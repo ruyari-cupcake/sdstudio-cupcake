@@ -40,8 +40,10 @@ const WINDOWS_SOURCE = [
   'using System.Collections.Generic;',
   'using System.ComponentModel;',
   'using System.Runtime.InteropServices;',
+  'using System.Text;',
   'public static class CupcakeNativeInput {',
   '  [StructLayout(LayoutKind.Sequential)] public struct Point { public int x; public int y; }',
+  '  [StructLayout(LayoutKind.Sequential)] public struct Rect { public int left; public int top; public int right; public int bottom; }',
   '  [StructLayout(LayoutKind.Sequential)] public struct MouseInput {',
   '    public int dx; public int dy; public uint data; public uint flags;',
   '    public uint time; public IntPtr extra;',
@@ -67,7 +69,28 @@ const WINDOWS_SOURCE = [
   '  [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);',
   '  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point point);',
   '  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window, uint flags);',
+  '  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Rect rectangle);',
+  '  [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr window, out Rect rectangle);',
+  '  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);',
+  '  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);',
+  '  [DllImport("user32.dll", EntryPoint="GetClassNameW", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window, StringBuilder name, int size);',
+  '  [DllImport("user32.dll", EntryPoint="GetWindowLongW")] static extern int GetWindowLong(IntPtr window, int index);',
   '  [DllImport("user32.dll")] static extern bool SetProcessDPIAware();',
+  '  static string DescribeWindow(IntPtr window) {',
+  '    uint pid; GetWindowThreadProcessId(window, out pid);',
+  '    var name = new StringBuilder(256); GetClassName(window, name, name.Capacity);',
+  '    string processName = "unavailable";',
+  '    try { using (var process = System.Diagnostics.Process.GetProcessById((int)pid)) { processName = process.ProcessName; } } catch {}',
+  '    Rect bounds; bool hasBounds = GetWindowRect(window, out bounds);',
+  '    Rect client; bool hasClient = GetClientRect(window, out client);',
+  '    uint style = unchecked((uint)GetWindowLong(window, -16));',
+  '    uint extendedStyle = unchecked((uint)GetWindowLong(window, -20));',
+  '    return "hwnd=" + window + ",pid=" + pid + ",process=" + processName + ",class=" + name',
+  '      + ",bounds=" + (hasBounds ? bounds.left + ":" + bounds.top + ":" + bounds.right + ":" + bounds.bottom : "unavailable")',
+  '      + ",client=" + (hasClient ? client.left + ":" + client.top + ":" + client.right + ":" + client.bottom : "unavailable")',
+  '      + ",visible=" + IsWindowVisible(window) + ",iconic=" + IsIconic(window)',
+  '      + ",style=0x" + style.ToString("X") + ",exStyle=0x" + extendedStyle.ToString("X") + ",topmost=" + ((extendedStyle & 0x8) != 0);',
+  '  }',
   '  static void Send(Input[] inputs) {',
   '    uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));',
   '    if (sent != inputs.Length) throw new Win32Exception(Marshal.GetLastWin32Error(), "Native input was not fully delivered");',
@@ -107,7 +130,7 @@ const WINDOWS_SOURCE = [
   '    if (hitRoot != ownedRoot) {',
   '      uint hitPid;',
   '      GetWindowThreadProcessId(hit, out hitPid);',
-  '      throw new InvalidOperationException("Native click point is covered or outside the owned window (client=" + x + "," + y + ", screen=" + point.x + "," + point.y + ", hitHwnd=" + hit + ", hitRoot=" + hitRoot + ", hitPid=" + hitPid + ", ownedHwnd=" + window + ", ownedRoot=" + ownedRoot + ")");',
+  '      throw new InvalidOperationException("Native click point is covered or outside the owned window (client=" + x + "," + y + ", screen=" + point.x + "," + point.y + ", hitHwnd=" + hit + ", hitRoot=" + hitRoot + ", hitPid=" + hitPid + ", ownedHwnd=" + window + ", ownedRoot=" + ownedRoot + "; owned={" + DescribeWindow(window) + "}; hit={" + DescribeWindow(hit) + "}; hitRoot={" + DescribeWindow(hitRoot) + "}; foreground={" + DescribeWindow(GetForegroundWindow()) + "})");',
   '    }',
   '    if (!SetCursorPos(point.x, point.y)) throw new Win32Exception(Marshal.GetLastWin32Error());',
   '    Input down = new Input { type=0 }; down.value.mouse.flags=0x0002;',
@@ -219,6 +242,12 @@ async function createNativeInput(application, page) {
       (process.platform === 'win32' && identity.parentPid === launcherPid),
     'Native window does not belong to the owned launcher or its Windows child',
   );
+  if (process.platform === 'win32') {
+    // The CI runner's foreground console can cover a restarted fixture even
+    // after moveTop()/focus(). Expose only this verified, disposable window;
+    // the real click must still hit its HWND and acquire native foreground.
+    await owner.evaluate((window) => window.setAlwaysOnTop(true));
+  }
   async function focus() {
     assert(!page.isClosed(), 'Owned page has closed');
     await owner.evaluate((window) => {

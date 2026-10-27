@@ -86,6 +86,27 @@ async function screenshot(name) {
     timeout: 10000,
   });
 }
+async function captureFailureDesktop() {
+  if (!application || process.platform !== 'win32') return;
+  const capture = await application.evaluate(async ({ desktopCapturer, screen }) => {
+    const display = screen.getPrimaryDisplay();
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: {
+        width: Math.round(display.size.width * display.scaleFactor),
+        height: Math.round(display.size.height * display.scaleFactor),
+      },
+    });
+    const source = sources.find((item) => item.display_id === String(display.id));
+    if (!source) throw new Error('The owned CI display is not available for capture');
+    return {
+      display: { id: display.id, bounds: display.bounds, scaleFactor: display.scaleFactor },
+      png: source.thumbnail.toPNG().toString('base64'),
+    };
+  });
+  fs.writeFileSync(path.join(out, 'failure-desktop.png'), Buffer.from(capture.png, 'base64'));
+  result.failureDesktop = { file: 'failure-desktop.png', display: capture.display };
+}
 async function launch() {
   const args = ['--no-sandbox', '--disable-gpu', '--user-data-dir=' + userData];
   if (!packaged) args.push(path.join(repository, 'release/app'));
@@ -156,6 +177,9 @@ async function launch() {
         platform: process.platform,
         normalWindow: {
           maximized: win.isMaximized(),
+          minimized: win.isMinimized(),
+          visible: win.isVisible(),
+          focused: win.isFocused(),
           contentBounds: win.getContentBounds(),
         },
         area,
@@ -165,9 +189,18 @@ async function launch() {
   assert.equal(path.resolve(identity.userData), path.resolve(userData));
   assert.equal(identity.version, expectedVersion);
   assert.equal(identity.packaged, packaged);
+  // Keep native and renderer geometry separate in the report. The failure-time
+  // native hit test records actual HWND bounds before sending any mouse input.
+  const rendererGeometry = await page.evaluate(() => ({
+    width: innerWidth,
+    height: innerHeight,
+    scale: devicePixelRatio,
+    focused: document.hasFocus(),
+  }));
   input = await createNativeInput(application, page);
   return {
     ...identity,
+    rendererGeometry,
     nativeInput: input.kind,
     nativeProcess: input.processIdentity,
   };
@@ -411,6 +444,8 @@ async function main() {
   await check('saved preferences survive a full process restart', async () => {
     await shutdown();
     const restarted = await launch();
+    result.restartedIdentity = restarted;
+    write();
     await open();
     await selectTab('커스텀');
     await checked(savedValue);
@@ -437,6 +472,9 @@ main()
   .catch(async (error) => {
     result.status = 'failed';
     result.error = { message: error.message, stack: error.stack, phase };
+    await captureFailureDesktop().catch((captureError) => {
+      result.desktopCaptureError = captureError.message;
+    });
     if (page && !page.isClosed()) {
       await screenshot('failure').catch(() => {});
       const visible = await page

@@ -5,6 +5,7 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $utf8 = [Text.UTF8Encoding]::new($false)
 $ownedProcesses = [Collections.Generic.List[Diagnostics.Process]]::new()
@@ -169,6 +170,38 @@ function Manifest([string] $Directory, [string[]] $Files, [string] $Channel = 'p
     Write-Text (Join-Path $Directory $ownership) ($value | ConvertTo-Json -Depth 5)
 }
 
+function Write-FixtureArchive([string] $Directory, [string] $ArchivePath) {
+    # Windows PowerShell's .NET Framework compatibility mode can make
+    # CreateFromDirectory write backslashes into ZIP entry names. Release ZIPs
+    # use forward slashes; create those names explicitly without relaxing the
+    # helper's path checks or depending on the host's compatibility switches.
+    $sourceRoot = [IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
+    $archive = [IO.Compression.ZipFile]::Open($ArchivePath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($file in (Get-ChildItem -LiteralPath $Directory -Recurse -File -Force)) {
+            $relative = $file.FullName.Substring($sourceRoot.Length).Replace('\', '/')
+            [void] [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive, $file.FullName, $relative, [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $archive.Dispose() }
+
+    # Check the actual archive, including its root manifest, before using it as
+    # an update fixture. Its file set must agree with the same release contract.
+    $manifest = [IO.File]::ReadAllText((Join-Path $Directory $ownership), $utf8) | ConvertFrom-Json
+    $expected = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($name in @($manifest.files)) { [void] $expected.Add([string] $name) }
+    [void] $expected.Add($ownership)
+    $actual = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            Assert (-not $entry.FullName.Contains('\')) 'Fixture ZIP contains a Windows path separator.'
+            Assert ($actual.Add($entry.FullName)) 'Fixture ZIP contains a repeated entry.'
+        }
+        Assert ($actual.SetEquals($expected)) 'Fixture ZIP files differ from the root application manifest.'
+    } finally { $archive.Dispose() }
+}
+
 function Folder-Fixture([string] $Name, [bool] $Collision = $false) {
     $caseRoot = Join-Path $RunRoot $Name
     $installed = Join-Path $caseRoot 'installed'
@@ -191,7 +224,7 @@ function Folder-Fixture([string] $Name, [bool] $Collision = $false) {
     }
     Manifest $new $newFiles
     $artifact = Join-Path $caseRoot 'release.zip'
-    [IO.Compression.ZipFile]::CreateFromDirectory($new, $artifact)
+    Write-FixtureArchive $new $artifact
     $main = Start-Fixture (Join-Path $installed 'Studio.exe') 'hold'
     $line = $main.StandardOutput.ReadLine()
     if ([string]::IsNullOrEmpty($line)) {

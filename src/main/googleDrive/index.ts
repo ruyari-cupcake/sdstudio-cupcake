@@ -13,12 +13,13 @@
 // - 설정 없는 빌드(클라이언트 값 미주입, 2026-10-02): 저장된 인증 파일을 읽지도 지우지도 않고,
 //   상태는 항상 notConfigured, 연결은 'not-configured' 로 거부한다(client.ts 참조).
 
-import { BrowserWindow, shell } from 'electron';
+import { BrowserWindow, dialog, shell } from 'electron';
 import log from 'electron-log';
 import {
   DRIVE_AUTH_CHANNEL,
   DRIVE_AUTH_ERROR_TEXT,
   type DriveAuthConnectResult,
+  type DriveAuthConfigureResult,
   DriveAuthError,
   type DriveAuthQuota,
   type DriveAuthStatus,
@@ -30,12 +31,17 @@ import {
   GOOGLE_AUTH_ENDPOINT,
   GOOGLE_DRIVE_ABOUT_ENDPOINT,
   GOOGLE_DRIVE_SCOPE,
-  GOOGLE_OAUTH_CLIENT_ID,
-  GOOGLE_OAUTH_CLIENT_SECRET,
+  getGoogleOAuthClient,
   GOOGLE_REVOKE_ENDPOINT,
   GOOGLE_TOKEN_ENDPOINT,
   isGoogleOAuthConfigured,
+  setGoogleOAuthClient,
 } from './client';
+import {
+  loadGoogleClientConfig,
+  readGoogleClientConfig,
+  saveGoogleClientConfig,
+} from './clientConfigStore';
 import { type LoopbackAuthorization, startLoopbackAuthorization } from './auth';
 import {
   authorizationCodeParams,
@@ -72,15 +78,19 @@ let refreshing: Promise<string> | null = null;
 let quota: DriveAuthQuota | undefined;
 let lastError: string | undefined;
 let pending: PendingConnect | null = null;
+let configuring = false;
 // 세션이 바뀔 때마다 증가 — 진행 중이던 갱신·조회 결과가 해제/재연결 뒤에 반영되지 않게 한다.
 let generation = 0;
 
 function ensureLoaded(): Promise<void> {
   if (!loadPromise) {
     loadPromise = (async () => {
-      // 설정 없는 빌드는 인증 파일을 건드리지 않는다(클라이언트 불일치로 삭제되는 것도 막는다).
+      // Local application settings take precedence over optional build defaults.
+      // No account-token file is touched until a valid client is available.
+      const client = await loadGoogleClientConfig();
+      if (client) setGoogleOAuthClient(client);
       if (!isGoogleOAuthConfigured()) return;
-      const record = await loadAuthRecord(GOOGLE_OAUTH_CLIENT_ID);
+      const record = await loadAuthRecord(getGoogleOAuthClient().clientId);
       if (record && !session) {
         session = { record, persistent: true };
         generation += 1;
@@ -136,8 +146,8 @@ async function refreshAccessToken(): Promise<string> {
     GOOGLE_TOKEN_ENDPOINT,
     refreshTokenParams({
       refreshToken: session.record.refreshToken,
-      clientId: GOOGLE_OAUTH_CLIENT_ID,
-      clientSecret: GOOGLE_OAUTH_CLIENT_SECRET,
+      clientId: getGoogleOAuthClient().clientId,
+      clientSecret: getGoogleOAuthClient().clientSecret,
     }),
   );
   if (gen !== generation || !session) throw new DriveAuthError('not-connected');
@@ -172,8 +182,8 @@ async function refreshAccessToken(): Promise<string> {
 
 // Drive API 호출용 access token(②~에서 사용). 연결 안 됨·만료는 DriveAuthError.
 export async function getAccessToken(): Promise<string> {
-  if (!isGoogleOAuthConfigured()) throw new DriveAuthError('not-configured');
   await ensureLoaded();
+  if (!isGoogleOAuthConfigured()) throw new DriveAuthError('not-configured');
   if (!session) throw new DriveAuthError('not-connected');
   if (
     access &&
@@ -268,9 +278,9 @@ async function revokeToken(token: string): Promise<void> {
 }
 
 export async function connect(): Promise<DriveAuthStatus> {
-  if (!isGoogleOAuthConfigured()) throw new DriveAuthError('not-configured');
   await ensureLoaded();
-  if (pending) throw new DriveAuthError('busy');
+  if (pending || configuring) throw new DriveAuthError('busy');
+  if (!isGoogleOAuthConfigured()) throw new DriveAuthError('not-configured');
   if (session) throw new DriveAuthError('already-connected');
   const attempt: PendingConnect = { auth: null, cancelled: false };
   pending = attempt;
@@ -279,7 +289,7 @@ export async function connect(): Promise<DriveAuthStatus> {
   try {
     const auth = await startLoopbackAuthorization({
       authEndpoint: GOOGLE_AUTH_ENDPOINT,
-      clientId: GOOGLE_OAUTH_CLIENT_ID,
+      clientId: getGoogleOAuthClient().clientId,
       scope: GOOGLE_DRIVE_SCOPE,
       timeoutMs: AUTH_TIMEOUT_MS,
       openExternal: (url) => shell.openExternal(url),
@@ -293,8 +303,8 @@ export async function connect(): Promise<DriveAuthStatus> {
       GOOGLE_TOKEN_ENDPOINT,
       authorizationCodeParams({
         code,
-        clientId: GOOGLE_OAUTH_CLIENT_ID,
-        clientSecret: GOOGLE_OAUTH_CLIENT_SECRET,
+        clientId: getGoogleOAuthClient().clientId,
+        clientSecret: getGoogleOAuthClient().clientSecret,
         verifier: auth.verifier,
         redirectUri: auth.redirectUri,
       }),
@@ -319,7 +329,7 @@ export async function connect(): Promise<DriveAuthStatus> {
 
     const record: DriveAuthRecord = {
       refreshToken: parsed.refreshToken,
-      clientId: GOOGLE_OAUTH_CLIENT_ID,
+      clientId: getGoogleOAuthClient().clientId,
       connectedAt: new Date().toISOString(),
     };
     const persistent = await saveAuthRecord(record);
@@ -360,6 +370,71 @@ export async function connectForIpc(): Promise<DriveAuthConnectResult> {
   }
 }
 
+/**
+ * The picker owns a single configuration transaction across all windows.
+ * Changing a connected or connecting client would detach in-flight authorization
+ * from the credentials it started with, so users disconnect before replacing it.
+ */
+export async function configureClient(): Promise<DriveAuthStatus | null> {
+  if (configuring || pending || refreshing) throw new DriveAuthError('busy');
+  configuring = true;
+  try {
+    try {
+      await ensureLoaded();
+    } catch (error) {
+      // A replacement must remain possible when the previous local JSON is damaged.
+      if (
+        !(error instanceof DriveAuthError) ||
+        !['invalid-client-config', 'client-config-read-failed'].includes(
+          error.code,
+        )
+      )
+        throw error;
+    }
+    if (session) throw new DriveAuthError('already-connected');
+    const options = {
+      title: 'Google 앱 설정 불러오기',
+      properties: ['openFile'] as const,
+      filters: [{ name: 'Google 데스크톱 OAuth JSON', extensions: ['json'] }],
+    };
+    const selection = await dialog.showOpenDialog({
+      ...options,
+      properties: ['openFile'],
+    });
+    if (selection.canceled || !selection.filePaths[0]) return null;
+    let client;
+    try {
+      client = await readGoogleClientConfig(selection.filePaths[0]);
+    } catch (error) {
+      if (error instanceof DriveAuthError) throw error;
+      throw new DriveAuthError('client-config-read-failed');
+    }
+    // Publish only after atomic disk replacement; failed saves keep memory and
+    // previously saved application settings together.
+    await saveGoogleClientConfig(client);
+    setGoogleOAuthClient(client);
+    loadPromise = null;
+    lastError = undefined;
+    generation += 1;
+    await ensureLoaded();
+    broadcastStatus();
+    return currentStatus();
+  } finally {
+    configuring = false;
+  }
+}
+
+export async function configureClientForIpc(): Promise<DriveAuthConfigureResult> {
+  try {
+    return { ok: true, status: await configureClient() };
+  } catch (error) {
+    if (error instanceof DriveAuthError) {
+      return { ok: false, code: error.code };
+    }
+    return { ok: false, code: 'unknown' };
+  }
+}
+
 export function cancelConnect(): void {
   if (!pending) return;
   pending.cancelled = true;
@@ -367,9 +442,10 @@ export function cancelConnect(): void {
 }
 
 export async function disconnect(): Promise<void> {
-  // 설정 없는 빌드는 연결된 적이 없다 — 다른 빌드가 남긴 인증 파일을 지우지 않는다.
-  if (!isGoogleOAuthConfigured()) return;
   await ensureLoaded();
+  if (configuring) throw new DriveAuthError('busy');
+  // A client-less build must preserve an account file it cannot identify.
+  if (!isGoogleOAuthConfigured()) return;
   cancelConnect();
   const token = session?.record.refreshToken;
   // 저장소 불가 환경에서 읽지 않은 파일이 남아 있을 수 있으므로 세션 유무와 관계없이 삭제한다.

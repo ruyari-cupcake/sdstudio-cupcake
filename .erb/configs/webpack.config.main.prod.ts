@@ -12,20 +12,15 @@ import webpackPaths from './webpack.paths';
 import checkNodeEnv from '../scripts/check-node-env';
 import deleteSourceMaps from '../scripts/delete-source-maps';
 import { loadDotEnv } from './loadDotEnv';
-import metadata from '../../package.json';
 
 checkNodeEnv('production');
 deleteSourceMaps();
 // 저장소 루트 .env(gitignore)의 빌드 설정을 읽는다. 이미 설정된 환경 변수(CI Secrets)가 우선.
-if (metadata.build.publish.private) {
-  loadDotEnv(path.join(webpackPaths.rootPath, '.env'));
-} else {
-  // Public builds never inherit the owner's installed OAuth client from the
-  // shell or a neighbouring private checkout. Contributors can register their
-  // own client in an explicitly private build.
-  process.env.SDSTUDIO_GOOGLE_CLIENT_ID = '';
-  process.env.SDSTUDIO_GOOGLE_CLIENT_SECRET = '';
-}
+// The release channel controls updates, not Google Drive availability. A build
+// may explicitly supply its application OAuth client in either channel; user
+// account tokens are never build inputs. A client-less build supports local JSON
+// configuration through preferences.
+loadDotEnv(path.join(webpackPaths.rootPath, '.env'));
 
 const configuration: webpack.Configuration = {
   devtool: 'source-map',

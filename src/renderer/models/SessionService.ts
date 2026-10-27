@@ -17,6 +17,7 @@ import {
 } from '.';
 import { type IBatchPlanItem, resolveBatchName } from './batchCreatePlan';
 import type { TemplateProtectArea } from './TemplateService';
+import { prepareSceneTransfer } from './sceneTransfer';
 import { getAppState } from './appStateRef';
 import type { FileEntry } from '../backend';
 import defaultassets from '../defaultassets';
@@ -2198,10 +2199,11 @@ export class SessionService extends ResourceSyncService<Session> {
     const batch = opts?.batchAxes;
     // 씬 구성: 이름은 템플릿 내에서 이미 유일 (임포트 시 번호 부여).
     // 배치 모드는 템플릿 자체 씬을 무시 — 씬 축(씬 템플릿) 또는 기본 빈 씬.
+    const sceneAxis = batch?.sceneTemplateName
+      ? await this.buildScenesFromSceneTemplate(batch.sceneTemplateName)
+      : undefined;
     const scenes = batch
-      ? batch.sceneTemplateName
-        ? await this.buildScenesFromSceneTemplate(batch.sceneTemplateName)
-        : SessionService.defaultScenesJSON()
+      ? (sceneAxis?.scenes ?? SessionService.defaultScenesJSON())
       : entry.scenes.length > 0
         ? Object.fromEntries(
             entry.scenes.map((s) => [s.name, JSON.parse(JSON.stringify(s))]),
@@ -2213,7 +2215,7 @@ export class SessionService extends ResourceSyncService<Session> {
       presets: {},
       inpaints: {},
       scenes: scenes as any,
-      library: {},
+      library: sceneAxis?.library ?? {},
       presetShareds: {},
       characterPresets: {},
     };
@@ -2407,23 +2409,30 @@ export class SessionService extends ResourceSyncService<Session> {
   // 필요 없고, 씬이 하나도 없으면 기본 빈 씬으로 폴백한다.
   private async buildScenesFromSceneTemplate(
     tplName: string,
-  ): Promise<Record<string, any>> {
+  ): Promise<Pick<ISession, 'scenes' | 'library'>> {
     const tpl = await this.get(tplName);
     if (!tpl) {
       throw new Error(`씬 템플릿 프로젝트를 불러올 수 없습니다: ${tplName}`);
     }
-    const scenes = tpl.getScenes('scene');
-    if (scenes.length === 0) return SessionService.defaultScenesJSON();
-    const out: Record<string, any> = {};
-    for (const src of scenes) {
-      const json: any = JSON.parse(JSON.stringify(src.toJSON()));
-      json.imageMap = [];
-      json.mains = [];
-      json.game = undefined;
-      json.round = undefined;
-      out[json.name] = json;
-    }
-    return out;
+    const scenes = [...tpl.scenes.values()];
+    if (scenes.length === 0)
+      return { scenes: SessionService.defaultScenesJSON(), library: {} };
+    const transfer = prepareSceneTransfer(
+      scenes.map((scene) => scene.toJSON()),
+      Object.fromEntries(
+        [...tpl.library].map(([name, library]) => [name, library.toJSON()]),
+      ),
+      new Map(),
+      globalPieceService.library,
+    );
+    return {
+      scenes: Object.fromEntries(
+        transfer.scenes.map((scene) => [scene.name, scene]),
+      ),
+      library: Object.fromEntries(
+        transfer.libraries.map((library) => [library.name, library]),
+      ),
+    };
   }
 
   // 프로젝트 일괄 생성 (배치 생성 R2, 2026-07-16 확정 스펙).
@@ -2645,6 +2654,10 @@ export class SessionService extends ResourceSyncService<Session> {
     if (this.isLoaded(name)) {
       throw new Error('Resource already exists');
     }
+    // Match deep import: unloaded projects still own their name and files.
+    if (this.list().includes(name)) {
+      throw new Error(`이미 같은 이름의 프로젝트가 있습니다: ${name}`);
+    }
     session.name = name;
     // 유래 생성(복제·씬템플릿·백업 복원·순환) — 원본 id 를 버려 migrate 가 새 uuid 를
     // 발급하게 한다(트랙1 (b): 물리 폴더 유일성). 순수 로드가 아닌 신규 프로젝트 생성.
@@ -2678,6 +2691,9 @@ export class SessionService extends ResourceSyncService<Session> {
       }
     }
     await this.createFrom(name, session);
+    // Periodic sync deliberately retains failures for retry. An explicit import
+    // must additionally await a durable write before its caller reports success.
+    await this.flushProjectNow(name);
   }
 
   async importSessionDeep(tarpath: string, name: string) {

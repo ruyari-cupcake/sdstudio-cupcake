@@ -29,7 +29,7 @@
     }
   ],
   "main": "./src/main/main.ts",
-  "version": "6.1.0-cupcake.1",
+  "version": "6.1.1-cupcake.1",
   "scripts": {
     "build": "concurrently \"npm run build:main\" \"npm run build:renderer\"",
     "build:dll": "cross-env NODE_ENV=development TS_NODE_TRANSPILE_ONLY=true webpack --config ./.erb/configs/webpack.config.renderer.dev.dll.ts",
@@ -377,6 +377,6 @@
     "logLevel": "quiet"
   },
   "extraMetadata": {
-    "version": "6.1.0-cupcake.1"
+    "version": "6.1.1-cupcake.1"
   }
 }

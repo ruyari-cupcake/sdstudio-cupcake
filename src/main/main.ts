@@ -607,6 +607,9 @@ ipcMain.handle(DRIVE_AUTH_CHANNEL.status, async () =>
 ipcMain.handle(DRIVE_AUTH_CHANNEL.connect, async () =>
   googleDriveAuth.connectForIpc(),
 );
+ipcMain.handle(DRIVE_AUTH_CHANNEL.configure, async () =>
+  googleDriveAuth.configureClientForIpc(),
+);
 ipcMain.handle(DRIVE_AUTH_CHANNEL.cancel, async () =>
   googleDriveAuth.cancelConnect(),
 );

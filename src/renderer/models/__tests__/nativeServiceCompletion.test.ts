@@ -357,6 +357,7 @@ describe('native service failure completion', () => {
       );
       const service = new Service();
       service.isLoaded = jest.fn().mockReturnValue(false);
+      service.list = jest.fn().mockReturnValue([]);
       service.createFrom = jest.fn();
       const preset = { type: 'style', profile: 'original-base64' };
       await expect(

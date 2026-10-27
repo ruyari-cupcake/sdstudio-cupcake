@@ -9,19 +9,39 @@
 //     (값 출처 = 저장소 루트 .env(gitignore) 또는 CI Secrets). renderer 번들에는 들어가지 않는다.
 //   - 개발(npm start): src/main/devDotEnv.ts 가 이 모듈보다 먼저 .env 를 process.env 에 채운다.
 // 치환이 되도록 process.env.X 를 직접 참조한다(구조 분해·동적 키 금지).
-// 값이 비어 있으면(포크·기여자 빌드, Secrets 미등록) 드라이브 연동은 「설정 없음」(not-configured).
+// Built clients are optional in both channels. When absent, the user can import a
+// Desktop OAuth JSON in preferences; the main auth owner loads it before use.
 
 export const GOOGLE_OAUTH_CLIENT_ID: string =
   process.env.SDSTUDIO_GOOGLE_CLIENT_ID || '';
 export const GOOGLE_OAUTH_CLIENT_SECRET: string =
   process.env.SDSTUDIO_GOOGLE_CLIENT_SECRET || '';
 
-// 클라이언트 ID·시크릿이 둘 다 주입된 빌드인지.
-export function isGoogleOAuthConfigured(): boolean {
+interface GoogleOAuthClient {
+  clientId: string;
+  clientSecret: string;
+}
+
+let localClient: GoogleOAuthClient | null = null;
+
+export function getGoogleOAuthClient(): GoogleOAuthClient {
   return (
-    GOOGLE_OAUTH_CLIENT_ID.trim() !== '' &&
-    GOOGLE_OAUTH_CLIENT_SECRET.trim() !== ''
+    localClient ?? {
+      clientId: GOOGLE_OAUTH_CLIENT_ID,
+      clientSecret: GOOGLE_OAUTH_CLIENT_SECRET,
+    }
   );
+}
+
+// The auth owner publishes a local client only after its separate file is saved.
+export function setGoogleOAuthClient(client: GoogleOAuthClient): void {
+  localClient = { ...client };
+}
+
+// A client can come from explicit build settings or the local desktop JSON.
+export function isGoogleOAuthConfigured(): boolean {
+  const client = getGoogleOAuthClient();
+  return client.clientId.trim() !== '' && client.clientSecret.trim() !== '';
 }
 
 // 앱이 만든 파일·폴더에만 접근하는 비민감 범위(앱 검증 불필요).

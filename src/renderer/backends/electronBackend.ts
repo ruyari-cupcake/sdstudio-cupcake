@@ -25,6 +25,7 @@ import { embedSDStudioMetadataInPngBase64 } from '../../shared/sdstudioImageMeta
 import {
   DRIVE_AUTH_CHANNEL,
   type DriveAuthConnectResult,
+  type DriveAuthConfigureResult,
   DriveAuthError,
   type DriveAuthStatus,
   isDriveAuthErrorCode,
@@ -275,6 +276,16 @@ export class ElectornBackend
     if (res && res.ok) return res.status;
     const code = res && isDriveAuthErrorCode(res.code) ? res.code : 'unknown';
     throw new DriveAuthError(code, res && !res.ok ? res.detail : undefined);
+  }
+
+  override async driveAuthConfigure(): Promise<DriveAuthStatus | null> {
+    const result: DriveAuthConfigureResult = await invoke(
+      DRIVE_AUTH_CHANNEL.configure,
+    );
+    if (result && result.ok) return result.status;
+    const code =
+      result && isDriveAuthErrorCode(result.code) ? result.code : 'unknown';
+    throw new DriveAuthError(code);
   }
 
   override async driveAuthCancel(): Promise<void> {

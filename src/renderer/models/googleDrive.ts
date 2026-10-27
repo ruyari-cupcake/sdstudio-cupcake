@@ -25,9 +25,18 @@ export const GOOGLE_DRIVE_TEXT = {
     disconnected: '연결 안 됨',
     connecting: '연결 중…',
     loading: '확인 중…',
-    notConfigured: '사용 불가',
+    notConfigured: '앱 설정 필요',
   },
   connectButton: 'Google 계정 연결',
+  configureButton: 'Google 앱 설정 불러오기',
+  configureHint:
+    'Google Cloud에서 만든 데스크톱 앱 OAuth JSON을 선택하면 이 PC에 저장됩니다. 공개판과 비공개판에서 같은 방법으로 사용할 수 있습니다.',
+  configureHelp: 'Google Cloud 앱 설정 안내',
+  configureHelpUrl:
+    'https://developers.google.com/workspace/guides/create-credentials#desktop-app',
+  configured:
+    'Google 앱 설정을 저장했습니다. 이제 Google 계정을 연결할 수 있습니다.',
+  configureFailed: 'Google 앱 설정을 불러오지 못했습니다.',
   disconnectButton: '연결 해제',
   cancelButton: '취소',
   connectingHint: '브라우저에서 승인해 주세요',
@@ -73,7 +82,7 @@ export const GOOGLE_DRIVE_TEXT = {
   backupListDisconnected: '연결하면 드라이브의 백업 목록이 여기에 표시됩니다.',
   // 클라이언트 값이 주입되지 않은 빌드(2026-10-02). 본문은 DRIVE_AUTH_ERROR_TEXT['not-configured'].
   notConfiguredHint:
-    '환경설정 내보내기·불러오기와 로컬 동기화 폴더는 그대로 사용할 수 있습니다.',
+    '앱 설정 파일을 한 번 불러온 뒤 Google 계정 연결을 눌러 브라우저에서 승인해 주세요.',
 
   // ─── 백업 목록·받기 (드라이브 API ③) ───
   managerTitle: 'Google 드라이브 백업',

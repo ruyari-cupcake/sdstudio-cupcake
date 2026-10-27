@@ -15,8 +15,8 @@ android {
         applicationId "io.ruyari.cupcake.sdstudio.public"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 6010001
-        versionName "6.1.0-cupcake.1"
+        versionCode 6010101
+        versionName "6.1.1-cupcake.1"
         buildConfigField "String", "UPDATE_OWNER", updateString(updateRepository.owner)
         buildConfigField "String", "UPDATE_REPO", updateString(updateRepository.repo)
         buildConfigField "String", "UPDATE_CHANNEL", updateString(updateRepository.private ? 'private' : 'public')

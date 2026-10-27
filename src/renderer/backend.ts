@@ -119,6 +119,13 @@ export abstract class Backend {
   // 시스템 브라우저로 승인 → 완료 시 상태. 실패·취소는 DriveAuthError(code) throw.
   abstract driveAuthConnect(): Promise<DriveAuthStatus>;
 
+  // Desktop-only native picker. Android uses registered package/signing identity.
+  driveAuthConfigure(): Promise<DriveAuthStatus | null> {
+    return Promise.reject(
+      new Error('Google 앱 설정 가져오기는 PC에서 지원합니다.'),
+    );
+  }
+
   // 진행 중인 브라우저 승인 대기를 취소한다(없으면 무시).
   abstract driveAuthCancel(): Promise<void>;
 

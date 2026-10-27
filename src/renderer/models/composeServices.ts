@@ -61,6 +61,9 @@ const templateService = new TemplateService({
   get projectTemplateService(): ProjectTemplateService {
     return services.projectTemplateService;
   },
+  get globalPieceService(): GlobalPieceService {
+    return services.globalPieceService;
+  },
 });
 
 // 프로젝트 템플릿 엔티티 (프로젝트 상속 v2 — 시작 시 로드 없음, 지연 로드)

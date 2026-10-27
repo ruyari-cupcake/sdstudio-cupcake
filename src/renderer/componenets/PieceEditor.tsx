@@ -243,27 +243,60 @@ const PieceEditor = observer(() => {
   };
 
   const handleJsonImport = async (file: File) => {
+    const targetSession = scope === 'local' ? curSession : undefined;
+    const canImport = async (): Promise<boolean> => {
+      if (scope === 'global') return true;
+      if (!targetSession || appState.curSession !== targetSession) return false;
+      if (sessionService.isMirror(targetSession.name)) {
+        appState.pushMessage(
+          '읽기 전용 창에서는 조각을 가져올 수 없습니다. 편집 중인 창에서 불러와주세요.',
+          'error',
+        );
+        return false;
+      }
+      const allowed = await sessionService.guardCrossWindowLock(
+        targetSession.name,
+        '조각 불러오기',
+      );
+      return (
+        allowed &&
+        appState.curSession === targetSession &&
+        !sessionService.isMirror(targetSession.name)
+      );
+    };
+    const finishImport = async (): Promise<void> => {
+      // The file picker and drop dispatcher use the same storage owners. A
+      // completed import must survive reopen before a success label is shown.
+      if (targetSession) {
+        sessionService.markDirty(targetSession.name);
+        await sessionService.flushProjectNow(targetSession.name);
+      } else {
+        await globalPieceService.flushSave();
+      }
+      const current = appState.curSession;
+      if (current) await sessionService.reloadPieceLibraryDB(current);
+    };
     try {
       const text = await file.text();
       let json = JSON.parse(text);
       if (!isValidPieceLibrary(json)) {
-        appState.pushMessage('올바른 조각그룹 JSON 파일이 아닙니다');
+        appState.pushMessage(
+          '조각그룹 JSON을 선택해주세요. 감정·포즈 씬 묶음(프로젝트 JSON)은 씬 템플릿 → 파일 불러오기에서 추가할 수 있습니다.',
+        );
         return;
       }
       if (!json.version) {
         json = migratePieceLibrary(json);
       }
-      const source =
-        scope === 'local' ? curSession!.library : globalPieceService.library;
+      if (!(await canImport())) return;
+      const source = targetSession
+        ? targetSession.library
+        : globalPieceService.library;
       if (!source.has(json.name)) {
         const lib = PieceLibrary.fromJSON(json);
-        if (scope === 'local') {
-          source.set(json.name, lib);
-        } else {
-          globalPieceService.addLibrary(json.name, lib);
-        }
+        source.set(json.name, lib);
+        await finishImport();
         setSelectedPieceLibrary(json.name);
-        reloadDB();
         appState.pushMessage(`조각그룹 "${json.name}" 불러오기 완료`);
       } else {
         const newName = await promptName({
@@ -271,28 +304,28 @@ const PieceEditor = observer(() => {
           kind: 'pieceGroup',
           existing: (n) => source.has(n),
         });
-        if (!newName) return;
+        if (!newName || !(await canImport())) return;
         json.name = newName;
         const lib = PieceLibrary.fromJSON(json);
-        if (scope === 'local') {
-          source.set(newName, lib);
-        } else {
-          globalPieceService.addLibrary(newName, lib);
-        }
+        source.set(newName, lib);
+        await finishImport();
         setSelectedPieceLibrary(newName);
-        reloadDB();
+        appState.pushMessage(`조각그룹 "${newName}" 불러오기 완료`);
       }
-    } catch {
-      appState.pushMessage('JSON 파일을 읽는 중 오류가 발생했습니다');
+    } catch (error) {
+      appState.pushMessage(
+        `조각을 불러오지 못했습니다: ${error instanceof Error ? error.message : String(error)}`,
+        'error',
+      );
     }
   };
 
   const handleFileImport = async (file: File) => {
-    if (file.name.endsWith('.json')) {
+    if (/\.json$/i.test(file.name)) {
       await handleJsonImport(file);
       return;
     }
-    if (file.name.endsWith('.txt')) {
+    if (/\.txt$/i.test(file.name)) {
       await handleWildcardImport(file);
       return;
     }
@@ -300,7 +333,7 @@ const PieceEditor = observer(() => {
   };
 
   async function handleWildcardImport(file: File) {
-    if (!file.name.endsWith('.txt')) {
+    if (!/\.txt$/i.test(file.name)) {
       appState.pushMessage('txt 파일만 지원됩니다');
       return;
     }
@@ -654,7 +687,8 @@ const PieceEditor = observer(() => {
           <HelpIcon
             content={
               '조각은 프롬프트에서 <그룹.이름> 으로 참조하는 재사용 텍스트입니다.\n' +
-              '로컬은 현재 프로젝트 전용(전역보다 우선), 전역은 모든 프로젝트 공유입니다.'
+              '로컬은 현재 프로젝트 전용(전역보다 우선), 전역은 모든 프로젝트 공유입니다.\n' +
+              '조각그룹 JSON은 불러오기 버튼으로 추가하세요. 감정·포즈 씬 묶음은 씬 템플릿에서 불러옵니다.'
             }
           />
         </span>

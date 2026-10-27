@@ -157,8 +157,15 @@ const SceneTemplateManager = observer(
 
     const importToCurrent = async () => {
       if (!curSession) return;
-      const names = await templateService.importSceneTemplate(curSession);
-      if (names && names.length > 0) onClose(); // 가져온 씬을 바로 보도록
+      try {
+        const names = await templateService.importSceneTemplate(curSession);
+        if (names && names.length > 0) onClose();
+      } catch (error) {
+        appState.pushMessage(
+          `씬을 저장하지 못했습니다. 다시 시도해주세요: ${error instanceof Error ? error.message : String(error)}`,
+          'error',
+        );
+      }
     };
 
     // 파일 내보내기/불러오기 (PC↔모바일 크로스 작업 이동, 2026-07-18) —
@@ -181,7 +188,14 @@ const SceneTemplateManager = observer(
 
     // 텍스트 이후는 TemplateService.importSceneTemplateFile(드라이브에서 받은 파일과 공용 — 드라이브 API ③).
     const handleImportFile = async (file: File) => {
-      await templateService.importSceneTemplateFile(await file.text());
+      try {
+        await templateService.importSceneTemplateFile(await file.text());
+      } catch (error) {
+        appState.pushMessage(
+          `파일을 불러오지 못했습니다: ${error instanceof Error ? error.message : String(error)}`,
+          'error',
+        );
+      }
     };
 
     return (
@@ -194,6 +208,7 @@ const SceneTemplateManager = observer(
             <HelpIcon
               content={
                 '자주 쓰는 씬 묶음을 템플릿으로 저장해 두고 아무 프로젝트로나 복사할 수 있습니다.\n' +
+                '예전 감정·포즈 씬 묶음(프로젝트 JSON)도 파일 불러오기로 추가할 수 있습니다.\n' +
                 '행을 클릭하면 템플릿을 열어 씬을 직접 수정할 수 있습니다.'
               }
             />
@@ -232,7 +247,7 @@ const SceneTemplateManager = observer(
               <ActionIcon id="copy-to-project" size={13} /> 현재 프로젝트로 복사
             </button>
           </Tooltip>
-          <Tooltip content="다른 기기에서 내보낸 씬 템플릿 파일을 추가합니다">
+          <Tooltip content="씬 템플릿 또는 예전 SDStudio 프로젝트 JSON을 씬 묶음으로 추가합니다">
             {/* PC 에서 Google 드라이브에 연결돼 있으면 출처를 먼저 묻는다(드라이브 API ③). */}
             <div>
               <button
@@ -266,8 +281,10 @@ const SceneTemplateManager = observer(
           </Tooltip>
         </div>
         <div className="text-xs text-muted mb-3">
-          템플릿은 숨김 프로젝트로 저장되어 일반 프로젝트 목록에는 보이지
-          않습니다. 행을 클릭하면 열어서 씬을 수정할 수 있습니다.
+          예전 감정·포즈 씬 묶음은 파일 불러오기로 추가한 뒤 현재 프로젝트로
+          복사하세요. 씬에 쓰인 프롬프트 조각도 함께 복사됩니다. 템플릿은 일반
+          프로젝트 목록에 보이지 않으며, 아래 행을 클릭해 열고 수정할 수
+          있습니다.
         </div>
 
         {/* 템플릿 목록 */}

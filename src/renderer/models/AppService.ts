@@ -13,12 +13,17 @@ import {
   isMobile,
   sessionService,
   projectTemplateService,
+  templateService,
   trashService,
   workFlowService,
 } from '.';
 import { setAppState } from './appStateRef';
 import { readImportFile } from './fileImportReader';
 import { getImportFilePath } from './importFilePath';
+import {
+  prepareSceneTransfer,
+  applyImportedSceneSettings,
+} from './sceneTransfer';
 import { resolveToastKind, type ToastKind } from './toastKind';
 import { confirmViaDialog } from './confirmKeys';
 import {
@@ -63,7 +68,6 @@ import {
   convertNAISToSession,
   Piece,
   PieceLibrary,
-  PromptPiece,
   Scene,
   type Session,
 } from './types';
@@ -1177,13 +1181,33 @@ export class AppState {
         items: [
           { text: '새 프로젝트로 불러오기', value: 'new-project' },
           {
-            text: '현재 프로젝트에 씬만 불러오기 (⚠️! 씬이 덮어씌워짐)',
+            text: '현재 프로젝트에 씬과 사용 중인 조각 불러오기',
             value: 'cur-project',
           },
         ],
       });
       if (option === 'new-project') return importProject();
       if (option !== 'cur-project' || this.curSession !== current) return [];
+      const canImportToCurrent = async (): Promise<boolean> => {
+        if (this.curSession !== current) return false;
+        if (sessionService.isMirror(current.name)) {
+          this.pushMessage(
+            '읽기 전용 창에서는 씬을 가져올 수 없습니다. 편집 중인 창에서 불러와주세요.',
+            'error',
+          );
+          return false;
+        }
+        const allowed = await sessionService.guardCrossWindowLock(
+          current.name,
+          '씬 불러오기',
+        );
+        return (
+          allowed &&
+          this.curSession === current &&
+          !sessionService.isMirror(current.name)
+        );
+      };
+      if (!(await canImportToCurrent())) return [];
       const incoming: ISession = await sessionService.migrate(json);
       if (this.curSession !== current) return [];
       const overlapping = overlappingSceneNames(
@@ -1198,25 +1222,36 @@ export class AppState {
         });
         if (!confirmed || this.curSession !== current) return [];
       }
-      for (const key of Object.keys(incoming.scenes)) {
-        if (current.scenes.has(key)) {
-          current.scenes.get(key)!.slots = incoming.scenes[key].slots.map(
-            (slot: any) =>
-              slot.map((piece: any) => PromptPiece.fromJSON(piece)),
-          );
-          current.scenes.get(key)!.resolution = incoming.scenes[key].resolution;
-        } else {
-          current.scenes.set(key, Scene.fromJSON(incoming.scenes[key]));
-          current.scenes.get(key)!.mains = [];
-          current.scenes.get(key)!.game = undefined;
-        }
+      if (!(await canImportToCurrent())) return [];
+      const transfer = prepareSceneTransfer(
+        Object.values(incoming.scenes),
+        incoming.library,
+        current.library,
+        globalPieceService.library,
+      );
+      for (const library of transfer.libraries)
+        current.library.set(library.name, PieceLibrary.fromJSON(library));
+      for (const scene of transfer.scenes) {
+        const existingScene = current.scenes.get(scene.name);
+        if (existingScene) applyImportedSceneSettings(existingScene, scene);
+        else current.scenes.set(scene.name, Scene.fromJSON(scene));
       }
-      this.pushDialog({ type: 'yes-only', text: '씬을 불러왔습니다' });
+      sessionService.markDirty(current.name);
+      await sessionService.flushProjectNow(current.name);
+      await sessionService.reloadPieceLibraryDB(current);
+      this.pushDialog({
+        type: 'yes-only',
+        text: '씬과 사용 중인 프롬프트 조각을 불러왔습니다',
+      });
       return [];
     };
 
     const handleJSONContent = async (incomingJson: any): Promise<string[]> => {
       let json = incomingJson;
+      if (json?.type === 'sdstudio-scene-template') {
+        await templateService.importSceneTemplateFile(JSON.stringify(json));
+        return [];
+      }
       if (isValidSession(json)) return handleAddSession(json);
       if (isValidNAISPreset(json)) {
         const pieceNames = extractNAISPieceNames(json.scenes);
@@ -1242,21 +1277,55 @@ export class AppState {
         }
         return handleAddSession(converted);
       }
-      if (!isValidPieceLibrary(json)) return [];
+      if (!isValidPieceLibrary(json)) {
+        this.pushMessage(
+          '지원하는 SDStudio 프로젝트·씬 템플릿·조각그룹 JSON인지 확인해주세요.',
+          'error',
+        );
+        return [];
+      }
       if (!json.version) json = migratePieceLibrary(json);
       const importToTarget = async (
         targetLibrary: Map<string, PieceLibrary>,
         scopeLabel: string,
         targetSession?: Session,
       ): Promise<void> => {
-        const afterImport = () => {
-          if (scopeLabel === '전역') globalPieceService.scheduleSave();
-          const session = targetSession ?? this.curSession;
-          if (session) sessionService.reloadPieceLibraryDB(session);
+        const canImport = async (): Promise<boolean> => {
+          if (!targetSession) return true;
+          if (this.curSession !== targetSession) return false;
+          if (sessionService.isMirror(targetSession.name)) {
+            this.pushMessage(
+              '읽기 전용 창에서는 조각을 가져올 수 없습니다. 편집 중인 창에서 불러와주세요.',
+              'error',
+            );
+            return false;
+          }
+          const allowed = await sessionService.guardCrossWindowLock(
+            targetSession.name,
+            '조각 불러오기',
+          );
+          return (
+            allowed &&
+            this.curSession === targetSession &&
+            !sessionService.isMirror(targetSession.name)
+          );
+        };
+        if (!(await canImport())) return;
+        const afterImport = async (): Promise<void> => {
+          // Explicit imports acknowledge the selected store's real save, rather
+          // than the ordinary editing debounce. Keep unsaved state on failure.
+          if (targetSession) {
+            sessionService.markDirty(targetSession.name);
+            await sessionService.flushProjectNow(targetSession.name);
+          } else {
+            await globalPieceService.flushSave();
+          }
+          const session = this.curSession;
+          if (session) await sessionService.reloadPieceLibraryDB(session);
         };
         if (!targetLibrary.has(json.name)) {
           targetLibrary.set(json.name, PieceLibrary.fromJSON(json));
-          afterImport();
+          await afterImport();
           this.pushDialog({
             type: 'yes-only',
             text: `조각모음을 ${scopeLabel}에 불러왔습니다`,
@@ -1312,8 +1381,7 @@ export class AppState {
           text: detail,
           items,
         });
-        if (!choice || (targetSession && this.curSession !== targetSession))
-          return;
+        if (!choice || !(await canImport())) return;
         if (choice === 'merge-overwrite' || choice === 'merge-skip') {
           let added = 0;
           let overwritten = 0;
@@ -1330,7 +1398,7 @@ export class AppState {
               overwritten++;
             } else skipped++;
           }
-          afterImport();
+          await afterImport();
           const parts = [];
           if (added) parts.push(`${added}개 추가`);
           if (overwritten) parts.push(`${overwritten}개 덮어쓰기`);
@@ -1339,7 +1407,7 @@ export class AppState {
         } else if (choice === 'overwrite') {
           targetLibrary.delete(json.name);
           targetLibrary.set(json.name, sourceLibrary);
-          afterImport();
+          await afterImport();
           this.pushMessage(`"${json.name}" 조각그룹을 덮어썼습니다`);
         } else if (choice === 'rename') {
           const name = await promptName({
@@ -1347,8 +1415,7 @@ export class AppState {
             kind: 'pieceGroup',
             existing: (value) => targetLibrary.has(value),
           });
-          if (!name || (targetSession && this.curSession !== targetSession))
-            return;
+          if (!name || !(await canImport())) return;
           if (targetLibrary.has(name)) {
             this.pushMessage(
               NAME_INPUT_TEXT.duplicate('pieceGroup', name),
@@ -1358,7 +1425,7 @@ export class AppState {
           }
           sourceLibrary.name = name;
           targetLibrary.set(name, sourceLibrary);
-          afterImport();
+          await afterImport();
           this.pushMessage(`"${name}" 조각그룹을 ${scopeLabel}에 불러왔습니다`);
         }
       };
@@ -1383,7 +1450,7 @@ export class AppState {
     };
 
     try {
-      if (file.name.endsWith('.tar')) {
+      if (/\.tar$/i.test(file.name)) {
         const filePath = getImportFilePath(file);
         if (!filePath) {
           this.pushMessage('tar 파일 경로를 가져올 수 없습니다');
@@ -1391,7 +1458,7 @@ export class AppState {
         }
         return await this.handleTarImport(filePath);
       }
-      if (file.type === 'application/json') {
+      if (file.type === 'application/json' || /\.json$/i.test(file.name)) {
         return await handleJSONContent(
           JSON.parse(await readImportFile(file, 'text')),
         );

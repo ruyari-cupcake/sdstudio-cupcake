@@ -43,6 +43,9 @@ export type DriveAuthErrorCode =
   | 'network'
   | 'server'
   | 'not-configured'
+  | 'invalid-client-config'
+  | 'client-config-read-failed'
+  | 'client-config-save-failed'
   // Android: Google Play 서비스가 DEVELOPER_ERROR(10)를 돌려줌 — 이 APK 의 패키지 이름·서명 지문이
   // Google Cloud 프로젝트에 등록되지 않음(직접 빌드·다른 키 서명). 2026-10-02.
   | 'signing-not-registered'
@@ -68,9 +71,15 @@ export const DRIVE_AUTH_ERROR_TEXT: Record<DriveAuthErrorCode, string> = {
   network: '네트워크에 연결할 수 없습니다. 인터넷 연결을 확인해 주세요.',
   server: 'Google 서버 응답이 올바르지 않습니다. 잠시 뒤 다시 시도해 주세요.',
   'not-configured':
-    '이 빌드에는 Google 드라이브 연동 설정이 들어 있지 않습니다.',
+    'Google 앱 설정이 필요합니다. 아래에서 데스크톱 OAuth JSON을 불러온 뒤 계정을 연결해 주세요.',
+  'invalid-client-config':
+    'Google Cloud에서 내려받은 데스크톱 앱 OAuth JSON을 선택해 주세요. 웹 앱 설정이나 계정 토큰 파일은 사용할 수 없습니다.',
+  'client-config-read-failed':
+    'Google 앱 설정 파일을 읽지 못했습니다. 파일 접근 권한을 확인하거나 설정 파일을 다시 불러와 주세요.',
+  'client-config-save-failed':
+    'Google 앱 설정을 저장하지 못했습니다. 기존 설정은 유지됩니다. 저장 공간과 폴더 권한을 확인한 뒤 다시 시도해 주세요.',
   'signing-not-registered':
-    '이 빌드의 서명이 Google 프로젝트에 등록되어 있지 않습니다. 공식 배포 APK 를 쓰거나, 직접 빌드했다면 자신의 Google Cloud 프로젝트에 패키지 이름과 서명 지문을 등록해야 합니다.',
+    '이 앱의 패키지 이름과 서명 지문이 Google 프로젝트에 등록되어 있지 않습니다. 앱 배포자가 Google Cloud의 Android 클라이언트 등록을 완료해야 합니다. 공개판과 비공개판은 각각 등록합니다.',
   unknown: '알 수 없는 오류로 연결하지 못했습니다.',
 };
 
@@ -111,12 +120,18 @@ export type DriveAuthConnectResult =
   | { ok: true; status: DriveAuthStatus }
   | { ok: false; code: DriveAuthErrorCode; detail?: string };
 
+// Configuration selection stays in main: no client values return to the renderer.
+export type DriveAuthConfigureResult =
+  | { ok: true; status: DriveAuthStatus | null }
+  | { ok: false; code: DriveAuthErrorCode; detail?: string };
+
 // IPC 채널 이름(main.ts·preload·electronBackend 공용).
 export const DRIVE_AUTH_CHANNEL = {
   status: 'drive-auth-status',
   // 연결 여부만(네트워크 조회 없음) — 내보내기 목적지 결정용(드라이브 API ②).
   connected: 'drive-auth-connected',
   connect: 'drive-auth-connect',
+  configure: 'drive-auth-configure',
   cancel: 'drive-auth-cancel',
   disconnect: 'drive-auth-disconnect',
   changed: 'drive-auth-changed',

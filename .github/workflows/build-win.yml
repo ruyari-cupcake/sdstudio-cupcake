@@ -54,6 +54,10 @@ jobs:
 
       - name: Build application
         run: npm run build
+        env:
+          # Google 드라이브 연동 OAuth 클라이언트(main 번들에 빌드 시 주입). Secrets 미등록이면 빈 값 → 연동 설정 없는 빌드.
+          SDSTUDIO_GOOGLE_CLIENT_ID: ${{ secrets.SDSTUDIO_GOOGLE_CLIENT_ID }}
+          SDSTUDIO_GOOGLE_CLIENT_SECRET: ${{ secrets.SDSTUDIO_GOOGLE_CLIENT_SECRET }}
 
       - name: Package (win-unpacked)
         run: npx electron-builder build --win --dir --publish never
@@ -108,6 +112,22 @@ jobs:
         with:
           name: ${{ env.artifact_prefix }}-Windows-update-acceptance
           path: '${{ runner.temp }}/sdstudio-update-acceptance/'
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Exercise packaged Google application configuration
+        run: node tools/electron-google-config-smoke.cjs
+        env:
+          SDSTUDIO_PACKAGED: '1'
+          ELECTRON_EXECUTABLE: '${{ github.workspace }}/release/build/win-unpacked/${{ env.app_executable }}'
+          SDSTUDIO_SMOKE_REPORT_DIR: '${{ runner.temp }}/sdstudio-google-config-acceptance'
+
+      - name: Upload Google configuration acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact_prefix }}-Windows-google-config-acceptance
+          path: '${{ runner.temp }}/sdstudio-google-config-acceptance/'
           if-no-files-found: warn
           retention-days: 30
 

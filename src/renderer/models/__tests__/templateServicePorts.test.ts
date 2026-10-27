@@ -93,7 +93,11 @@ describe('template and trash service ports', () => {
         add: jest.fn(async () => undefined),
         exportSessionShallow: jest.fn(async () => session.toJSON()),
         importSessionShallow: jest.fn(async () => undefined),
+        reloadPieceLibraryDB: jest.fn(async () => undefined),
+        flushProjectNow: jest.fn(async () => undefined),
+        markDirty: jest.fn(),
         guardCrossWindowLock: jest.fn(async () => true),
+        isMirror: jest.fn(() => false),
       };
       const images = {
         invalidateCacheBatch: jest.fn(async () => undefined),

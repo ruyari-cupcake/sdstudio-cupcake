@@ -32,6 +32,7 @@ export type Channels =
   | 'save-export-to-downloads'
   | 'drive-auth-status'
   | 'drive-auth-connect'
+  | 'drive-auth-configure'
   | 'drive-auth-cancel'
   | 'drive-auth-disconnect'
   | 'drive-auth-changed'

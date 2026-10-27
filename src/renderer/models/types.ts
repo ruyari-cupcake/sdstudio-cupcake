@@ -305,30 +305,39 @@ export type ContextAlt = ImageContextAlt | SceneContextAlt | StyleContextAlt;
 export const encodeContextAlt = (x: ContextAlt) => JSON.stringify(x)!;
 export const decodeContextAlt = JSON.parse as (x: string) => ContextAlt;
 
+const isSessionMap = (value: unknown): boolean =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
 export const isValidSession = (session: any) => {
   return (
+    !!session &&
     typeof session.name === 'string' &&
+    session.presets !== null &&
     typeof session.presets === 'object' &&
-    typeof session.inpaints === 'object' &&
-    typeof session.scenes === 'object' &&
-    typeof session.library === 'object'
+    isSessionMap(session.inpaints) &&
+    isSessionMap(session.scenes) &&
+    isSessionMap(session.library)
   );
 };
 
 export const isValidPieceLibrary = (library: any) => {
   return (
+    !!library &&
     (typeof library.name === 'string' ||
       typeof library.description === 'string') &&
-    library.pieces
+    (library.version
+      ? Array.isArray(library.pieces)
+      : isSessionMap(library.pieces))
   );
 };
 
 export const isValidNAISPreset = (data: any) => {
   return (
+    !!data &&
     typeof data.name === 'string' &&
     Array.isArray(data.scenes) &&
     data.scenes.length > 0 &&
-    typeof data.scenes[0].scenePrompt === 'string'
+    typeof data.scenes[0]?.scenePrompt === 'string'
   );
 };
 

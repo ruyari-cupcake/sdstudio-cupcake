@@ -93,6 +93,28 @@ function DriveConnectSection({ onStatusChange }: Props) {
     }
   };
 
+  const configure = async () => {
+    if (busy || connecting || status?.connected || status?.connecting) return;
+    setBusy(true);
+    try {
+      const next = await backend.driveAuthConfigure();
+      if (next) {
+        if (aliveRef.current) setStatus(next);
+        appState.pushMessage(GOOGLE_DRIVE_TEXT.configured);
+      }
+    } catch (error) {
+      appState.pushDialog({
+        type: 'yes-only',
+        text:
+          error instanceof Error
+            ? error.message
+            : GOOGLE_DRIVE_TEXT.configureFailed,
+      });
+    } finally {
+      if (aliveRef.current) setBusy(false);
+    }
+  };
+
   const cancel = async () => {
     try {
       await backend.driveAuthCancel();
@@ -175,6 +197,30 @@ function DriveConnectSection({ onStatusChange }: Props) {
           </button>
         )}
       </div>
+      {!isMobile && !view.canDisconnect && (
+        <div className="space-y-2">
+          <button
+            type="button"
+            className={`${btn} back-gray`}
+            disabled={busy || connecting || !status || view.canCancel}
+            onClick={configure}
+          >
+            {GOOGLE_DRIVE_TEXT.configureButton}
+          </button>
+          <p className="text-xs text-muted">
+            {GOOGLE_DRIVE_TEXT.configureHint}
+          </p>
+          <button
+            type="button"
+            className="text-xs underline text-muted"
+            onClick={() =>
+              backend.openWebPage(GOOGLE_DRIVE_TEXT.configureHelpUrl)
+            }
+          >
+            {GOOGLE_DRIVE_TEXT.configureHelp}
+          </button>
+        </div>
+      )}
       {view.notice && (
         <div className="space-y-1">
           <p className="text-sm text-body break-words">{view.notice}</p>

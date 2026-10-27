@@ -1638,14 +1638,21 @@ export const CharacterPresetEditor = observer(
                   <button
                     type="button"
                     onClick={async () => {
-                      const names =
-                        await templateService.importSceneTemplate(curSession);
-                      if (names && names.length > 0) {
-                        setSelectedScenes((prev) => {
-                          const next = new Set(prev);
-                          names.forEach((n) => next.add(n));
-                          return next;
-                        });
+                      try {
+                        const names =
+                          await templateService.importSceneTemplate(curSession);
+                        if (names && names.length > 0) {
+                          setSelectedScenes((prev) => {
+                            const next = new Set(prev);
+                            names.forEach((n) => next.add(n));
+                            return next;
+                          });
+                        }
+                      } catch (error) {
+                        appState.pushMessage(
+                          `씬을 저장하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`,
+                          'error',
+                        );
                       }
                     }}
                     className="text-xs btn-link"

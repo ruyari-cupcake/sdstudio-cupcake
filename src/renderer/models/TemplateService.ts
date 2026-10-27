@@ -4,13 +4,16 @@ import type { Backend } from '../backend';
 import type { SessionService } from './SessionService';
 import type { TrashService } from './TrashService';
 import type { ProjectTemplateService } from './ProjectTemplateService';
+import type { GlobalPieceService } from './GlobalPieceService';
 import { getAppState } from './appStateRef';
 import { nameErrorMessage, projectNameRules, promptName } from './nameInput';
-import { type Session, genericSceneFromJSON } from './types';
+import { type Session, PieceLibrary, Scene, isValidSession } from './types';
+import { prepareSceneTransfer } from './sceneTransfer';
 import { stringifyExportJson } from './jsonExport';
 import { askImportPolicy, notifyImportDone } from './importFlow';
 
 export interface TemplateServiceDependencies {
+  readonly globalPieceService?: Pick<GlobalPieceService, 'library'>;
   readonly backend: Pick<Backend, 'existFile' | 'readFile' | 'writeFile'>;
   readonly sessionService: Pick<
     SessionService,
@@ -20,6 +23,11 @@ export interface TemplateServiceDependencies {
     | 'getFolderOf'
     | 'exportSessionShallow'
     | 'importSessionShallow'
+    | 'reloadPieceLibraryDB'
+    | 'flushProjectNow'
+    | 'markDirty'
+    | 'guardCrossWindowLock'
+    | 'isMirror'
   >;
   readonly trashService: Pick<TrashService, 'moveSceneToTrash'>;
   readonly projectTemplateService: Pick<
@@ -687,12 +695,14 @@ export class TemplateService {
       appState.pushMessage('올바른 씬 템플릿 파일이 아닙니다.');
       return null;
     }
-    if (
-      data?.type !== 'sdstudio-scene-template' ||
-      !data.session ||
-      typeof data.session !== 'object'
-    ) {
-      appState.pushMessage('올바른 씬 템플릿 파일이 아닙니다.');
+    // Older shared emotion packs are complete project JSON files. Their scene
+    // and local-piece contracts are the same as the current wrapped template.
+    const sessionData =
+      data?.type === 'sdstudio-scene-template' ? data.session : data;
+    if (!isValidSession(sessionData)) {
+      appState.pushMessage(
+        '씬 템플릿 또는 SDStudio 프로젝트 JSON을 선택해주세요. 조각그룹 JSON은 프롬프트조각 → 불러오기에서 추가할 수 있습니다.',
+      );
       return null;
     }
     await this.ensureLoaded();
@@ -724,7 +734,7 @@ export class TemplateService {
     }
     try {
       await this.services.sessionService.importSessionShallow(
-        data.session,
+        sessionData,
         name,
       );
     } catch (e: any) {
@@ -824,7 +834,7 @@ export class TemplateService {
       appState.pushMessage('씬 템플릿 프로젝트를 불러올 수 없습니다.');
       return null;
     }
-    const scenes = tpl.getScenes('scene');
+    const scenes = [...tpl.scenes.values()];
     if (scenes.length === 0) {
       appState.pushMessage('이 템플릿에는 씬이 없습니다.');
       return null;
@@ -848,25 +858,47 @@ export class TemplateService {
       if (!sel) return null;
       policy = sel;
     }
+    if (this.services.sessionService.isMirror(session.name)) {
+      appState.pushMessage(
+        '읽기 전용 창에서는 씬을 가져올 수 없습니다. 편집 중인 창에서 불러와주세요.',
+        'error',
+      );
+      return null;
+    }
+    if (
+      !(await this.services.sessionService.guardCrossWindowLock(
+        session.name,
+        '씬 템플릿 불러오기',
+      ))
+    )
+      return null;
+    if (this.services.sessionService.isMirror(session.name)) return null;
+    const transfer = prepareSceneTransfer(
+      scenes
+        .filter(
+          (scene) =>
+            policy !== 'skip' || !session.hasScene('scene', scene.name),
+        )
+        .map((scene) => scene.toJSON()),
+      Object.fromEntries(
+        [...tpl.library].map(([name, library]) => [name, library.toJSON()]),
+      ),
+      session.library,
+      this.services.globalPieceService?.library,
+    );
+    // Publish dependencies before scenes, including across awaited trash moves.
+    for (const library of transfer.libraries)
+      session.library.set(library.name, PieceLibrary.fromJSON(library));
     let added = 0;
     let replaced = 0;
-    let skipped = 0;
+    const skipped = policy === 'skip' ? conflicts.length : 0;
     const importedNames: string[] = [];
     const moveFailed: string[] = [];
-    for (const src of scenes) {
+    for (const src of transfer.scenes) {
       // 크로스 프로젝트 씬 복사 선례(AppContextMenu '설정만 복사') 재사용 —
       // 템플릿 프로젝트에서 생성된 이미지/토너먼트 흔적은 가져오지 않는다.
-      const scene = genericSceneFromJSON(src.toJSON());
-      if (!scene) continue;
-      scene.imageMap = [];
-      scene.mains = [];
-      (scene as any).game = undefined;
-      (scene as any).round = undefined;
+      const scene = Scene.fromJSON(src);
       if (session.hasScene(scene.type, scene.name)) {
-        if (policy === 'skip') {
-          skipped++;
-          continue;
-        }
         if (policy === 'overwrite') {
           const old = session.getScene(scene.type, scene.name);
           // 기존 씬을 휴지통으로 옮기지 못하면(파일 잠금·다른 창 잠금) 덮어쓰지 않고 건너뛴다 —
@@ -900,6 +932,11 @@ export class TemplateService {
       session.addScene(scene);
       added++;
       importedNames.push(scene.name);
+    }
+    if (importedNames.length > 0) {
+      this.services.sessionService.markDirty(session.name);
+      await this.services.sessionService.flushProjectNow(session.name);
+      await this.services.sessionService.reloadPieceLibraryDB(session);
     }
     const parts = [`추가 ${added}개`];
     if (replaced) parts.push(`덮어쓰기 ${replaced}개`);

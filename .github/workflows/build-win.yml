@@ -27,6 +27,11 @@ jobs:
       - name: Verify root and packaged app release versions
         run: node tools/check-release-metadata.cjs --ci-env
 
+      # This real helper contract is independent of npm and the packaged app.
+      - name: Verify Windows update replacement and recovery
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows-update-helper-smoke.ps1
+
       - name: Install native module dependencies
         run: |
           cd src/native
@@ -55,10 +60,6 @@ jobs:
 
       - name: Record files owned by this application build
         run: node tools/write-app-manifest.cjs release/build/win-unpacked
-
-      - name: Verify Windows update replacement and recovery
-        shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows-update-helper-smoke.ps1
 
       # The real packaged window must accept OS mouse/keyboard input. DOM/CDP
       # clicks alone bypass Electron's draggable non-client regions.

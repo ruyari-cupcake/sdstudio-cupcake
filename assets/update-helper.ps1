@@ -127,7 +127,9 @@ function Write-Result([string] $State, [string] $Message = '', [bool] $RolledBac
     $temporary = $resultPath + '.tmp'
     [IO.File]::WriteAllText($temporary, ($result | ConvertTo-Json -Depth 5), $utf8)
     if ([IO.File]::Exists($resultPath)) {
-        [IO.File]::Replace($temporary, $resultPath, $null)
+        # A .NET string argument receives an empty string for PowerShell $null.
+        # File.Replace needs an actual null to omit its backup filename.
+        [IO.File]::Replace($temporary, $resultPath, [System.Management.Automation.Language.NullString]::Value)
     } else {
         [IO.File]::Move($temporary, $resultPath)
     }

@@ -279,6 +279,20 @@ function Ready([object] $Run) {
     }
 }
 
+function Helper-Diagnostics([object] $Run) {
+    Assert $Run.Process.HasExited 'Helper diagnostics require an exited process.'
+    # ReadToEnd is safe here only because the caller has already waited for exit.
+    $output = $Run.Process.StandardOutput.ReadToEnd()
+    $errors = $Run.Process.StandardError.ReadToEnd()
+    $resultFile = Join-Path $Run.Workspace 'result.json'
+    $resultText = '<missing>'
+    if ([IO.File]::Exists($resultFile)) {
+        $resultText = [IO.File]::ReadAllText($resultFile, $utf8)
+    }
+    return ('exit=' + $Run.Process.ExitCode + '; stdout=' + $output +
+        '; stderr=' + $errors + '; result=' + $resultText)
+}
+
 function Apply([object] $Run, [object] $Fixture) {
     $Run.Process.StandardInput.WriteLine('APPLY')
     $Run.Process.StandardInput.Flush()
@@ -310,7 +324,9 @@ try {
     Ready $run
     $run.Process.StandardInput.Close()
     $run.Process.WaitForExit()
-    Assert ($run.Process.ExitCode -eq 0) 'Cancel did not exit normally.'
+    Assert ($run.Process.ExitCode -eq 0) ('Cancel did not exit normally. ' + (Helper-Diagnostics $run))
+    $cancelResult = [IO.File]::ReadAllText((Join-Path $run.Workspace 'result.json'), $utf8) | ConvertFrom-Json
+    Assert ($cancelResult.state -ceq 'cancelled') 'Cancel did not persist its completed state.'
     Assert (-not $fixture.Main.HasExited) 'Cancel stopped the running application.'
     Assert ((Hash $fixture.MainExecutable) -ceq (Hash $script:oldBinary)) 'Cancel changed the installed executable.'
     Assert ([IO.File]::Exists((Join-Path $fixture.Installed 'resources\old.txt'))) 'Cancel removed an installed file.'

@@ -1,0 +1,300 @@
+import { imageService, taskQueueService, workFlowService } from '..';
+import { getImageDimensions } from '../../componenets/BrushTool';
+import { dataUriToBase64 } from '../ImageService';
+import { createSDPrompts, createSDCharacterPrompts } from '../PromptService';
+import type { TaskParam } from '../TaskQueueService';
+import type {
+  AugmentJob,
+  GenericScene,
+  PromptNode,
+  Scene,
+  SDAbstractJob,
+  Session,
+} from '../types';
+import {
+  WFDefBuilder,
+  wfiIfIn,
+  wfiInlineInput,
+  wfiMiddlePlaceholderInput,
+  wfiPresetSelect,
+  wfiSceneOnly,
+  wfiShowImage,
+  wfiStack,
+  WFVarBuilder,
+} from './WorkFlow';
+
+const AugmentGenPreset = new WFVarBuilder()
+  .addPromptVar('frontPrompt', '')
+  .addPromptVar('backPrompt', '');
+
+const AugmentGenShared = new WFVarBuilder()
+  .addImageVar('image')
+  .addIntVar('weaken', 0, 5, 1, 0)
+  .addSelectVar(
+    'method',
+    [
+      { value: 'emotion', label: '감정' },
+      { value: 'colorize', label: '색칠' },
+      { value: 'lineart', label: '라인아트' },
+      { value: 'bg-removal', label: '배경제거' },
+      { value: 'declutter', label: '글자제거' },
+      { value: 'sketch', label: '스케치화' },
+    ],
+    'emotion',
+  );
+
+export const emotions = [
+  'neutral',
+  'happy',
+  'sad',
+  'angry',
+  'scared',
+  'surprised',
+  'tired',
+  'excited',
+  'nervous',
+  'thinking',
+  'confused',
+  'shy',
+  'disgusted',
+  'smug',
+  'bored',
+  'laughing',
+  'irritated',
+  'aroused',
+  'embarrassed',
+  'worried',
+  'love',
+  'determined',
+  'hurt',
+  'playful',
+];
+
+const AugmentGenMeta = new WFVarBuilder().addSelectVar(
+  'emotion',
+  emotions.map((e) => ({ value: e, label: e })),
+  'neutral',
+);
+
+const AugmentGenUI = wfiStack([
+  wfiInlineInput('수정방법', 'method', 'shared', 'flex-none'),
+  wfiInlineInput('이미지', 'image', 'shared', 'flex-none'),
+  wfiShowImage('image', 'shared', 'show-image'),
+  wfiIfIn(
+    'method',
+    'shared',
+    ['emotion', 'colorize'],
+    wfiPresetSelect(),
+    'if-preset-select',
+  ),
+  wfiIfIn(
+    'method',
+    'shared',
+    ['emotion', 'colorize'],
+    wfiInlineInput('상위 프롬프트', 'frontPrompt', 'preset', 'flex-1'),
+  ),
+  wfiIfIn(
+    'method',
+    'shared',
+    ['emotion', 'colorize'],
+    wfiMiddlePlaceholderInput('중위 프롬프트 (이 씬에만 적용)'),
+    'if-middle-prompt',
+  ),
+  wfiIfIn(
+    'method',
+    'shared',
+    ['emotion', 'colorize'],
+    wfiInlineInput('하위 프롬프트', 'backPrompt', 'preset', 'flex-1'),
+  ),
+  wfiIfIn(
+    'method',
+    'shared',
+    ['emotion'],
+    wfiSceneOnly(wfiInlineInput('감정', 'emotion', 'meta', 'flex-none', 'top')),
+  ),
+  wfiIfIn(
+    'method',
+    'shared',
+    ['emotion', 'colorize'],
+    wfiInlineInput('강도 약화', 'weaken', 'shared', 'flex-none'),
+  ),
+]);
+
+const AugmentGenHandler = async (
+  session: Session,
+  scene: GenericScene,
+  prompt: PromptNode,
+  _characterPrompts: PromptNode[],
+  preset: any,
+  shared: any,
+  samples: number,
+  metaInput?: any,
+  onComplete?: (img: string) => void,
+  nodelay?: boolean,
+) => {
+  const meta = metaInput || workFlowService.buildMeta('AugmentGen');
+  const image = (await imageService.fetchVibeImage(session, shared.image))!;
+  const { width, height } = await getImageDimensions(dataUriToBase64(image));
+  const job: AugmentJob = {
+    type: 'augment',
+    image: dataUriToBase64(image),
+    method: shared.method,
+    emotion: meta.emotion,
+    weaken: shared.weaken,
+    prompt,
+    backend: preset.backend,
+    width,
+    height,
+  };
+  const param: TaskParam = {
+    session,
+    job,
+    scene,
+    nodelay,
+    outputPath: imageService.getOutputDir(session, scene),
+    onComplete,
+  };
+  await taskQueueService.addTask(param, samples);
+};
+
+const AugmentGenCreatePrompts = async (
+  session: Session,
+  scene: GenericScene,
+  preset: any,
+  shared: any,
+) => {
+  return await createSDPrompts(session, preset, shared, scene as Scene);
+};
+
+const AugmentGenCreateCharacterPrompts = async (
+  session: Session,
+  scene: GenericScene,
+  preset: any,
+  shared: any,
+) => {
+  return await createSDCharacterPrompts(
+    session,
+    preset,
+    shared,
+    scene as Scene,
+  );
+};
+
+export const AugmentGenDef = new WFDefBuilder('AugmentGen')
+  .setTitle('이미지 수정')
+  .setBackendType('image')
+  .setPresetVars(AugmentGenPreset.build())
+  .setSharedVars(AugmentGenShared.build())
+  .setMetaVars(AugmentGenMeta.build())
+  .setEditor(AugmentGenUI)
+  .setCreatePrompt(AugmentGenCreatePrompts)
+  .setCreateCharacterPrompts(AugmentGenCreateCharacterPrompts)
+  .setHandler(AugmentGenHandler)
+  .build();
+
+const AugmentPreset = new WFVarBuilder()
+  .addImageVar('image')
+  .addIntVar('weaken', 0, 5, 1, 0)
+  .addSelectVar(
+    'method',
+    [
+      { value: 'emotion', label: '감정' },
+      { value: 'colorize', label: '색칠' },
+      { value: 'lineart', label: '라인아트' },
+      { value: 'bg-removal', label: '배경제거' },
+      { value: 'declutter', label: '글자제거' },
+      { value: 'sketch', label: '스케치화' },
+    ],
+    'emotion',
+  )
+  .addSelectVar(
+    'emotion',
+    emotions.map((e) => ({ value: e, label: e })),
+    'neutral',
+  )
+  .addPromptVar('prompt', '');
+
+function createAugmentPreset(
+  job: SDAbstractJob<string>,
+  image?: string,
+  _mask?: string,
+): any {
+  const preset = workFlowService.buildPreset('Augment');
+  preset.image = image;
+  preset.prompt = job.prompt;
+  return preset;
+}
+
+const AugmentUI = wfiStack([
+  wfiInlineInput('수정방법', 'method', 'preset', 'flex-none'),
+  wfiInlineInput('이미지', 'image', 'preset', 'flex-none'),
+  wfiIfIn(
+    'method',
+    'preset',
+    ['emotion', 'colorize'],
+    wfiInlineInput('프롬프트', 'prompt', 'preset', 'flex-1'),
+  ),
+  wfiIfIn(
+    'method',
+    'preset',
+    ['emotion'],
+    wfiInlineInput('감정', 'emotion', 'preset', 'flex-none', 'top'),
+  ),
+  wfiIfIn(
+    'method',
+    'preset',
+    ['emotion', 'colorize'],
+    wfiInlineInput('강도 약화', 'weaken', 'preset', 'flex-none'),
+  ),
+]);
+
+const AugmentHandler = async (
+  session: Session,
+  scene: GenericScene,
+  _prompt: PromptNode,
+  _characterPrompts: PromptNode[],
+  preset: any,
+  _shared: any,
+  samples: number,
+  _meta?: any,
+  onComplete?: (img: string) => void,
+  nodelay?: boolean,
+) => {
+  const image = (await imageService.fetchVibeImage(session, preset.image))!;
+  const promptNode: PromptNode = {
+    type: 'text',
+    text: preset.prompt,
+  };
+  const { width, height } = await getImageDimensions(dataUriToBase64(image));
+  const job: AugmentJob = {
+    type: 'augment',
+    image: dataUriToBase64(image),
+    method: preset.method,
+    emotion: preset.emotion,
+    weaken: preset.weaken,
+    prompt: promptNode,
+    backend: preset.backend,
+    width,
+    height,
+  };
+  const param: TaskParam = {
+    session,
+    job,
+    scene,
+    nodelay,
+    outputPath: imageService.getOutputDir(session, scene),
+    onComplete,
+  };
+  await taskQueueService.addTask(param, samples);
+};
+
+export const AugmentDef = new WFDefBuilder('Augment')
+  .setTitle('이미지 수정')
+  .setBackendType('image')
+  .setI2I(true)
+  .setEmoji('🪛')
+  .setPresetVars(AugmentPreset.build())
+  .setEditor(AugmentUI)
+  .setCreatePreset(createAugmentPreset)
+  .setHandler(AugmentHandler)
+  .build();

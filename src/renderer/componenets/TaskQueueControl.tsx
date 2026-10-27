@@ -1,0 +1,542 @@
+import { useEffect, useRef, useState } from 'react';
+import { FaPlay, FaStop, FaTimes, FaRegClock } from 'react-icons/fa';
+import { observer } from 'mobx-react-lite';
+import SceneQueueMenu from './SceneQueueMenu';
+import { ActionIcon } from './ActionIcon';
+import { taskQueueService, cyclingSessionService } from '../models';
+import type { Task } from '../models/TaskQueueService';
+import { appState } from '../models/AppService';
+import { isV2 } from '../models/mobileV2';
+import Tooltip from './Tooltip';
+import { addScenesToQueue } from '../models/sceneQueueActions';
+import { REQUEST_DELAY_TEXT } from '../models/requestTiming';
+
+interface ProgressBarProps {
+  duration: number;
+  isError: boolean;
+  text: string;
+  // 이미 흘러간 시간(초) — 음수 animation-delay 로 애니메이션을 중간부터 이어
+  // 그린다. 컨트롤이 도크↔플로팅 이동으로 재마운트될 때 0부터 다시 차오르는
+  // 문제 방지(경과 초과 시에는 fill-mode:forwards 라 꽉 찬 상태로 유지).
+  elapsed?: number;
+  // 모바일 V2: 고정/클램프 폭 대신 부모가 준 폭을 그대로 채우고 시계 아이콘을 뺀다(예약 버튼을 덮던 문제, 2026-09-21 실기기).
+  fit?: boolean;
+  // 긴 휴식 중(T3b): 채움을 회색 토큰(back-gray = --c-gray-bg/--c-gray-fg)으로 그린다.
+  isRest?: boolean;
+}
+
+function ProgressBar({
+  duration,
+  isError,
+  text,
+  elapsed,
+  fit,
+  isRest,
+}: ProgressBarProps) {
+  const animStyle = {
+    animationDuration: `${duration}s`,
+    animationDelay: `-${elapsed ?? 0}s`,
+  };
+  return (
+    <div
+      // 모바일 폭(md 미만)은 남는 폭에 맞춰 6~10rem 으로 줄어든다 — 360px 기기에서 고정 160px 때문에
+      // 시작 버튼이 화면 밖으로 밀리던 문제(2026-09-20). md 이상은 기존 고정 폭.
+      className={`relative ${fit ? 'w-full' : 'w-[clamp(6rem,calc(100vw-14.5rem),10rem)] md:w-40 lg:w-52'} bg-gray-200 dark:bg-slate-700 rounded-full h-8 overflow-hidden`}
+    >
+      {/* tabular-nums: 남은 개수·예상 시간 숫자가 바뀌어도 폭이 출렁이지 않게 */}
+      <div
+        className={`top-0 left-0 w-full h-8 absolute flex items-center justify-center text-gray-600 dark:text-white gap-2 ${fit ? 'px-1.5' : 'px-2'} md:px-0`}
+      >
+        {!fit && <FaRegClock size={20} className="flex-none" />}
+        <div className="flex-1 min-w-0 md:flex-none md:w-28 lg:w-40 text-xs lg:text-sm text-center overflow-hidden text-nowrap tabular-nums">
+          {text}
+        </div>
+      </div>
+      <div
+        className={`top-0 left-0 absolute w-full progress-transition rounded-full h-8 progress-clip-animation ${
+          isRest
+            ? 'back-gray'
+            : !isError
+              ? 'bg-sky-500 dark:bg-indigo-400'
+              : 'bg-red-500'
+        }`}
+        style={animStyle}
+      />
+      <div
+        className={`top-0 left-0 w-full h-8 absolute flex items-center justify-center ${isRest ? 'back-gray !bg-transparent' : 'text-white'} gap-2 ${fit ? 'px-1.5' : 'px-2'} md:px-0 progress-clip-animation`}
+        style={animStyle}
+      >
+        {!fit && <FaRegClock size={20} className="flex-none" />}
+        <div className="flex-1 min-w-0 md:flex-none md:w-28 lg:w-40 text-xs lg:text-sm text-center overflow-hidden text-nowrap tabular-nums">
+          {text}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface TaskProgressBarProps {
+  fast?: boolean;
+  fit?: boolean;
+  onActivate?: () => void;
+}
+export function TaskProgressBar({
+  fast: _fast,
+  fit,
+  onActivate,
+}: TaskProgressBarProps) {
+  const key = useRef<number>(0);
+  // 마운트 시점에 이미 실행 중이면(도크↔플로팅 재마운트 등) 진행 중이던 사이클을
+  // 이어받는다: 길이는 현재 태스크 예상치, 경과는 서비스의 사이클 시작 시각 기준.
+  // (새 사이클이 시작되면 onStart/onComplete 가 elapsed 를 0 으로 되돌린다.)
+  const [duration, setDuration] = useState(() =>
+    taskQueueService.isRunning()
+      ? taskQueueService.estimateTopTaskTime('mean') / 1000
+      : 0,
+  );
+  const [elapsed, setElapsed] = useState(() =>
+    taskQueueService.isRunning() && taskQueueService.progressCycleStartedAt > 0
+      ? Math.max(
+          0,
+          (Date.now() - taskQueueService.progressCycleStartedAt) / 1000,
+        )
+      : 0,
+  );
+  const [isError, setIsError] = useState(false);
+  const [error, setError] = useState<string>('');
+  const [, rerender] = useState<{}>({});
+  // 긴 휴식(T3b) — 서비스의 휴식 상태가 바뀔 때만 막대를 새로 그린다(key 교체).
+  const restRef = useRef<boolean>(taskQueueService.isLongBreak());
+  const isRest = taskQueueService.isRunning() && taskQueueService.isLongBreak();
+  const formatTime = (ms: number) => {
+    const seconds = ms / 1000;
+    const minutes = seconds / 60;
+    const hours = minutes / 60;
+
+    if (seconds < 60) {
+      return `${Math.round(seconds)}초`;
+    }
+    if (minutes < 60) {
+      return `${Math.round(minutes)}분`;
+    }
+    return `${Math.round(hours)}시간`;
+  };
+  const getProgressText = () => {
+    const stats = taskQueueService.statsAllTasks();
+    // 표시 방어: 통계가 일시적으로 어긋나도 음수("-1개 남음")는 보여주지 않는다.
+    const remain = Math.max(0, stats.total - stats.done);
+    const ms = taskQueueService.estimateTime('mean');
+    const timeEstimate = formatTime(ms);
+    // 좁은 막대(fit)는 짧은 문구 — "12개 · 3분"
+    if (fit) return `${remain}개·${timeEstimate}`;
+    return `${remain}개 남음 (예상 ${timeEstimate})`;
+  };
+
+  useEffect(() => {
+    const nextKey = () => {
+      key.current += 1;
+      rerender({});
+    };
+    const onChange = () => {
+      if (!taskQueueService.isRunning()) {
+        nextKey();
+        setDuration(0);
+        setElapsed(0);
+        setIsError(false);
+        setError('');
+      }
+      // 휴식 시작·끝: 막대를 새로 그린다. 끝나면 다음 작업 사이클을 처음부터(서비스가 사이클
+      // 시작 시각도 다시 찍는다).
+      const rest = taskQueueService.isLongBreak();
+      if (rest !== restRef.current) {
+        restRef.current = rest;
+        nextKey();
+        if (!rest && taskQueueService.isRunning()) {
+          setIsError(false);
+          setError('');
+          setElapsed(0);
+          setDuration(taskQueueService.estimateTopTaskTime('mean') / 1000);
+        }
+      }
+      rerender({});
+    };
+    const onComplete = () => {
+      nextKey();
+      setIsError(false);
+      setError('');
+      setElapsed(0); // 새 사이클 — 처음부터 차오름
+      setDuration(taskQueueService.estimateTopTaskTime('mean') / 1000);
+      if (!taskQueueService.isRunning()) {
+        setDuration(0);
+      }
+    };
+    const onStart = () => {
+      nextKey();
+      setIsError(false);
+      setError('');
+      setElapsed(0); // 새 사이클 — 처음부터 차오름
+      setDuration(taskQueueService.estimateTopTaskTime('mean') / 1000);
+      if (!taskQueueService.isRunning()) {
+        setDuration(0);
+      }
+    };
+    const onError = (e: any) => {
+      if (e.detail.task.type === 'remove-bg') {
+        appState.pushMessage(`Error: ${e.detail.error}`);
+      }
+      setError(e.detail.error);
+      setIsError(true);
+    };
+    taskQueueService.addEventListener('start', onStart);
+    taskQueueService.addEventListener('stop', onChange);
+    taskQueueService.addEventListener('progress', onChange);
+    taskQueueService.addEventListener('complete', onComplete);
+    taskQueueService.addEventListener('error', onError);
+    return () => {
+      taskQueueService.removeEventListener('start', onStart);
+      taskQueueService.removeEventListener('stop', onChange);
+      taskQueueService.removeEventListener('progress', onChange);
+      taskQueueService.removeEventListener('complete', onComplete);
+      taskQueueService.removeEventListener('error', onError);
+    };
+  }, []);
+
+  // 휴식 중에는 남은 시간 문구를 1초마다 다시 그린다(채움 애니메이션은 CSS 가 이어 그림).
+  useEffect(() => {
+    if (!isRest) return undefined;
+    const timer = setInterval(() => rerender({}), 1000);
+    return () => clearInterval(timer);
+  }, [isRest]);
+
+  // 휴식 중 막대: 길이 = 휴식 전체, 경과 = 휴식 시작부터(재마운트돼도 서비스 시각 기준으로 이어 그림).
+  const rest = isRest ? taskQueueService.longBreakWindow() : null;
+  const restDuration = rest
+    ? Math.max(0, (rest.until - rest.startedAt) / 1000)
+    : 0;
+  const restElapsed = rest
+    ? Math.max(0, (Date.now() - rest.startedAt) / 1000)
+    : 0;
+
+  return (
+    <button
+      type="button"
+      className={fit ? 'w-full' : undefined}
+      aria-label={isRest ? '생성 휴식 안내' : '작업 진행 상황'}
+      onClick={(e) => {
+        if (isRest) {
+          // 휴식 안내만 띄운다(목록 펼치기 등 바깥 클릭 동작은 막는다). 기존 확인 한 개 창 경로.
+          e.stopPropagation();
+          void appState.pushDialogAsync({
+            type: 'yes-only',
+            text: REQUEST_DELAY_TEXT.breakNotice,
+          });
+          return;
+        }
+        if (error !== '') {
+          appState.pushMessage(`Error: ${error}`);
+        }
+        onActivate?.();
+      }}
+    >
+      <ProgressBar
+        key={key.current}
+        isError={rest ? false : isError}
+        isRest={!!rest}
+        duration={rest ? restDuration : duration}
+        elapsed={rest ? restElapsed : elapsed}
+        text={
+          rest
+            ? REQUEST_DELAY_TEXT.breakProgress(rest.until - Date.now(), fit)
+            : getProgressText()
+        }
+        fit={fit}
+      />
+    </button>
+  );
+}
+
+function TaskQueueList({
+  onClose,
+  dropDown,
+}: {
+  onClose?: () => void;
+  // 컨트롤이 화면 상단에 있을 때(플로팅 위젯) 목록을 아래로 펼침 — 기본은 기존처럼 위로
+  dropDown?: boolean;
+}) {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  // Queue objects retain their identity as earlier tasks leave the list.
+  const taskKeys = useRef({ next: 0, keys: new WeakMap<Task, number>() });
+  const taskKey = (task: Task) => {
+    let key = taskKeys.current.keys.get(task);
+    if (key === undefined) {
+      key = taskKeys.current.next;
+      taskKeys.current.next += 1;
+      taskKeys.current.keys.set(task, key);
+    }
+    return key;
+  };
+  useEffect(() => {
+    const onChange = () => {
+      setTasks([...taskQueueService.queue]);
+    };
+    taskQueueService.addEventListener('start', onChange);
+    taskQueueService.addEventListener('stop', onChange);
+    taskQueueService.addEventListener('progress', onChange);
+    taskQueueService.addEventListener('complete', onChange);
+    taskQueueService.addEventListener('error', onChange);
+    onChange();
+    return () => {
+      taskQueueService.removeEventListener('start', onChange);
+      taskQueueService.removeEventListener('stop', onChange);
+      taskQueueService.removeEventListener('progress', onChange);
+      taskQueueService.removeEventListener('complete', onChange);
+      taskQueueService.removeEventListener('error', onChange);
+    };
+  }, []);
+
+  const getEmoji = (task: Task) => {
+    return taskQueueService.getTaskInfo(task).emoji;
+  };
+
+  const getTaskText = (task: Task) => {
+    return taskQueueService.getTaskInfo(task).name;
+  };
+
+  return (
+    <div
+      className={`absolute ${
+        dropDown ? 'top-full mt-2 ' : 'bottom-0 mb-14 md:mb-20 '
+      }bg-white dark:bg-slate-700 w-60 md:w-96 z-[var(--z-widget)] shadow-lg prog-list flex flex-col overflow-hidden`}
+    >
+      <button
+        type="button"
+        className="ml-auto mt-2 mr-2 text-muted hover:text-gray-700 flex-none"
+        aria-label="닫기"
+        onClick={() => {
+          onClose?.();
+        }}
+      >
+        <FaTimes size={20} />
+      </button>
+      <div className="flex-1 overflow-hidden pb-2">
+        <div className="h-full overflow-auto">
+          {tasks.map((task) => (
+            <div
+              key={taskKey(task)}
+              className="flex mt-2 items-center gap-2 p-2 line-color border mx-2 rounded-lg"
+            >
+              <div className="flex-none ">{getEmoji(task)}</div>
+              <div className="flex-1 truncate text-default">
+                {getTaskText(task)}
+              </div>
+              <div className="flex-none ml-auto p-2 bg-gray-300 dark:bg-slate-500 dark:text-white rounded-lg font-medium text-sm text-gray-500">
+                {task!.done}/{task!.total}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const TaskQueueControl = observer(() => {
+  const [, rerender] = useState<{}>({});
+  const [showList, setShowList] = useState(false);
+  // 목록 펼침 방향: 컨트롤(플로팅 위젯 포함)이 화면 위쪽 절반이면 아래로 펼친다
+  const [listDropDown, setListDropDown] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const onChange = () => {
+      rerender({});
+    };
+    taskQueueService.addEventListener('start', onChange);
+    taskQueueService.addEventListener('stop', onChange);
+    taskQueueService.addEventListener('progress', onChange);
+    taskQueueService.addEventListener('complete', onChange);
+    taskQueueService.addEventListener('error', onChange);
+    return () => {
+      taskQueueService.removeEventListener('start', onChange);
+      taskQueueService.removeEventListener('stop', onChange);
+      taskQueueService.removeEventListener('progress', onChange);
+      taskQueueService.removeEventListener('complete', onChange);
+      taskQueueService.removeEventListener('error', onChange);
+    };
+  }, []);
+
+  const cyclingActive =
+    cyclingSessionService.state === 'running' ||
+    cyclingSessionService.state === 'paused';
+  // 모바일 V2: 생성 위주 하단 바(막대는 남는 폭, 생성/중지 버튼은 이름을 달아 크게). 클래식은 기존 그대로.
+  const v2 = isV2('main');
+  // 하단 일괄 예약의 대상 종류 = 지금 보고 있는 메인 탭(2026-09-21 버그 수정). 예전에는 'scene' 고정이라
+  // 이미지변형 탭에서 눌러도 이미지생성 탭의 씬이 예약됐다(상단 툴바의 예약 추가는 탭 종류를 따름 — 동작 불일치).
+  // 씬 탭이 아닌 곳(프리셋·작가·퀵 생성)에서는 기존처럼 이미지생성 씬. globalActions.ts 와 같은 규칙.
+  const queueType: 'scene' | 'inpaint' =
+    appState.curMainTab === 'inpaint' ? 'inpaint' : 'scene';
+
+  return (
+    <div
+      ref={rootRef}
+      className={
+        v2
+          ? 'flex gap-1.5 items-center w-full min-w-0'
+          : 'flex gap-0.5 md:gap-2 lg:gap-4 items-center'
+      }
+    >
+      {showList && (
+        <TaskQueueList
+          dropDown={listDropDown}
+          onClose={() => {
+            setShowList(false);
+          }}
+        />
+      )}
+      {cyclingActive && (
+        <div className="hidden md:flex items-center gap-1 px-2 py-1 bg-sky-100 dark:bg-sky-900/30 rounded-lg text-xs whitespace-nowrap">
+          <span className="text-sky-600 dark:text-sky-400">🔄</span>
+          <span className="text-sky-700 dark:text-sky-300">
+            순차 ({cyclingSessionService.completedPresets + 1}/
+            {cyclingSessionService.totalPresets})
+          </span>
+        </div>
+      )}
+      <div className="whitespace-nowrap">
+        <span className="sr-only md:not-sr-only whitespace-nowrap text-default">
+          개수:
+        </span>
+        <input
+          aria-label="생성 개수"
+          min={1}
+          max={99}
+          className="ml-1 md:ml-2 p-1 w-10 md:w-16 text-center gray-input"
+          type="number"
+          value={appState.samples}
+          onChange={(e: any) => {
+            // parseInt 는 비숫자에서 NaN 을 반환하고 ??/Math.min 은 NaN 을 거르지
+            // 못한다 — NaN 이 samples 에 들어가면 큐 통계가 영구 오염된다.
+            const num = parseInt(e.currentTarget.value, 10);
+            appState.samples = Number.isFinite(num)
+              ? Math.max(1, Math.min(99, num))
+              : 1;
+          }}
+        />
+      </div>
+      <div
+        className={`relative cursor-pointer hover:brightness-95 active:brightness-90${v2 ? ' flex-1 min-w-[3.5rem]' : ''}`}
+      >
+        <TaskProgressBar
+          fit={v2}
+          onActivate={() => {
+            if (!showList) {
+              const rect = rootRef.current?.getBoundingClientRect();
+              setListDropDown(!!rect && rect.top < window.innerHeight / 2);
+            }
+            setShowList(!showList);
+          }}
+        />
+      </div>
+      <SceneQueueMenu
+        session={appState.curSession}
+        type={queueType}
+        selectedOnly={appState.selectedSceneCount(queueType) > 0}
+      >
+        <button
+          type="button"
+          className="round-button back-sky px-2 h-8 lg:px-6 disabled:opacity-50"
+          title={
+            queueType === 'inpaint'
+              ? '이미지변형 씬 일괄 예약 (선택한 씬이 있으면 선택 씬만)'
+              : '씬 일괄 예약 (선택한 씬이 있으면 선택 씬만)'
+          }
+          aria-label="씬 일괄 예약"
+          disabled={!appState.curSession}
+          onClick={() => {
+            if (appState.curSession) {
+              // 보고 있는 탭의 종류로 예약한다(queueType). 선택 예약 여부도 같은 종류의 선택 수로만 판단해
+              // 다른 탭에서 고른 이름으로 같은 이름의 씬을 예약하지 않는다.
+              void addScenesToQueue(
+                appState.curSession,
+                queueType,
+                appState.selectedSceneCount(queueType) > 0,
+              );
+            }
+          }}
+        >
+          <ActionIcon id="queue-add" size={18} />
+        </button>
+      </SceneQueueMenu>
+      {/* 예약 전부 제거는 확인 없이 즉시(의도된 동작) — 이름·툴팁만 붙인다(X11) */}
+      <Tooltip content="모든 예약 제거">
+        <button
+          type="button"
+          className="round-button back-gray px-2 h-8 lg:px-6"
+          aria-label="모든 예약 제거"
+          onClick={() => {
+            taskQueueService.removeAllTasks();
+          }}
+        >
+          <ActionIcon id="queue-remove" size={18} />
+        </button>
+      </Tooltip>
+      {!taskQueueService.isRunning() ? (
+        <Tooltip content="예약된 생성 시작">
+          <button
+            type="button"
+            className={
+              v2
+                ? 'round-button back-green flex-none !h-10 min-w-[96px] px-4 gap-2 !rounded-xl font-bold text-[15px]'
+                : `round-button back-green px-2 h-8 lg:px-6`
+            }
+            aria-label="생성 시작"
+            onClick={() => {
+              (async () => {
+                const costs = taskQueueService.calculateCost();
+                const message = costs
+                  .map((x) => `${x.text} (씬: ${x.scene})`)
+                  .slice(0, 10)
+                  .join('\n');
+                if (costs.length > 0) {
+                  appState.pushDialog({
+                    type: 'confirm',
+                    text:
+                      `Anlas를 소모하는 유료 세팅입니다. 계속합니까?` +
+                      `\n${message}`,
+                    callback: () => {
+                      taskQueueService.run();
+                    },
+                  });
+                } else {
+                  taskQueueService.run();
+                }
+              })();
+            }}
+          >
+            <FaPlay size={15} />
+            {v2 && <span>생성</span>}
+          </button>
+        </Tooltip>
+      ) : (
+        <Tooltip content="생성 중지">
+          <button
+            type="button"
+            className={
+              v2
+                ? 'round-button back-red flex-none !h-10 min-w-[96px] px-4 gap-2 !rounded-xl font-bold text-[15px]'
+                : `round-button back-red px-2 h-8 lg:px-6`
+            }
+            aria-label="생성 중지"
+            onClick={() => {
+              taskQueueService.stop();
+            }}
+          >
+            <FaStop size={15} />
+            {v2 && <span>중지</span>}
+          </button>
+        </Tooltip>
+      )}
+    </div>
+  );
+});
+
+export default TaskQueueControl;

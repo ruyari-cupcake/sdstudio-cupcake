@@ -1,0 +1,898 @@
+import {
+  type GenerationSettingsSnapshot,
+  NoiseSchedule,
+  Sampling,
+} from '../../backends/imageGen';
+import { NAI_FREE_PIXEL_LIMIT } from '../../backends/genVendors/naiModelCapabilities';
+import {
+  WFDefBuilder,
+  wfiExtraPromptInput,
+  wfiGroup,
+  wfiInlineInput,
+  wfiMainSamplingNotice,
+  wfiMiddlePlaceholderInput,
+  wfiPresetSelect,
+  wfiProfilePresetSelect,
+  wfiPush,
+  wfiStack,
+  WFVarBuilder,
+} from './WorkFlow';
+import type {
+  Session,
+  GenericScene,
+  SDJob,
+  Scene,
+  SDAbstractJob,
+  PromptNode,
+  SDInpaintJob,
+  SDI2IJob,
+  CharacterPrompt,
+} from '../types';
+import {
+  createSDCharacterPrompts,
+  createSDPrompts,
+  defaultBPrompt,
+  defaultFPrompt,
+  defaultUC,
+  lowerPromptNode,
+} from '../PromptService';
+import {
+  imageService,
+  promptService,
+  taskQueueService,
+  workFlowService,
+} from '..';
+import type { TaskParam } from '../TaskQueueService';
+import { dataUriToBase64 } from '../ImageService';
+import { resolveSceneSeed } from '../sceneSeedGroups';
+import {
+  FOCUS_CONTEXT_DEFAULT,
+  FOCUS_CONTEXT_MAX,
+  FOCUS_CONTEXT_MIN,
+  FOCUS_GRID,
+  focusSpecFromPreset,
+} from '../focusedInpaint';
+import {
+  resolveSceneCharacterPrompts,
+  usesSceneCharacterPromptData,
+} from '../sceneCharacterPrompts';
+import { applyImportedJob } from './importedJob';
+import { comboExpandedOf, resolvePresetPromptNode } from '../variantCombo';
+import {
+  resolveVariantSampling,
+  VARIANT_SAMPLING_TEXT,
+} from '../variantSampling';
+
+const SDImageGenPreset = new WFVarBuilder()
+  .addIntVar('cfgRescale', 0, 1, 0.01, 0)
+  .addIntVar('steps', 1, 50, 1, 28)
+  .addIntVar('promptGuidance', 0, 10, 0.1, 5)
+  .addSamplingVar('sampling', Sampling.KEulerAncestral)
+  .addPromptVar('frontPrompt', defaultFPrompt)
+  .addPromptVar('backPrompt', defaultBPrompt)
+  .addPromptVar('uc', defaultUC)
+  .addNoiseScheduleVar('noiseSchedule', NoiseSchedule.Karras)
+  .addCharacterPromptsVar('characterPrompts', [])
+  .addBoolVar('useCoords', false)
+  .addBoolVar('legacyPromptConditioning', false)
+  .addBoolVar('varietyPlus', false)
+  .addBoolVar('deliberateEulerAncestralBug', false);
+
+const SDImageGenShared = new WFVarBuilder()
+  .addVibeSetVar('vibes')
+  .addBoolVar('normalizeStrength', true)
+  .addNullIntVar('seed')
+  .addCharacterReferenceVar('characterReferences')
+  .addCharacterPromptsVar('characterPrompts', [])
+  .addStringVar('_appliedPresetName', '');
+
+const SDImageGenUI = wfiStack([
+  wfiPresetSelect('preset-select'),
+  wfiInlineInput('상위 프롬프트', 'frontPrompt', 'preset', 'flex-1'),
+  // 추가 프롬프트 — 상위/중위 사이, 프로젝트 귀속·프리셋 비저장 (기본 접힘)
+  wfiExtraPromptInput('추가 프롬프트', 'extra-prompt'),
+  wfiMiddlePlaceholderInput(
+    '중간 프롬프트 (이 씬에만 적용됨)',
+    'middle-prompt',
+  ),
+  wfiInlineInput('하위 프롬프트', 'backPrompt', 'preset', 'flex-1'),
+  wfiInlineInput('네거티브 프롬프트', 'uc', 'preset', 'flex-1'),
+  wfiInlineInput('시드', 'seed', 'shared', 'flex-none'),
+  wfiInlineInput('캐릭터 프롬프트', 'characterPrompts', 'preset', 'flex-none'),
+  wfiGroup(
+    '샘플링/모델 설정',
+    [
+      wfiPush('top'),
+      wfiInlineInput('스탭 수', 'steps', 'preset', 'flex-none'),
+      wfiInlineInput(
+        '프롬프트 가이던스',
+        'promptGuidance',
+        'preset',
+        'flex-none',
+      ),
+      wfiInlineInput('샘플링', 'sampling', 'preset', 'flex-none'),
+      wfiInlineInput('노이즈 스케줄', 'noiseSchedule', 'preset', 'flex-none'),
+      wfiInlineInput('CFG 리스케일', 'cfgRescale', 'preset', 'flex-none'),
+      wfiInlineInput(
+        'Legacy Prompt Conditioning 모드',
+        'legacyPromptConditioning',
+        'preset',
+        'flex-none',
+      ),
+      wfiInlineInput(
+        '바이브 강도 정규화',
+        'normalizeStrength',
+        'shared',
+        'flex-none',
+      ),
+      wfiInlineInput('Variety+', 'varietyPlus', 'preset', 'flex-none'),
+      wfiInlineInput(
+        'Deliberate Euler Ancestral Bug',
+        'deliberateEulerAncestralBug',
+        'preset',
+        'flex-none',
+      ),
+    ],
+    'sampling-group',
+  ),
+  wfiInlineInput('바이브 설정', 'vibes', 'shared', 'flex-none'),
+  wfiInlineInput(
+    '캐릭터 레퍼런스',
+    'characterReferences',
+    'shared',
+    'flex-none',
+  ),
+]);
+
+const SDImageGenEasyPreset = new WFVarBuilder()
+  .addIntVar('cfgRescale', 0, 1, 0.01, 0)
+  .addIntVar('steps', 1, 50, 1, 28)
+  .addIntVar('promptGuidance', 0, 10, 0.1, 5)
+  .addSamplingVar('sampling', Sampling.KEulerAncestral)
+  .addPromptVar('frontPrompt', defaultFPrompt)
+  .addPromptVar('backPrompt', defaultBPrompt)
+  .addPromptVar('uc', defaultUC)
+  .addNoiseScheduleVar('noiseSchedule', NoiseSchedule.Karras)
+  .addBoolVar('useCoords', false)
+  .addBoolVar('legacyPromptConditioning', false)
+  .addBoolVar('varietyPlus', false)
+  .addBoolVar('deliberateEulerAncestralBug', false);
+
+const SDImageGenEasyShared = SDImageGenShared.clone()
+  .addPromptVar('characterPrompt', '')
+  .addPromptVar('backgroundPrompt', '')
+  .addPromptVar('uc', '');
+
+const SDImageGenEasyUI = wfiStack([
+  wfiProfilePresetSelect('profile-preset-select'),
+  wfiInlineInput('캐릭터 관련 태그', 'characterPrompt', 'shared', 'flex-1'),
+  // 추가 프롬프트 — 상위/중위 사이, 프로젝트 귀속·프리셋 비저장 (기본 접힘)
+  wfiExtraPromptInput('추가 프롬프트', 'extra-prompt'),
+  wfiMiddlePlaceholderInput(
+    '중간 프롬프트 (이 씬에만 적용됨)',
+    'middle-prompt',
+  ),
+  wfiInlineInput('배경 관련 태그', 'backgroundPrompt', 'shared', 'flex-1'),
+  wfiInlineInput('태그 밴 리스트', 'uc', 'shared', 'flex-1'),
+  wfiInlineInput('시드', 'seed', 'shared', 'flex-none'),
+  wfiInlineInput('캐릭터 프롬프트', 'characterPrompts', 'shared', 'flex-none'),
+  wfiInlineInput('바이브 설정', 'vibes', 'shared', 'flex-none'),
+  wfiInlineInput(
+    '캐릭터 레퍼런스',
+    'characterReferences',
+    'shared',
+    'flex-none',
+  ),
+]);
+
+const SDImageGenEasyInnerUI = wfiStack([
+  wfiInlineInput('상위 프롬프트', 'frontPrompt', 'preset', 'flex-1'),
+  wfiMiddlePlaceholderInput(
+    '중간 프롬프트 (이 창에만 적용됨)',
+    'middle-prompt',
+  ),
+  wfiInlineInput('하위 프롬프트', 'backPrompt', 'preset', 'flex-1'),
+  wfiInlineInput('네거티브 프롬프트', 'uc', 'preset', 'flex-1'),
+  wfiGroup(
+    '샘플링/모델 설정',
+    [
+      wfiPush('top'),
+      wfiInlineInput('스탭 수', 'steps', 'preset', 'flex-none'),
+      wfiInlineInput(
+        '프롬프트 가이던스',
+        'promptGuidance',
+        'preset',
+        'flex-none',
+      ),
+      wfiInlineInput('샘플링', 'sampling', 'preset', 'flex-none'),
+      wfiInlineInput('노이즈 스케줄', 'noiseSchedule', 'preset', 'flex-none'),
+      wfiInlineInput('CFG 리스케일', 'cfgRescale', 'preset', 'flex-none'),
+      wfiInlineInput(
+        'Legacy Prompt Conditioning 모드',
+        'legacyPromptConditioning',
+        'preset',
+        'flex-none',
+      ),
+      wfiInlineInput(
+        '바이브 강도 정규화',
+        'normalizeStrength',
+        'shared',
+        'flex-none',
+      ),
+      wfiInlineInput('Variety+', 'varietyPlus', 'preset', 'flex-none'),
+      wfiInlineInput(
+        'Deliberate Euler Ancestral Bug',
+        'deliberateEulerAncestralBug',
+        'preset',
+        'flex-none',
+      ),
+    ],
+    'sampling-group',
+  ),
+]);
+
+// 일반 씬 생성 잡 조립(예약 핸들러와 대량 작업 「I2I로 이미지생성 씬 복사」가 같은 규칙을 쓴다 — 2026-10-04 B1).
+// 프롬프트·캐릭터 프롬프트는 createPrompt·createCharacterPrompts 가 만든 한 조합, 네거티브는 씬 전용 덧붙임까지 포함.
+export const buildSDImageGenJob = (
+  scene: GenericScene,
+  prompt: PromptNode,
+  characterPrompts: PromptNode[],
+  preset: any,
+  shared: any,
+): SDJob => {
+  const sceneObj = scene as Scene;
+  const allCharacterPrompts = resolveSceneCharacterPrompts(
+    preset,
+    shared,
+    sceneObj,
+  );
+  const enabledCharacterPrompts = (allCharacterPrompts || [])
+    .map((p: CharacterPrompt, i: number) => ({ original: p, index: i }))
+    .filter(
+      ({ original }: { original: CharacterPrompt }) =>
+        original.enabled !== false,
+    );
+
+  const job: SDJob = {
+    type: 'sd',
+    cfgRescale: preset.cfgRescale,
+    steps: preset.steps,
+    promptGuidance: preset.promptGuidance,
+    prompt,
+    sampling: preset.sampling,
+    uc: preset.uc,
+    characterPrompts: enabledCharacterPrompts.map(
+      ({ original, index }: { original: CharacterPrompt; index: number }) => ({
+        ...original,
+        prompt: characterPrompts[index],
+      }),
+    ),
+    useCoords: preset.useCoords,
+    legacyPromptConditioning: preset.legacyPromptConditioning,
+    normalizeStrength: shared.normalizeStrength,
+    varietyPlus: preset.varietyPlus,
+    deliberateEulerAncestralBug: preset.deliberateEulerAncestralBug,
+    // 예약 시점 스냅샷: 이후 프리셋에서 레퍼런스를 토글/삭제/수정해도
+    // 이미 예약된 작업에는 영향이 없도록 메타데이터를 깊은 복사한다.
+    characterReferences: (shared.characterReferences || [])
+      .filter((ref: any) => ref.enabled !== false)
+      .map((ref: any) => (ref.toJSON ? ref.toJSON() : { ...ref })),
+    noiseSchedule: preset.noiseSchedule,
+    backend: preset.backend,
+    vibes: (shared.vibes || []).map((v: any) =>
+      v.toJSON ? v.toJSON() : { ...v },
+    ),
+    seed: resolveSceneSeed(sceneObj, shared.seed),
+    sdstudioPromptSource:
+      prompt.type === 'group' ? prompt.sdstudioPromptSource : undefined,
+  };
+
+  // 씬 전용 캐릭터 UC 추가
+  if (usesSceneCharacterPromptData(sceneObj) && sceneObj.sceneCharacterUC) {
+    job.uc = `${job.uc}, ${sceneObj.sceneCharacterUC}`;
+  }
+
+  if (shared.type === 'SDImageGenEasy') {
+    job.uc = `${shared.uc}, ${preset.uc}`;
+  }
+  // 씬 전용 네거티브 — 항상 최종 네거티브 뒤에 붙인다(이 씬에만 적용)
+  if (sceneObj.sceneUC) {
+    job.uc = `${job.uc}, ${sceneObj.sceneUC}`;
+  }
+  return job;
+};
+
+const SDImageGenHandler = async (
+  session: Session,
+  scene: GenericScene,
+  prompt: PromptNode,
+  characterPrompts: PromptNode[],
+  preset: any,
+  shared: any,
+  samples: number,
+  _meta?: any,
+  onComplete?: (img: string) => void,
+  nodelay?: boolean,
+  generationSnapshot?: GenerationSettingsSnapshot,
+) => {
+  const job = buildSDImageGenJob(
+    scene,
+    prompt,
+    characterPrompts,
+    preset,
+    shared,
+  );
+  const param: TaskParam = {
+    session,
+    job,
+    scene,
+    nodelay,
+    outputPath: imageService.getOutputDir(session, scene),
+    onComplete,
+    generationSnapshot,
+  };
+  await taskQueueService.addTask(param, samples);
+};
+
+const SDCreatePrompt = async (
+  session: Session,
+  scene: GenericScene,
+  preset: any,
+  shared: any,
+) => {
+  return await createSDPrompts(session, preset, shared, scene as Scene);
+};
+
+const SDCreateCharacterPrompts = async (
+  session: Session,
+  scene: GenericScene,
+  preset: any,
+  shared: any,
+) => {
+  return await createSDCharacterPrompts(
+    session,
+    preset,
+    shared,
+    scene as Scene,
+  );
+};
+
+export const SDImageGenDef = new WFDefBuilder('SDImageGen')
+  .setTitle('이미지 생성')
+  .setBackendType('image')
+  .setI2I(false)
+  .setPresetVars(SDImageGenPreset.build())
+  .setSharedVars(SDImageGenShared.build())
+  .setEditor(SDImageGenUI)
+  .setHandler(SDImageGenHandler)
+  .setCreatePrompt(SDCreatePrompt)
+  .setCreateCharacterPrompts(SDCreateCharacterPrompts)
+  .build();
+
+export const SDImageGenEasyDef = new WFDefBuilder('SDImageGenEasy')
+  .setTitle('이미지 생성 (이지모드)')
+  .setBackendType('image')
+  .setI2I(false)
+  .setPresetVars(SDImageGenEasyPreset.build())
+  .setSharedVars(SDImageGenEasyShared.build())
+  .setEditor(SDImageGenEasyUI)
+  .setInnerEditor(SDImageGenEasyInnerUI)
+  .setHandler(SDImageGenHandler)
+  .setCreatePrompt(SDCreatePrompt)
+  .setCreateCharacterPrompts(SDCreateCharacterPrompts)
+  .build();
+
+const SDInpaintPreset = new WFVarBuilder()
+  .addImageVar('image')
+  .addImageVar('mask')
+  .addIntVar('strength', 0, 1, 0.01, 1)
+  .addIntVar('cfgRescale', 0, 1, 0.01, 0)
+  .addIntVar('steps', 1, 50, 1, 28)
+  .addIntVar('promptGuidance', 0, 10, 0.1, 5)
+  .addBoolVar('originalImage', true)
+  .addSamplingVar('sampling', Sampling.KEulerAncestral)
+  .addPromptVar('prompt', '')
+  .addPromptVar('uc', '')
+  .addNoiseScheduleVar('noiseSchedule', NoiseSchedule.Karras)
+  .addCharacterPromptsVar('characterPrompts', [])
+  .addBoolVar('useCoords', false)
+  .addBoolVar('legacyPromptConditioning', false)
+  .addBoolVar('normalizeStrength', true)
+  .addBoolVar('varietyPlus', false)
+  .addBoolVar('deliberateEulerAncestralBug', false)
+  .addVibeSetVar('vibes')
+  .addNullIntVar('seed');
+
+// Focused inpainting(2026-10-04 S1) — 인페인트 워크플로우에만 있는 키. I2I·미러(SDInpaintPreset.clone())
+// 에는 넣지 않는다(미러는 좌우 합성 캔버스라 영역 개념이 없음 — 핸들러에서도 무시).
+// 좌표는 원본 이미지 픽셀(8 배수), 기존 씬 JSON 에는 키가 없어 fromJSON 이 기본값(꺼짐·null·48)을 유지한다.
+// 편집기 UI(영역 도구·맥락 여백 슬라이더)는 S2 — InPaintEditor·FocusAreaOverlay. 계약: SPEC_GUIDE §7-2.
+const SDInpaintFocusedPreset = SDInpaintPreset.clone()
+  .addBoolVar('focusEnabled', false)
+  .addNullIntVar('focusX')
+  .addNullIntVar('focusY')
+  .addNullIntVar('focusW')
+  .addNullIntVar('focusH')
+  .addIntVar(
+    'focusContext',
+    FOCUS_CONTEXT_MIN,
+    FOCUS_CONTEXT_MAX,
+    FOCUS_GRID,
+    FOCUS_CONTEXT_DEFAULT,
+  )
+  // 인페인트 조합 모드(2026-10-04 P1, SPEC §7-4) 「복사 시점 설정을 1회 복제」 고정값 — I2I(SDI2IPreset)와 같은 키·기본 ''.
+  // 조합 모드가 아닌 인페인트 씬은 빈 값 그대로(전개에 쓰이지 않음). 옛 씬 JSON 은 키가 없어 기본값 — 롤백 시 값만 소실.
+  .addPromptVar('frontPrompt', '')
+  .addPromptVar('backPrompt', '')
+  .addPromptVar('globalUc', '');
+
+const SDInpaintUI = wfiStack([
+  wfiInlineInput('이미지', 'image', 'preset', 'flex-none'),
+  wfiInlineInput('인페인트 강도', 'strength', 'preset', 'flex-none'),
+  wfiInlineInput(
+    '비마스크 영역 편집 방지',
+    'originalImage',
+    'preset',
+    'flex-none',
+  ),
+  wfiInlineInput('프롬프트', 'prompt', 'preset', 'flex-1'),
+  wfiInlineInput('네거티브 프롬프트', 'uc', 'preset', 'flex-1'),
+  wfiInlineInput('캐릭터 프롬프트', 'characterPrompts', 'preset', 'flex-none'),
+  // 샘플링·모델 설정은 메인 사전 세팅을 따른다(2026-10-11, SPEC §7-5) — 그룹 대신 안내 줄+메인 값 요약.
+  wfiMainSamplingNotice(VARIANT_SAMPLING_TEXT.notice, 'main-sampling-notice'),
+  wfiInlineInput('바이브 설정', 'vibes', 'preset', 'flex-none'),
+  // wfiInlineInput('시드', 'seed', true, 'flex-none'),
+]);
+
+// 인페인트 조합 모드 편집 칸(2026-10-04 P1) — SDI2IComboUI 와 같은 이유로 단일 「프롬프트」 칸을 빼고 네거티브 칸 = 씬 네거티브.
+// 마스크·Focused 영역은 편집 창 이미지 패널(브러시·영역 도구)이 그대로 맡는다.
+export const SDInpaintComboUI = wfiStack([
+  wfiInlineInput('이미지', 'image', 'preset', 'flex-none'),
+  wfiInlineInput('인페인트 강도', 'strength', 'preset', 'flex-none'),
+  wfiInlineInput(
+    '비마스크 영역 편집 방지',
+    'originalImage',
+    'preset',
+    'flex-none',
+  ),
+  wfiInlineInput('씬 네거티브 프롬프트', 'uc', 'preset', 'flex-1'),
+  wfiInlineInput('캐릭터 프롬프트', 'characterPrompts', 'preset', 'flex-none'),
+  // 샘플링·모델 설정은 메인 사전 세팅을 따른다(2026-10-11, SPEC §7-5) — 그룹 대신 안내 줄+메인 값 요약.
+  wfiMainSamplingNotice(VARIANT_SAMPLING_TEXT.notice, 'main-sampling-notice'),
+  wfiInlineInput('바이브 설정', 'vibes', 'preset', 'flex-none'),
+]);
+
+const createSDI2IHandler = (type: string) => {
+  const handler = async (
+    session: Session,
+    scene: GenericScene,
+    _prompt: PromptNode,
+    _characterPrompts: PromptNode[],
+    presetInput: any,
+    _shared: any,
+    samples: number,
+    _meta?: any,
+    onComplete?: (img: string) => void,
+    _nodelay?: boolean,
+    generationSnapshot?: GenerationSettingsSnapshot,
+  ) => {
+    // 샘플링·모델 설정(스텝·가이던스·CFG·샘플러·노이즈 스케줄·legacy·Variety+·DEA 버그·바이브 강도 정규화)은
+    // 생성 시점의 메인 사전 세팅 값(2026-10-11 사용자 결정, SPEC §7-5 — variantSampling 단일 출처). 변형 생성 경로는
+    // 전부 이 핸들러를 지나므로(미러·조합 전개·이미지 변형 메뉴·대량 작업) 여기 한 곳에서만 적용한다.
+    // 씬 프리셋 객체는 바꾸지 않는다(사본) — 메인을 못 읽으면 씬 값 그대로 + 경고.
+    const preset = resolveVariantSampling(session, presetInput);
+    const image = preset.image.endsWith('.png')
+      ? dataUriToBase64(
+          (await imageService.fetchVibeImage(session, preset.image))!,
+        )
+      : preset.image;
+    const isInpaint = type === 'SDInpaint';
+    const getMask = async () =>
+      dataUriToBase64(
+        (await imageService.fetchVibeImage(session, preset.mask))!,
+      );
+    // 조합 전개 결과(미러·I2I·인페인트 조합 모드 — variantCombo, SPEC §7-4)가 실려 있으면 그것을, 아니면 단일 프롬프트.
+    // 인페인트 조합 모드도 마스크·Focused 는 프리셋 그대로(조합마다 같은 마스크·영역).
+    // 단일 프롬프트도 `<조각>` 은 생성 경로처럼 푼다(2026-10-04 B4 C4 — 예전엔 글자 그대로 보냈다).
+    // 이미지 변형 메뉴(OneTimeFlows)가 넘기는 임시 이미지생성 씬의 메타데이터 프롬프트는 글자 그대로 둔다.
+    const expanded = comboExpandedOf(preset);
+    const job: SDInpaintJob | SDI2IJob = {
+      type: isInpaint ? 'sd_inpaint' : 'sd_i2i',
+      cfgRescale: preset.cfgRescale,
+      steps: preset.steps,
+      promptGuidance: preset.promptGuidance,
+      prompt: expanded
+        ? expanded.prompt
+        : scene?.type === 'inpaint'
+          ? resolvePresetPromptNode(preset.prompt, session, scene)
+          : { type: 'text', text: preset.prompt },
+      sampling: preset.sampling,
+      uc: preset.uc,
+      characterPrompts: expanded
+        ? expanded.characterPrompts.map((p) => ({ ...p }))
+        : (preset.characterPrompts || []).map((p: CharacterPrompt) => ({
+            ...p,
+            prompt: { type: 'text', text: p.prompt || '' },
+          })),
+      useCoords: preset.useCoords,
+      legacyPromptConditioning: preset.legacyPromptConditioning,
+      normalizeStrength: preset.normalizeStrength,
+      varietyPlus: preset.varietyPlus,
+      deliberateEulerAncestralBug: preset.deliberateEulerAncestralBug,
+      noiseSchedule: preset.noiseSchedule,
+      // 예약 시점 스냅샷 (깊은 복사) — 위 핸들러와 동일한 이유
+      characterReferences: (preset.characterReferences || []).map((ref: any) =>
+        ref.toJSON ? ref.toJSON() : { ...ref },
+      ),
+      backend: preset.backend,
+      vibes: (preset.vibes || []).map((v: any) =>
+        v.toJSON ? v.toJSON() : { ...v },
+      ),
+      strength: preset.strength,
+      noise: preset.noise,
+      overrideResolution: preset.overrideResolution,
+      originalImage: isInpaint ? preset.originalImage : true,
+      image,
+      mask: isInpaint && preset.mask ? await getMask() : '',
+    };
+    // Focused 사양은 켜져 있고 사각형이 있을 때만 잡에 싣는다(미러 프리셋에는 키가 없어 항상 없음).
+    const focus = isInpaint ? focusSpecFromPreset(preset) : undefined;
+    if (focus) (job as SDInpaintJob).focus = focus;
+    const param: TaskParam = {
+      session,
+      job,
+      scene,
+      outputPath: imageService.getOutputDir(session, scene),
+      onComplete,
+      generationSnapshot,
+    };
+    await taskQueueService.addTask(param, samples);
+  };
+  return handler;
+};
+
+export function createInpaintPreset(
+  job?: Partial<SDAbstractJob<string>>,
+  image?: string,
+  mask?: string,
+): any {
+  const preset = workFlowService.buildPreset('SDInpaint');
+  if (image !== undefined) preset.image = image;
+  if (mask !== undefined) preset.mask = mask;
+  return applyImportedJob(preset, job);
+}
+
+export const SDInpaintDef = new WFDefBuilder('SDInpaint')
+  .setTitle('인페인트')
+  .setBackendType('image')
+  .setEmoji('🖌️')
+  .setI2I(true)
+  .setHasMask(true)
+  .setPresetVars(SDInpaintFocusedPreset.build())
+  .setSharedVars(new WFVarBuilder().build())
+  .setEditor(SDInpaintUI)
+  .setHandler(createSDI2IHandler('SDInpaint'))
+  .setCreatePreset(createInpaintPreset)
+  .build();
+
+// frontPrompt·backPrompt·globalUc = I2I 조합 모드 「복사 시점 설정을 1회 복제」(comboMode 'snapshot')의 고정값(2026-10-04 B4,
+// SPEC §7-4). 그 밖의 I2I 씬은 빈 값 그대로(전개에 쓰이지 않음). 옛 씬 JSON 은 키가 없어 기본값 '' — 5.4.0 롤백 시 값만 소실.
+const SDI2IPreset = SDInpaintPreset.clone()
+  .addIntVar('noise', 0, 1, 0.01, 0)
+  .addStringVar('overrideResolution', '')
+  .addCharacterReferenceVar('characterReferences')
+  .addPromptVar('frontPrompt', '')
+  .addPromptVar('backPrompt', '')
+  .addPromptVar('globalUc', '');
+
+const SDI2IUI = wfiStack([
+  wfiInlineInput('이미지', 'image', 'preset', 'flex-none'),
+  wfiInlineInput('강도', 'strength', 'preset', 'flex-none'),
+  wfiInlineInput('노이즈', 'noise', 'preset', 'flex-none'),
+  wfiInlineInput('프롬프트', 'prompt', 'preset', 'flex-1'),
+  wfiInlineInput('네거티브 프롬프트', 'uc', 'preset', 'flex-1'),
+  wfiInlineInput('캐릭터 프롬프트', 'characterPrompts', 'preset', 'flex-none'),
+  // 샘플링·모델 설정은 메인 사전 세팅을 따른다(2026-10-11, SPEC §7-5) — 그룹 대신 안내 줄+메인 값 요약.
+  wfiMainSamplingNotice(VARIANT_SAMPLING_TEXT.notice, 'main-sampling-notice'),
+  wfiInlineInput('바이브 설정', 'vibes', 'preset', 'flex-none'),
+  wfiInlineInput(
+    '캐릭터 레퍼런스',
+    'characterReferences',
+    'preset',
+    'flex-none',
+  ),
+  // wfiInlineInput('시드', 'seed', true, 'flex-none'),
+]);
+
+// I2I 조합 모드 편집 칸(2026-10-04 B4) — 프롬프트는 편집 창의 「프롬프트 에디터」 탭(상위·중간·하위)·「조합 에디터」 탭이
+// 맡으므로 단일 「프롬프트」 칸을 뺀다(중복 방지). 네거티브 칸 = 씬 네거티브(전역 네거티브 앞에 붙음 — 미러와 같음).
+export const SDI2IComboUI = wfiStack([
+  wfiInlineInput('이미지', 'image', 'preset', 'flex-none'),
+  wfiInlineInput('강도', 'strength', 'preset', 'flex-none'),
+  wfiInlineInput('노이즈', 'noise', 'preset', 'flex-none'),
+  wfiInlineInput('씬 네거티브 프롬프트', 'uc', 'preset', 'flex-1'),
+  wfiInlineInput('캐릭터 프롬프트', 'characterPrompts', 'preset', 'flex-none'),
+  // 샘플링·모델 설정은 메인 사전 세팅을 따른다(2026-10-11, SPEC §7-5) — 그룹 대신 안내 줄+메인 값 요약.
+  wfiMainSamplingNotice(VARIANT_SAMPLING_TEXT.notice, 'main-sampling-notice'),
+  wfiInlineInput('바이브 설정', 'vibes', 'preset', 'flex-none'),
+  wfiInlineInput(
+    '캐릭터 레퍼런스',
+    'characterReferences',
+    'preset',
+    'flex-none',
+  ),
+]);
+
+// 이미지에서 가져온 부분 메타데이터를 변형 프리셋에 옮기는 규칙은 importedJob.ts 단일 출처
+// (createInpaintPreset과 동일 계약, SPEC_GUIDE §12 — 대량 작업 「I2I로 이미지생성 씬 복사」도 같은 규칙).
+
+export function createI2IPreset(
+  job?: Partial<SDAbstractJob<string>>,
+  image?: string,
+  mask?: string,
+): any {
+  const preset = workFlowService.buildPreset('SDI2I');
+  if (image !== undefined) preset.image = image;
+  if (mask !== undefined) preset.mask = mask;
+  return applyImportedJob(preset, job);
+}
+
+export const SDI2IDef = new WFDefBuilder('SDI2I')
+  .setTitle('이미지 투 이미지')
+  .setBackendType('image')
+  .setEmoji('🔄')
+  .setI2I(true)
+  .setPresetVars(SDI2IPreset.build())
+  .setSharedVars(new WFVarBuilder().build())
+  .setEditor(SDI2IUI)
+  .setHandler(createSDI2IHandler('SDI2I'))
+  .setCreatePreset(createI2IPreset)
+  .build();
+
+// ── SDMirror (캐릭터 미러) ──
+
+const MIRROR_MIN_GAP = 32; // 최소 구분선 두께 (px)
+
+// 미러 캔버스 크기 계산 — 갭이 64 정렬 패딩을 흡수하여 좌우 대칭 보장
+function computeMirrorDimensions(srcW: number, srcH: number) {
+  const canvasWidth = Math.ceil((srcW * 2 + MIRROR_MIN_GAP) / 64) * 64;
+  const canvasHeight = Math.ceil(srcH / 64) * 64;
+  const actualGap = canvasWidth - srcW * 2; // MIRROR_MIN_GAP ~ MIRROR_MIN_GAP+63
+  return { width: canvasWidth, height: canvasHeight, gap: actualGap };
+}
+
+function findMaxMirrorScale(
+  srcW: number,
+  srcH: number,
+  maxPixels: number,
+): number {
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 30; i++) {
+    const mid = (lo + hi) / 2;
+    const sw = Math.floor(srcW * mid);
+    const sh = Math.floor(srcH * mid);
+    const { width, height } = computeMirrorDimensions(sw, sh);
+    if (width * height <= maxPixels) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+export async function prepareMirrorCanvas(
+  sourceBase64: string,
+  mode: 'blank' | 'duplicate' = 'blank',
+): Promise<{
+  canvas: string;
+  mask: string;
+  width: number;
+  height: number;
+  cropX: number;
+  downscaled?: boolean;
+}> {
+  const img = new Image();
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = reject;
+    img.src = `data:image/png;base64,${sourceBase64}`;
+  });
+  const srcW = img.naturalWidth;
+  const srcH = img.naturalHeight;
+
+  // 미러 캔버스 크기 계산 및 무료 한계 초과 시 다운스케일
+  const { width: rawMirrorW, height: rawMirrorH } = computeMirrorDimensions(
+    srcW,
+    srcH,
+  );
+  let effectiveImg: HTMLImageElement | HTMLCanvasElement = img;
+  let effectiveW = srcW;
+  let effectiveH = srcH;
+  let downscaled = false;
+
+  if (rawMirrorW * rawMirrorH > NAI_FREE_PIXEL_LIMIT) {
+    const scale = findMaxMirrorScale(srcW, srcH, NAI_FREE_PIXEL_LIMIT);
+    effectiveW = Math.floor(srcW * scale);
+    effectiveH = Math.floor(srcH * scale);
+    // 최소 크기 보장
+    if (effectiveW < 64) effectiveW = 64;
+    if (effectiveH < 64) effectiveH = 64;
+    // Canvas drawImage (imageSmoothingQuality: 'high' = bicubic)
+    const tmpCvs = document.createElement('canvas');
+    tmpCvs.width = effectiveW;
+    tmpCvs.height = effectiveH;
+    const tmpCtx = tmpCvs.getContext('2d')!;
+    tmpCtx.imageSmoothingEnabled = true;
+    tmpCtx.imageSmoothingQuality = 'high';
+    tmpCtx.drawImage(img, 0, 0, effectiveW, effectiveH);
+    effectiveImg = tmpCvs;
+    downscaled = true;
+  }
+
+  const {
+    width: canvasWidth,
+    height: canvasHeight,
+    gap: actualGap,
+  } = computeMirrorDimensions(effectiveW, effectiveH);
+
+  // 레이아웃: [원본 effectiveW] [갭 actualGap] [인페인트 effectiveW]
+  // 좌우가 정확히 동일 크기 — 갭이 항상 정중앙
+  const gapStart = effectiveW;
+  const inpaintStart = effectiveW + actualGap;
+
+  // 합성 캔버스: 왼쪽=원본(다운스케일), 가운데=검정줄, 오른쪽=흰색
+  const cvs = document.createElement('canvas');
+  cvs.width = canvasWidth;
+  cvs.height = canvasHeight;
+  const ctx = cvs.getContext('2d')!;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+  ctx.drawImage(effectiveImg, 0, 0, effectiveW, effectiveH);
+  if (mode === 'duplicate') {
+    ctx.drawImage(effectiveImg, inpaintStart, 0, effectiveW, effectiveH);
+  }
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(gapStart, 0, actualGap, canvasHeight);
+
+  // 마스크 캔버스: 왼쪽+가운데=검정(보존), 오른쪽=흰색(인페인트)
+  const maskCvs = document.createElement('canvas');
+  maskCvs.width = canvasWidth;
+  maskCvs.height = canvasHeight;
+  const maskCtx = maskCvs.getContext('2d')!;
+  maskCtx.fillStyle = '#000000';
+  maskCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+  maskCtx.fillStyle = '#ffffff';
+  maskCtx.fillRect(inpaintStart, 0, effectiveW, canvasHeight);
+
+  const canvasDataUrl = cvs.toDataURL('image/png');
+  const maskDataUrl = maskCvs.toDataURL('image/png');
+  const canvasBase64 = canvasDataUrl.replace(/^data:image\/png;base64,/, '');
+  const maskBase64 = maskDataUrl.replace(/^data:image\/png;base64,/, '');
+
+  return {
+    canvas: canvasBase64,
+    mask: maskBase64,
+    width: canvasWidth,
+    height: canvasHeight,
+    cropX: inpaintStart,
+    downscaled,
+  };
+}
+
+const SDMirrorPreset = SDInpaintPreset.clone();
+
+const SDMirrorUI = wfiStack([
+  wfiInlineInput('인페인트 강도', 'strength', 'preset', 'flex-none'),
+  wfiInlineInput(
+    '비마스크 영역 편집 방지',
+    'originalImage',
+    'preset',
+    'flex-none',
+  ),
+  wfiInlineInput('씬 네거티브 프롬프트', 'uc', 'preset', 'flex-1'),
+  wfiInlineInput('캐릭터 프롬프트', 'characterPrompts', 'preset', 'flex-none'),
+  // 샘플링·모델 설정은 메인 사전 세팅을 따른다(2026-10-11, SPEC §7-5) — 그룹 대신 안내 줄+메인 값 요약.
+  wfiMainSamplingNotice(VARIANT_SAMPLING_TEXT.notice, 'main-sampling-notice'),
+  wfiInlineInput('바이브 설정', 'vibes', 'preset', 'flex-none'),
+]);
+
+const createMirrorHandler = () => {
+  const innerHandler = createSDI2IHandler('SDInpaint');
+  const handler = async (
+    session: Session,
+    scene: GenericScene,
+    prompt: PromptNode,
+    characterPrompts: PromptNode[],
+    preset: any,
+    shared: any,
+    samples: number,
+    meta?: any,
+    onComplete?: (img: string) => void,
+    nodelay?: boolean,
+    generationSnapshot?: GenerationSettingsSnapshot,
+  ) => {
+    // 예약 경로(queueMirrorWorkflow)는 조합을 생성 경로와 같은 규칙으로 이미 전개해 넘긴다(variantCombo, SPEC §7-4)
+    // — 상위·하위·전역 네거티브가 들어 있으므로 다시 붙이지 않는다.
+    if (comboExpandedOf(preset)) {
+      return innerHandler(
+        session,
+        scene,
+        prompt,
+        characterPrompts,
+        { ...preset, focusEnabled: false },
+        shared,
+        samples,
+        meta,
+        onComplete,
+        nodelay,
+        generationSnapshot,
+      );
+    }
+    // 전개 없이 불린 경우(직접 호출)의 예전 규칙 — 상위 + 프리셋 프롬프트 + 하위.
+    let front = '';
+    let back = '';
+    let globalUc = '';
+    if (session.selectedWorkflow) {
+      const [, genPreset] = session.getCommonSetup(session.selectedWorkflow);
+      if (genPreset) {
+        front = genPreset.frontPrompt || '';
+        back = genPreset.backPrompt || '';
+        globalUc = genPreset.uc || '';
+      }
+    }
+    const combined = [front, preset.prompt, back].filter(Boolean).join(', ');
+    // 프롬프트조각 (<그룹.이름>) 치환
+    const resolvedPrompt = combined
+      .split(',')
+      .map((w) => w.trim())
+      .filter(Boolean)
+      .map((w) => lowerPromptNode(promptService.parseWord(w, session, scene)))
+      .join(', ');
+    const mergedPreset = {
+      ...preset,
+      prompt: resolvedPrompt,
+      uc: [globalUc, preset.uc].filter(Boolean).join(', '),
+      // 미러는 Focused 를 쓰지 않는다(좌우 합성 캔버스 전체가 요청 단위). 프리셋에 키가 없어도 명시로 끈다.
+      focusEnabled: false,
+    };
+    // 예약 시점 스냅샷을 그대로 넘긴다(SPEC §11 — 일괄 예약의 공통 스냅샷 재사용).
+    // 예전에는 여기서 끊겨 미러 태스크마다 addTask 가 설정을 다시 읽었다(2026-10-02 P1).
+    return innerHandler(
+      session,
+      scene,
+      prompt,
+      characterPrompts,
+      mergedPreset,
+      shared,
+      samples,
+      meta,
+      onComplete,
+      nodelay,
+      generationSnapshot,
+    );
+  };
+  return handler;
+};
+
+export function createMirrorPreset(
+  job?: Partial<SDAbstractJob<string>>,
+  image?: string,
+  mask?: string,
+): any {
+  const preset = workFlowService.buildPreset('SDMirror');
+  if (image !== undefined) preset.image = image;
+  if (mask !== undefined) preset.mask = mask;
+  return applyImportedJob(preset, job);
+}
+
+export const SDMirrorDef = new WFDefBuilder('SDMirror')
+  .setTitle('이미지 미러')
+  .setBackendType('image')
+  .setEmoji('🪞')
+  .setI2I(true)
+  .setHasMask(false)
+  .setPresetVars(SDMirrorPreset.build())
+  .setSharedVars(new WFVarBuilder().build())
+  .setEditor(SDMirrorUI)
+  .setHandler(createMirrorHandler())
+  .setCreatePreset(createMirrorPreset)
+  .build();

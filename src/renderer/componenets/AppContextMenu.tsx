@@ -1,0 +1,1307 @@
+import { observer } from 'mobx-react-lite';
+
+import { Item, Menu, Separator } from 'react-contexify';
+// 메뉴가 떠 있는 동안 뒤로 가기·Esc 는 메뉴만 닫는다(닫기 관문, 2026-10-03 U1·X6)
+import { contextMenuBackLayer } from './contextMenuBack';
+import {
+  sessionService,
+  backend,
+  imageService,
+  isMobile,
+  imageDownloadService,
+  imageHistoryService,
+  templateService,
+  taskQueueService,
+} from '../models';
+import { appState } from '../models/AppService';
+import {
+  dataUriToBase64,
+  deleteImageFiles,
+  toggleImageMain,
+} from '../models/ImageService';
+import {
+  IMAGE_RETENTION_DAYS,
+  SCENE_RETENTION_DAYS,
+} from '../models/TrashService';
+import {
+  batchResultLine,
+  DELETE_RESULT_TEXT,
+  deleteConfirmText,
+  imageDeleteScopeLine,
+  runTrashDelete,
+  shouldSkipImageDeleteConfirm,
+  showImageDeleteSkipOption,
+} from '../models/deleteFlowRules';
+
+import {
+  type SceneContextAlt,
+  type StyleContextAlt,
+  ContextMenuType,
+  genericSceneFromJSON,
+  type GallaryImageContextAlt,
+  type GenericScene,
+  type HistoryImageContextAlt,
+  type Scene,
+  type SDJob,
+} from '../models/types';
+import { oneTimeFlowMap, oneTimeFlows } from '../models/workflows/OneTimeFlows';
+import { queueNaiUpscaleImages } from '../models/workflows/NaiUpscaleFlow';
+import { extractPromptDataFromBase64 } from '../models/util';
+import {
+  addScenesToQueue,
+  removeScenesFromQueue,
+} from '../models/sceneQueueActions';
+import {
+  assignScenesToSeedGroup,
+  createSceneSeedGroup,
+  dissolveSceneSeedGroup,
+  getSceneSeedGroupInfo,
+  listSceneSeedGroups,
+  removeScenesFromSeedGroups,
+} from '../models/sceneSeedGroups';
+import { openImageAttachFlow } from '../models/i2iBatchFlow';
+import {
+  openMaskApplyFlow,
+  openStrengthBatchFlow,
+} from '../models/variantBatchFlow';
+import { sceneSelectorHost } from '../models/sceneSelectorHost';
+
+export const AppContextMenu = observer(() => {
+  // 선택은 (종류, 이름) 쌍이다 — 변형 탭의 선택으로 같은 이름의 일반 씬을 다루지 않는다
+  // (models/sceneSelection.ts, SPEC_GUIDE 드래그 다중 선택 절).
+  const selectedNormalScenes = (fallback?: GenericScene): Scene[] => {
+    const session = appState.curSession;
+    if (!session) return [];
+    if (appState.selectedSceneCount('scene') > 0) {
+      return Array.from(appState.selectedScenes)
+        .map((name) => session.scenes.get(name))
+        .filter((scene): scene is Scene => scene !== undefined);
+    }
+    return fallback?.type === 'scene' ? [fallback] : [];
+  };
+  // 우클릭한 씬과 같은 종류의 선택만 그 종류의 Map 에서 조회한다.
+  const selectedScenesLike = (ctxScene: GenericScene): GenericScene[] => {
+    const session = appState.curSession;
+    if (!session) return [];
+    return session
+      .getScenes(ctxScene.type)
+      .filter((scene) => appState.isSceneSelected(scene));
+  };
+  // 메뉴 라벨 수: 우클릭한 씬 종류와 일치하는 선택만 센다
+  const selCount = appState.selectedSceneCount(appState.contextSceneType);
+
+  const configureSceneSeedGroup = async (ctx: SceneContextAlt) => {
+    const session = appState.curSession;
+    if (!session) return;
+    const scenes = selectedNormalScenes(ctx.scene);
+    if (scenes.length < 2) {
+      appState.pushMessage('일반 씬을 2개 이상 선택한 뒤 실행해 주세요.');
+      return;
+    }
+
+    const groups = listSceneSeedGroups(session);
+    const choice = await appState.pushDialogAsync({
+      type: 'select',
+      text: `선택한 ${scenes.length}개 씬의 시드 그룹을 설정합니다.`,
+      items: [
+        { text: '새 그룹으로 묶기', value: '__new__' },
+        ...groups.map((group) => ({
+          text: `그룹 ${group.label}에 추가`,
+          value: group.id,
+        })),
+      ],
+    });
+    if (!choice) return;
+
+    const group =
+      choice === '__new__'
+        ? createSceneSeedGroup(session, scenes)
+        : assignScenesToSeedGroup(session, scenes, choice)
+          ? listSceneSeedGroups(session).find((item) => item.id === choice)
+          : undefined;
+    if (!group) {
+      appState.pushMessage('시드 그룹을 설정하지 못했습니다.');
+      return;
+    }
+    sessionService.markDirty(session.name);
+    appState.pushMessage(
+      `${scenes.length}개 씬을 시드 그룹 ${group.label}로 설정했습니다.`,
+    );
+  };
+
+  const removeSceneSeedGroup = (ctx: SceneContextAlt) => {
+    const session = appState.curSession;
+    if (!session || ctx.scene.type !== 'scene') return;
+    const selected = selectedNormalScenes();
+    let changed = 0;
+    if (selected.length > 0) {
+      changed = removeScenesFromSeedGroups(selected);
+    } else {
+      const group = getSceneSeedGroupInfo(session, ctx.scene);
+      if (group) changed = dissolveSceneSeedGroup(session, group.id);
+    }
+    if (changed === 0) {
+      appState.pushMessage('해제할 시드 그룹이 없습니다.');
+      return;
+    }
+    sessionService.markDirty(session.name);
+    appState.pushMessage('시드 그룹을 해제했습니다.');
+  };
+
+  const duplicateScene = async (ctx: SceneContextAlt) => {
+    // 살아있는 씬의 toJSON() 재역직렬화라 null(프리셋 역직렬화 실패)이 나올 수 없다
+    const newScene = genericSceneFromJSON(ctx.scene.toJSON())!;
+    let cnt = 0;
+    const newName = () =>
+      `${newScene.name}_copy${cnt === 0 ? '' : cnt.toString()}`;
+    while (appState.curSession!.hasScene(newScene.type, newName())) {
+      cnt++;
+    }
+    newScene.name = newName();
+    appState.curSession!.addScene(newScene);
+  };
+
+  const regenerateSceneFromImages = async (ctx: SceneContextAlt) => {
+    const session = appState.curSession;
+    if (!session) return;
+
+    const sourceScene = ctx.scene;
+    await imageService.refresh(session, sourceScene);
+    const files = [...imageService.getOutputs(session, sourceScene)];
+    let generationSnapshot;
+    if (files.length > 0) {
+      try {
+        generationSnapshot = await taskQueueService.captureGenerationSnapshot();
+      } catch {
+        appState.pushMessage('생성 설정을 읽지 못해 예약하지 못했습니다.');
+        return;
+      }
+    }
+
+    const regenerated = genericSceneFromJSON(sourceScene.toJSON());
+    if (!regenerated) {
+      appState.pushMessage('씬을 복제할 수 없습니다.');
+      return;
+    }
+
+    const baseName = `${sourceScene.name}_regen`;
+    let name = baseName;
+    let suffix = 2;
+    while (session.hasScene(regenerated.type, name)) {
+      name = `${baseName}${suffix++}`;
+    }
+    regenerated.name = name;
+    regenerated.imageMap = [];
+    regenerated.mains = [];
+    session.addScene(regenerated);
+    const sourceIndex = session
+      .getScenes(sourceScene.type)
+      .findIndex((scene) => scene === sourceScene);
+    if (sourceIndex >= 0) session.moveScene(regenerated, sourceIndex + 1);
+
+    if (files.length === 0) {
+      appState.pushMessage(
+        `"${regenerated.name}" 씬을 만들었습니다. 재생성할 이미지가 없습니다.`,
+      );
+      return;
+    }
+
+    const sourceDir = imageService.getOutputDir(session, sourceScene);
+    const outputDir = imageService.getOutputDir(session, regenerated);
+    let queued = 0;
+    let skipped = 0;
+    let assetWarnings = 0;
+
+    appState.setProgressDialog({
+      text: '이미지 생성 설정을 읽는 중...',
+      done: 0,
+      total: files.length,
+    });
+    try {
+      for (let imageIndex = 0; imageIndex < files.length; imageIndex++) {
+        try {
+          const image = await imageService.fetchImage(
+            `${sourceDir}/${files[imageIndex]}`,
+          );
+          if (!image) {
+            skipped++;
+            continue;
+          }
+          const metadata = await extractPromptDataFromBase64(
+            dataUriToBase64(image),
+          );
+          if (!metadata?.prompt) {
+            skipped++;
+            continue;
+          }
+
+          const vibes = [];
+          for (
+            let vibeIndex = 0;
+            vibeIndex < (metadata.vibes?.length ?? 0);
+            vibeIndex++
+          ) {
+            const vibe = metadata.vibes[vibeIndex];
+            const encoded = metadata.vibeImageData?.[vibeIndex];
+            if (!encoded) {
+              assetWarnings++;
+              continue;
+            }
+            try {
+              const filename = `regen-${Date.now()}-${imageIndex}-v${vibeIndex}-${Math.random()
+                .toString(36)
+                .slice(2)}.png`;
+              await imageService.storeEncodedVibeImage(
+                session,
+                filename,
+                encoded,
+                vibe.info,
+              );
+              vibes.push({ ...vibe, path: filename });
+            } catch (e) {
+              assetWarnings++;
+              console.warn('바이브 복원 실패:', e);
+            }
+          }
+
+          const characterReferences = [];
+          for (
+            let referenceIndex = 0;
+            referenceIndex < (metadata.characterReferences?.length ?? 0);
+            referenceIndex++
+          ) {
+            const reference = metadata.characterReferences[referenceIndex];
+            const encoded = metadata.referenceImageData?.[referenceIndex];
+            if (!encoded) {
+              assetWarnings++;
+              continue;
+            }
+            try {
+              const referencePath = await imageService.storeReferenceImage(
+                session,
+                encoded,
+              );
+              characterReferences.push({
+                ...reference,
+                path: referencePath,
+                enabled: true,
+              });
+            } catch (e) {
+              assetWarnings++;
+              console.warn('캐릭터 레퍼런스 복원 실패:', e);
+            }
+          }
+
+          const job: SDJob = {
+            type: 'sd',
+            cfgRescale: metadata.cfgRescale ?? 0,
+            steps: metadata.steps ?? 28,
+            promptGuidance: metadata.promptGuidance ?? 5,
+            prompt: { type: 'text', text: metadata.prompt },
+            sampling: metadata.sampling || 'k_euler_ancestral',
+            uc: metadata.uc || '',
+            characterPrompts: (metadata.characterPrompts || []).map(
+              (prompt) => ({
+                ...prompt,
+                prompt: { type: 'text', text: prompt.prompt || '' },
+                uc: prompt.uc || '',
+              }),
+            ),
+            useCoords: !!metadata.useCoords,
+            legacyPromptConditioning: !!metadata.legacyPromptConditioning,
+            normalizeStrength: metadata.normalizeStrength ?? true,
+            varietyPlus: !!metadata.varietyPlus,
+            deliberateEulerAncestralBug: !!metadata.deliberateEulerAncestralBug,
+            characterReferences,
+            noiseSchedule: metadata.noiseSchedule || 'karras',
+            backend: metadata.backend
+              ? { ...metadata.backend }
+              : { type: 'NAI' },
+            vibes,
+            seed: undefined,
+            overrideResolution: metadata.resolution,
+          };
+          await taskQueueService.addTask(
+            {
+              session,
+              job,
+              outputPath: outputDir,
+              scene: regenerated,
+              generationSnapshot,
+            },
+            1,
+          );
+          queued++;
+        } catch (e) {
+          skipped++;
+          console.error(
+            '씬 이미지 설정 재생성 준비 실패:',
+            files[imageIndex],
+            e,
+          );
+        } finally {
+          appState.setProgressDialog({
+            text: '이미지 생성 설정을 읽는 중...',
+            done: imageIndex + 1,
+            total: files.length,
+          });
+        }
+      }
+    } finally {
+      appState.setProgressDialog(undefined);
+    }
+
+    const result = [`${queued}장 예약됨`];
+    if (skipped > 0) result.push(`${skipped}장 정보 없음/읽기 실패`);
+    if (assetWarnings > 0) result.push(`참조 자료 ${assetWarnings}개 제외`);
+    appState.pushMessage(
+      `"${regenerated.name}" 씬 생성 · ${result.join(' · ')}`,
+    );
+  };
+  const moveSceneFront = (ctx: SceneContextAlt) => {
+    const { curSession } = appState;
+    curSession!.moveScene(ctx.scene, 0);
+  };
+  const moveSceneBack = (ctx: SceneContextAlt) => {
+    const { curSession } = appState;
+    curSession!.moveScene(ctx.scene, curSession!.scenes.size - 1);
+  };
+  const copySceneToProject = async (ctx: SceneContextAlt) => {
+    await copyScenesToProject([ctx.scene]);
+  };
+
+  async function copyScenesToProject(scenes: GenericScene[]) {
+    const session = appState.curSession;
+    if (!session || scenes.length === 0) return;
+    const curName = session.name;
+    // 숨김 씬 템플릿 제외 (씬 템플릿 개편 2026-07-18)
+    const allProjects = templateService
+      .filterVisibleProjects(sessionService.list())
+      .filter((n) => n !== curName);
+    if (allProjects.length === 0) {
+      appState.pushMessage('복사할 다른 프로젝트가 없습니다');
+      return;
+    }
+
+    const countLabel =
+      scenes.length > 1 ? `선택한 ${scenes.length}개 씬을` : '씬을';
+
+    // 1) 대상 프로젝트 선택
+    const targetName = await appState.pushDialogAsync({
+      text: `${countLabel} 복사할 프로젝트를 선택하세요`,
+      type: 'dropdown',
+      items: allProjects.map((n) => ({ text: n, value: n })),
+    });
+    if (!targetName) return;
+
+    // 2) 복사 모드 선택
+    const mode = await appState.pushDialogAsync({
+      text: '복사 방식을 선택하세요',
+      type: 'select',
+      items: [
+        { text: '설정만 복사 (슬롯, 프롬프트 등)', value: 'config' },
+        { text: '이미지 포함 복사', value: 'with-images' },
+      ],
+    });
+    if (!mode) return;
+
+    // 3) 대상 세션 로드
+    const targetSession = await sessionService.get(targetName);
+    if (!targetSession) {
+      appState.pushMessage('프로젝트를 불러올 수 없습니다');
+      return;
+    }
+
+    let totalCopiedImages = 0;
+    let successCount = 0;
+
+    for (const srcScene of scenes) {
+      // 4) 씬 복제
+      const newScene = genericSceneFromJSON(srcScene.toJSON());
+      if (!newScene) continue;
+      let cnt = 0;
+      const baseName = newScene.name;
+      const newNameFn = () => baseName + (cnt === 0 ? '' : `_${cnt}`);
+      while (targetSession.hasScene(newScene.type, newNameFn())) {
+        cnt++;
+      }
+      newScene.name = newNameFn();
+
+      if (mode === 'config') {
+        newScene.imageMap = [];
+        newScene.mains = [];
+        targetSession.addScene(newScene);
+        successCount++;
+      } else {
+        const srcDir = imageService.getOutputDir(session, srcScene);
+        const dstDir = imageService.getOutputDir(targetSession, newScene);
+        targetSession.addScene(newScene);
+
+        const allImages = [...srcScene.imageMap];
+        let copied = 0;
+        for (const img of allImages) {
+          try {
+            await backend.copyFile(`${srcDir}/${img}`, `${dstDir}/${img}`);
+            copied++;
+          } catch (e) {
+            console.error('이미지 복사 실패:', img, e);
+          }
+        }
+        totalCopiedImages += copied;
+        successCount++;
+      }
+    }
+
+    if (successCount > 1) {
+      const imgMsg =
+        mode === 'with-images' ? ` (이미지 ${totalCopiedImages}장)` : '';
+      appState.pushMessage(
+        `${successCount}개 씬을 "${targetName}" 프로젝트에 복사했습니다${imgMsg}`,
+      );
+    } else if (successCount === 1) {
+      const imgMsg =
+        mode === 'with-images' ? ` (이미지 ${totalCopiedImages}장)` : '';
+      appState.pushMessage(
+        `씬을 "${targetName}" 프로젝트에 복사했습니다${imgMsg}`,
+      );
+    }
+  }
+
+  const handleSceneItemClick = ({ id, props }: any) => {
+    const ctx = props.ctx as SceneContextAlt;
+    if (id === 'edit-prompt') {
+      sessionService.dispatchEvent(
+        new CustomEvent('open-scene-editor', {
+          detail: { scene: ctx.scene, tabIndex: 0 },
+        }),
+      );
+    } else if (id === 'edit-combination') {
+      sessionService.dispatchEvent(
+        new CustomEvent('open-scene-editor', {
+          detail: { scene: ctx.scene, tabIndex: 1 },
+        }),
+      );
+    } else if (id === 'duplicate') {
+      duplicateScene(ctx);
+    } else if (id === 'regenerate-scene') {
+      regenerateSceneFromImages(ctx);
+    } else if (id === 'copy-to-project') {
+      if (appState.selectedSceneCount(ctx.scene.type) > 1) {
+        const selectedScenes = selectedScenesLike(ctx.scene);
+        if (selectedScenes.length > 0) {
+          copyScenesToProject(selectedScenes);
+          return;
+        }
+      }
+      copySceneToProject(ctx);
+    } else if (id === 'change-resolution') {
+      // 삭제·복사와 같은 규칙: 같은 종류의 선택이 2개 이상이면 선택한 씬 전부, 아니면 이 씬 하나
+      const selectedScenes =
+        appState.selectedSceneCount(ctx.scene.type) > 1
+          ? selectedScenesLike(ctx.scene)
+          : [];
+      appState.changeResolutionOfScenes(
+        selectedScenes.length > 0 ? selectedScenes : [ctx.scene],
+      );
+    } else if (
+      id === 'variant-attach-image' ||
+      id === 'variant-apply-mask' ||
+      id === 'variant-strength'
+    ) {
+      // 변형 씬 일괄 작업(2026-10-04 P2~P4) — 해상도 변경과 같은 규칙: 같은 종류의 선택이 2개 이상이면 선택한 씬 전부,
+      // 아니면 이 씬 하나. 씬 선택 창은 건너뛰고(이미 고름), 이미지·마스크 원본 고르기는 변형 탭의 씬 선택 창을 빌린다.
+      if (ctx.scene.type !== 'inpaint') return;
+      const selectedScenes =
+        appState.selectedSceneCount(ctx.scene.type) > 1
+          ? selectedScenesLike(ctx.scene)
+          : [];
+      const targets = selectedScenes.length > 0 ? selectedScenes : [ctx.scene];
+      const host =
+        sceneSelectorHost('inpaint') ??
+        ((item) => {
+          if (item)
+            appState.pushMessage(
+              '씬 선택 창을 열 수 없습니다. 변형 탭에서 다시 시도해 주세요.',
+            );
+        });
+      if (id === 'variant-attach-image')
+        openImageAttachFlow('inpaint', host, targets);
+      else if (id === 'variant-apply-mask')
+        openMaskApplyFlow('inpaint', host, targets);
+      else void openStrengthBatchFlow('inpaint', host, targets);
+    } else if (id === 'move-front') {
+      moveSceneFront(ctx);
+    } else if (id === 'move-back') {
+      moveSceneBack(ctx);
+    } else if (id === 'delete') {
+      const selectedCount = appState.selectedSceneCount(ctx.scene.type);
+      if (selectedCount > 1) {
+        appState.pushDialog({
+          type: 'confirm',
+          ...deleteConfirmText({
+            kind: ctx.scene.type === 'inpaint' ? 'inpaintScene' : 'scene',
+            count: selectedCount,
+            outcome: { trashDays: SCENE_RETENTION_DAYS },
+          }),
+          callback: async () => {
+            const { trashService } = await import('../models');
+            const session = appState.curSession;
+            if (!session) return;
+            // 우클릭한 씬과 같은 종류의 Map 에서만 대상을 찾는다. 이름만으로
+            // scenes→inpaints 순으로 찾으면 변형 탭의 삭제가 같은 이름의 일반 씬을 지운다.
+            // 휴지통 이동에 실패한 씬은 그대로 남는다(2026-10-02 S1) — 건수·이름을 알린다.
+            const failedNames: string[] = [];
+            const targets = selectedScenesLike(ctx.scene);
+            for (const scene of targets) {
+              try {
+                await trashService.moveSceneToTrash(session, scene);
+                // 다른 창 잠금 등으로 조용히 돌아온 경우도 실패로 센다
+                if (session.hasScene(scene.type, scene.name))
+                  failedNames.push(scene.name);
+              } catch (e) {
+                console.error('씬 휴지통 이동 실패:', scene.name, e);
+                failedNames.push(scene.name);
+              }
+            }
+            appState.clearSceneSelection();
+            if (failedNames.length > 0) {
+              appState.pushDialog({
+                type: 'yes-only',
+                text:
+                  `${targets.length - failedNames.length}개를 휴지통으로 옮겼습니다.\n` +
+                  `옮기지 못해 남겨 둔 씬 ${failedNames.length}개: ${failedNames.slice(0, 5).join(', ')}${failedNames.length > 5 ? ' 외' : ''}\n` +
+                  '파일이 다른 프로그램에서 열려 있거나 잠겨 있을 수 있습니다. 잠시 뒤 다시 시도해 주세요.',
+              });
+            }
+          },
+        });
+      } else {
+        appState.pushDialog({
+          type: 'confirm',
+          ...deleteConfirmText({
+            kind: ctx.scene.type === 'inpaint' ? 'inpaintScene' : 'scene',
+            name: ctx.scene.name,
+            outcome: { trashDays: SCENE_RETENTION_DAYS },
+          }),
+          callback: async () => {
+            const { trashService } = await import('../models');
+            const session = appState.curSession!;
+            // 잠금으로 조용히 돌아와 씬이 남아 있어도 실패로 알린다(SPEC §8, X4)
+            const outcome = await runTrashDelete({
+              remove: () => trashService.moveSceneToTrash(session, ctx.scene),
+              stillExists: () =>
+                session.hasScene(ctx.scene.type, ctx.scene.name),
+            });
+            if (outcome.kind === 'error') {
+              appState.pushMessage(
+                outcome.message || '씬을 휴지통으로 옮기지 못했습니다.',
+              );
+            } else if (outcome.kind === 'still-present') {
+              appState.pushMessage(DELETE_RESULT_TEXT.sceneStillPresent);
+            }
+          },
+        });
+      }
+    } else if (id === 'delete-all-selected-images') {
+      deleteAllImagesFromSelected(false, ctx.scene);
+    } else if (id === 'delete-all-selected-images-except-fav') {
+      deleteAllImagesFromSelected(true, ctx.scene);
+    } else if (id === 'queue-add-all-or-selected') {
+      const session = appState.curSession;
+      if (session) {
+        addScenesToQueue(
+          session,
+          ctx.scene.type,
+          appState.selectedSceneCount(ctx.scene.type) > 0,
+        );
+      }
+    } else if (id === 'queue-remove-all-or-selected') {
+      const session = appState.curSession;
+      if (session) {
+        removeScenesFromQueue(
+          session,
+          ctx.scene.type,
+          appState.selectedSceneCount(ctx.scene.type) > 0,
+        );
+      }
+    } else if (id === 'seed-group-set') {
+      void configureSceneSeedGroup(ctx);
+    } else if (id === 'seed-group-remove') {
+      removeSceneSeedGroup(ctx);
+    }
+  };
+  async function deleteAllImagesFromSelected(
+    excludeFav: boolean,
+    ctxScene: GenericScene,
+  ) {
+    const session = appState.curSession;
+    if (!session) return;
+    if (appState.selectedSceneCount(ctxScene.type) === 0) {
+      appState.pushMessage('선택된 씬이 없습니다.');
+      return;
+    }
+
+    // 대상 수집 헬퍼 — 확인 다이얼로그용 미리보기와 실제 삭제 시점 재계산에
+    // 같은 로직을 쓴다(클릭 시점 스냅샷을 실행까지 들고 가면 다이얼로그가 떠
+    // 있는 동안 생성된 이미지가 목록 갱신에서 빠져 화면에 남는 간헐 버그).
+    const collectTargets = () => {
+      const scenes: { scene: any; paths: string[] }[] = [];
+      let totalImages = 0;
+      for (const scene of selectedScenesLike(ctxScene)) {
+        if (!scene.imageMap || scene.imageMap.length === 0) continue;
+
+        const dir = imageService.getOutputDir(session, scene);
+        let paths = scene.imageMap.map((img: string) => `${dir}/${img}`);
+
+        if (excludeFav && scene.mains) {
+          const favs = new Set(scene.mains);
+          paths = paths.filter((p: string) => {
+            const filename = p.split('/').pop()!;
+            return !favs.has(filename);
+          });
+        }
+
+        if (paths.length > 0) {
+          scenes.push({ scene, paths });
+          totalImages += paths.length;
+        }
+      }
+      return { scenes, totalImages };
+    };
+
+    const preview = collectTargets();
+    if (preview.totalImages === 0) {
+      appState.pushMessage('삭제할 이미지가 없습니다.');
+      return;
+    }
+
+    const doBatchDelete = async () => {
+      // 실행 시점 재계산 — 확인 다이얼로그 대기 중 생성분까지 반영.
+      const { scenes, totalImages } = collectTargets();
+      appState.setProgressDialog({
+        text: '이미지 삭제 중...',
+        done: 0,
+        total: scenes.length,
+      });
+      let done = 0;
+      let failed = 0;
+      try {
+        for (const { scene, paths } of scenes) {
+          try {
+            // 씬마다 토스트가 쌓이지 않게 공용 알림은 끄고 아래에서 한 번에 알린다(X13)
+            failed += await deleteImageFiles(session, paths, scene, {
+              notify: false,
+            });
+          } catch (e) {
+            console.error('이미지 삭제 실패:', e);
+            failed += paths.length;
+          }
+          appState.setProgressDialog({
+            text: '이미지 삭제 중...',
+            done: ++done,
+            total: scenes.length,
+          });
+        }
+      } finally {
+        appState.setProgressDialog(undefined);
+      }
+      const ok = Math.max(0, totalImages - failed);
+      appState.pushMessage(
+        failed > 0
+          ? `${scenes.length}개 씬 이미지 ${batchResultLine(ok, failed)}장 — 실패한 이미지는 잠시 후 다시 시도해주세요.`
+          : `${scenes.length}개 씬에서 ${ok}장의 이미지를 삭제했습니다.`,
+      );
+    };
+    // 여러 씬 일괄 삭제도 이미지 삭제 — 「다시 묻지 않음」 체크박스·설정 존중(v5.4.0 범위, deleteFlowRules)
+    if (
+      shouldSkipImageDeleteConfirm(
+        appState.skipImageDeleteConfirm,
+        preview.totalImages,
+      )
+    ) {
+      await doBatchDelete();
+      return;
+    }
+    appState.pushDialog({
+      type: 'confirm',
+      ...deleteConfirmText({
+        kind: 'image',
+        count: preview.totalImages,
+        outcome: { trashDays: IMAGE_RETENTION_DAYS },
+        extra: imageDeleteScopeLine({
+          sceneCount: preview.scenes.length,
+          excludeFav,
+        }),
+      }),
+      showSkipConfirm: showImageDeleteSkipOption(preview.totalImages),
+      callback: doBatchDelete,
+    });
+  }
+  const duplicateImage = async (ctx: GallaryImageContextAlt) => {
+    if (!ctx.scene) return;
+    for (const path of ctx.path) {
+      const tmp = path.slice(0, path.lastIndexOf('/'));
+      // 원본 확장자 보존(webp/png) — 고정 .png 로 복제하면 내용/확장자 불일치
+      const ext = path.split('.').pop() || 'png';
+      await backend.copyFile(path, `${tmp}/${Date.now().toString()}.${ext}`);
+    }
+    imageService.refresh(appState.curSession!, ctx.scene);
+    appState.pushDialog({
+      type: 'yes-only',
+      text: '이미지를 복제했습니다',
+    });
+  };
+  const copyImage = (ctx: GallaryImageContextAlt) => {
+    appState.pushDialog({
+      type: 'dropdown',
+      text: '이미지를 어디에 복사할까요?',
+      items: Array.from(appState.curSession!.scenes.keys()).map((key) => ({
+        text: key,
+        value: key,
+      })),
+      callback: async (value) => {
+        if (!value) return;
+
+        const scene = appState.curSession!.scenes.get(value);
+        if (!scene) {
+          return;
+        }
+
+        for (const path of ctx.path) {
+          await backend.copyFile(
+            path,
+            `${imageService.getImageDir(
+              appState.curSession!,
+              scene,
+            )}/${Date.now().toString()}.png`,
+          );
+        }
+        imageService.refresh(appState.curSession!, scene);
+        appState.pushDialog({
+          type: 'yes-only',
+          text: '이미지를 복사했습니다',
+        });
+      },
+    });
+  };
+  const clipboardImage = async (ctx: GallaryImageContextAlt) => {
+    await backend.copyImageToClipboard(ctx.path[0]);
+  };
+  const favImage = (ctx: GallaryImageContextAlt) => {
+    if (!ctx.scene) return;
+    for (const path_ of ctx.path) {
+      const path = path_.split('/').pop()!;
+      // 창 간 동기화 헬퍼(읽기 전용 미러): 소유 창 위임 + 로컬 반영
+      toggleImageMain(appState.curSession!, ctx.scene, path);
+    }
+  };
+  const deleteImg = async (ctx: GallaryImageContextAlt) => {
+    const doDelete = async () => {
+      await deleteImageFiles(appState.curSession!, ctx.path, ctx.scene);
+    };
+    // 「다시 묻지 않음」은 장수와 무관하게 적용 — 단일·여러 장(선택 모드 우클릭) 모두 체크박스·설정 존중(deleteFlowRules)
+    const count = ctx.path.length;
+    if (shouldSkipImageDeleteConfirm(appState.skipImageDeleteConfirm, count)) {
+      await doDelete();
+      return;
+    }
+    appState.pushDialog({
+      type: 'confirm',
+      ...deleteConfirmText({
+        kind: 'image',
+        count: count > 1 ? count : undefined,
+        outcome: { trashDays: IMAGE_RETENTION_DAYS },
+      }),
+      showSkipConfirm: showImageDeleteSkipOption(count),
+      callback: doDelete,
+    });
+  };
+  const downloadImage = async (ctx: GallaryImageContextAlt) => {
+    if (!ctx.scene) return;
+    if (isMobile) {
+      // 모바일은 폴더 선택 불가 → Download 폴더 복사 경로 (downloadSingleImage 미동작 버그 우회)
+      for (const p of ctx.path) {
+        await backend.copyToDownloads(p);
+      }
+      appState.pushMessage(
+        ctx.path.length > 1
+          ? `${ctx.path.length}장을 다운로드 폴더에 저장했습니다`
+          : '다운로드 폴더에 저장했습니다',
+      );
+      return;
+    }
+    const characterPreset = appState.getAppliedCharacterPreset();
+    if (ctx.path.length === 1) {
+      // 단일 이미지 다운로드
+      await imageDownloadService.downloadSingleImage(
+        appState.curSession!,
+        ctx.scene,
+        ctx.path[0],
+        characterPreset,
+      );
+    } else {
+      // 다중 이미지 다운로드
+      await imageDownloadService.downloadMultipleImages(
+        appState.curSession!,
+        ctx.scene,
+        ctx.path,
+        characterPreset,
+      );
+    }
+  };
+  const upscaleImages = async (ctx: GallaryImageContextAlt) => {
+    const session = appState.curSession;
+    if (!session || !ctx.scene) return;
+    await queueNaiUpscaleImages(
+      session,
+      ctx.path.map((path) => ({ scene: ctx.scene!, path })),
+    );
+  };
+  const transformImage = async (ctx: GallaryImageContextAlt) => {
+    const items = oneTimeFlows.map((x) => ({
+      text: x.text,
+      value: x.text,
+    }));
+    const menu = await appState.pushDialogAsync({
+      text: '이미지 변형 방법을 선택하세요',
+      type: 'select',
+      items,
+    });
+    if (!menu) return;
+    const menuItem = oneTimeFlowMap.get(menu)!;
+    const input = menuItem.getInput
+      ? await menuItem.getInput(appState.curSession!)
+      : undefined;
+    for (const p of ctx.path) {
+      let image = await imageService.fetchImage(p);
+      image = dataUriToBase64(image!);
+      const job = await extractPromptDataFromBase64(image);
+      menuItem.handler(
+        appState.curSession!,
+        ctx.scene!,
+        image,
+        undefined,
+        job,
+        input,
+      );
+    }
+  };
+  const saveImageAsGlobalPreset = async (ctx: any) => {
+    const path = Array.isArray(ctx.path) ? ctx.path[0] : ctx.path;
+    if (!path) return;
+    await appState.saveImageAsGlobalPreset(path);
+  };
+  const saveImageToArtistLibrary = async (ctx: any) => {
+    const path = Array.isArray(ctx.path) ? ctx.path[0] : ctx.path;
+    if (!path) return;
+    await appState.saveImageToArtistLibrary(path);
+  };
+  // 파일 탐색기에서 열기 (데스크톱 전용 — 메뉴 항목도 !isMobile 게이트).
+  // showFile 은 저장소 상대경로를 받아 OS 탐색기에서 해당 파일을 선택해 보여준다.
+  const revealImageInExplorer = async (path: string | undefined) => {
+    if (!path) return;
+    try {
+      await backend.showFile(path);
+    } catch (e: any) {
+      appState.pushMessage(e.message || '파일 탐색기 열기에 실패했습니다.');
+    }
+  };
+  const handleImageItemClick = ({ id, props }: any) => {
+    const ctx2: GallaryImageContextAlt = {
+      ...props.ctx,
+      type: 'gallary_image',
+      path: [props.ctx.path],
+    };
+    if (id === 'duplicate') {
+      duplicateImage(ctx2);
+    } else if (id === 'copy') {
+      copyImage(ctx2);
+    } else if (id === 'clipboard') {
+      clipboardImage(ctx2);
+    } else if (id === 'fav') {
+      favImage(ctx2);
+    } else if (id === 'delete') {
+      deleteImg(ctx2);
+    } else if (id === 'download') {
+      downloadImage(ctx2);
+    } else if (id === 'upscale') {
+      upscaleImages(ctx2).catch(() =>
+        appState.pushMessage('업스케일 예약 실패'),
+      );
+    } else if (id === 'save-global') {
+      saveImageAsGlobalPreset(ctx2);
+    } else if (id === 'save-artist') {
+      saveImageToArtistLibrary(ctx2);
+    } else if (id === 'reveal') {
+      revealImageInExplorer(ctx2.path[0]);
+    }
+  };
+  const handleImageItemClick2 = ({ id, props }: any) => {
+    if (id === 'duplicate') {
+      duplicateImage(props.ctx);
+    } else if (id === 'copy') {
+      copyImage(props.ctx);
+    } else if (id === 'clipboard') {
+      clipboardImage(props.ctx);
+    } else if (id === 'fav') {
+      favImage(props.ctx);
+    } else if (id === 'delete') {
+      deleteImg(props.ctx);
+    } else if (id === 'transform') {
+      transformImage(props.ctx);
+    } else if (id === 'upscale') {
+      upscaleImages(props.ctx).catch(() =>
+        appState.pushMessage('업스케일 예약 실패'),
+      );
+    } else if (id === 'download') {
+      downloadImage(props.ctx);
+    } else if (id === 'save-global') {
+      saveImageAsGlobalPreset(props.ctx);
+    } else if (id === 'save-artist') {
+      saveImageToArtistLibrary(props.ctx);
+    } else if (id === 'reveal') {
+      revealImageInExplorer(props.ctx.path?.[0]);
+    }
+  };
+  const exportStyle = async (ctx: StyleContextAlt) => {
+    await appState.exportPreset(appState.curSession!, ctx.preset);
+  };
+  const deleteStyle = async (ctx: StyleContextAlt) => {
+    // 「최소 1개」 검사는 확인 창 전에 한다 — 확인을 누른 뒤에야 거절당하지 않게(X9)
+    const before = appState.curSession?.presets.get(ctx.preset.type) ?? [];
+    if (before.length <= 1) {
+      appState.pushMessage('그림체는 최소 한 개 이상이어야 합니다');
+      return;
+    }
+    appState.pushDialog({
+      type: 'confirm',
+      // 그림체는 휴지통이 없다 — 영구 삭제(Enter 무시, 2026-10-03 E1)
+      ...deleteConfirmText({
+        kind: 'style',
+        name: ctx.preset.name,
+        outcome: 'permanent',
+      }),
+      callback: async () => {
+        const { curSession } = appState;
+        const presets = curSession?.presets.get(ctx.preset.type) ?? [];
+        // 확인 창이 떠 있는 동안 다른 곳에서 지워졌을 수 있어 한 번 더 본다
+        if (presets.length <= 1) {
+          appState.pushMessage('그림체는 최소 한 개 이상이어야 합니다');
+          return;
+        }
+        curSession!.removePreset(ctx.preset.type, ctx.preset.name);
+      },
+    });
+  };
+  const editStyle = async (ctx: StyleContextAlt) => {
+    sessionService.styleEdit(ctx.preset, ctx.container);
+  };
+  // ── 히스토리 사이드바 이미지 메뉴 ──
+  // 히스토리는 타 프로젝트 항목이 있을 수 있어 curSession 대신 resolve()로 세션/씬을 얻는다.
+  // (비활성 세션의 mains 토글 등도 ResourceSyncService가 자동 저장)
+  const historyDownloadImage = async (ctx: HistoryImageContextAlt) => {
+    if (isMobile) {
+      // 모바일은 폴더 선택이 불가능해 downloadSingleImage가 동작하지 않음 —
+      // Download 폴더 복사(+미디어 스캔) 경로 사용
+      await backend.copyToDownloads(ctx.entry.path);
+      appState.pushMessage('다운로드 폴더에 저장했습니다');
+      return;
+    }
+    const resolved = await imageHistoryService.resolve(ctx.entry);
+    if (!resolved) return;
+    const { session, scene } = resolved;
+    const characterPreset =
+      session === appState.curSession
+        ? appState.getAppliedCharacterPreset()
+        : undefined;
+    await imageDownloadService.downloadSingleImage(
+      session,
+      scene,
+      ctx.entry.path,
+      characterPreset,
+    );
+  };
+  const historyDeleteImage = async (ctx: HistoryImageContextAlt) => {
+    const resolved = await imageHistoryService.resolve(ctx.entry);
+    if (!resolved) return;
+    const { session, scene } = resolved;
+    const doDelete = async () => {
+      await deleteImageFiles(session, [ctx.entry.path], scene);
+      imageHistoryService.remove(ctx.entry.id);
+    };
+    if (shouldSkipImageDeleteConfirm(appState.skipImageDeleteConfirm, 1)) {
+      await doDelete();
+      return;
+    }
+    appState.pushDialog({
+      type: 'confirm',
+      ...deleteConfirmText({
+        kind: 'image',
+        outcome: { trashDays: IMAGE_RETENTION_DAYS },
+      }),
+      showSkipConfirm: showImageDeleteSkipOption(1),
+      callback: doDelete,
+    });
+  };
+  const historyUpscaleImage = async (ctx: HistoryImageContextAlt) => {
+    const resolved = await imageHistoryService.resolve(ctx.entry);
+    if (!resolved) return;
+    await queueNaiUpscaleImages(resolved.session, [
+      { scene: resolved.scene, path: ctx.entry.path },
+    ]);
+  };
+  const handleHistoryItemClick = ({ id, props }: any) => {
+    const ctx = props.ctx as HistoryImageContextAlt;
+    if (id === 'goto-scene') {
+      imageHistoryService.navigateTo(ctx.entry, { openGrid: false });
+    } else if (id === 'open-grid') {
+      imageHistoryService.navigateTo(ctx.entry, { openGrid: true });
+    } else if (id === 'fav') {
+      imageHistoryService.toggleFavorite(ctx.entry);
+    } else if (id === 'download') {
+      historyDownloadImage(ctx);
+    } else if (id === 'upscale') {
+      historyUpscaleImage(ctx).catch(() =>
+        appState.pushMessage('업스케일 예약 실패'),
+      );
+    } else if (id === 'delete') {
+      historyDeleteImage(ctx);
+    } else if (id === 'reveal') {
+      revealImageInExplorer(ctx.entry.path);
+    }
+  };
+  const handleStyleItemClick = ({ id, props }: any) => {
+    if (id === 'export') {
+      exportStyle(props.ctx as StyleContextAlt);
+    } else if (id === 'delete') {
+      deleteStyle(props.ctx as StyleContextAlt);
+    } else if (id === 'edit') {
+      editStyle(props.ctx as StyleContextAlt);
+    } else if (id === 'to-global') {
+      const ctx = props.ctx as StyleContextAlt;
+      appState.exportPresetToGlobal(ctx.session, ctx.preset);
+    }
+  };
+  return (
+    <>
+      <Menu
+        id={ContextMenuType.Scene}
+        onVisibilityChange={contextMenuBackLayer(ContextMenuType.Scene)}
+      >
+        <Item id="edit-prompt" onClick={handleSceneItemClick}>
+          씬 편집기로
+        </Item>
+        <Item id="edit-combination" onClick={handleSceneItemClick}>
+          조합 에디터로
+        </Item>
+        <Separator />
+        <Item id="queue-add-all-or-selected" onClick={handleSceneItemClick}>
+          {selCount > 0
+            ? `선택한 씬 예약 추가 (${selCount})`
+            : '모든 씬 예약 추가'}
+        </Item>
+        <Item id="queue-remove-all-or-selected" onClick={handleSceneItemClick}>
+          {selCount > 0
+            ? `선택한 씬 예약 제거 (${selCount})`
+            : '모든 씬 예약 제거'}
+        </Item>
+        <Separator />
+        <Item id="duplicate" onClick={handleSceneItemClick}>
+          해당 씬 복제
+        </Item>
+        <Item id="regenerate-scene" onClick={handleSceneItemClick}>
+          씬 재생성 (이미지별 설정)
+        </Item>
+        <Item id="copy-to-project" onClick={handleSceneItemClick}>
+          {selCount > 1
+            ? `선택한 씬(${selCount}) 복사`
+            : '다른 프로젝트로 씬 복사'}
+        </Item>
+        <Item id="move-front" onClick={handleSceneItemClick}>
+          해당 씬 맨 위로
+        </Item>
+        <Item id="move-back" onClick={handleSceneItemClick}>
+          해당 씬 맨 뒤로
+        </Item>
+        <Item id="change-resolution" onClick={handleSceneItemClick}>
+          {selCount > 1
+            ? `선택한 씬(${selCount}) 해상도 변경`
+            : '해당 씬 해상도 변경'}
+        </Item>
+        {/* 변형 탭 전용 일괄 작업(2026-10-04 P2~P4) — 대량 작업 메뉴와 같은 흐름에 이미 고른 씬을 넘긴다 */}
+        {appState.contextSceneType === 'inpaint' && (
+          <Item id="variant-attach-image" onClick={handleSceneItemClick}>
+            {selCount > 1
+              ? `선택한 씬(${selCount})에 이미지 첨부`
+              : '해당 씬에 이미지 첨부'}
+          </Item>
+        )}
+        {appState.contextSceneType === 'inpaint' && (
+          <Item id="variant-apply-mask" onClick={handleSceneItemClick}>
+            {selCount > 1
+              ? `선택한 씬(${selCount})에 인페인트 마스크 적용`
+              : '해당 씬에 인페인트 마스크 적용'}
+          </Item>
+        )}
+        {appState.contextSceneType === 'inpaint' && (
+          <Item id="variant-strength" onClick={handleSceneItemClick}>
+            {selCount > 1
+              ? `선택한 씬(${selCount}) 강도·노이즈 변경`
+              : '해당 씬 강도·노이즈 변경'}
+          </Item>
+        )}
+        <Separator />
+        {selCount > 1 && (
+          <Item id="seed-group-set" onClick={handleSceneItemClick}>
+            선택한 씬 시드 그룹 설정 ({selCount})
+          </Item>
+        )}
+        <Item id="seed-group-remove" onClick={handleSceneItemClick}>
+          {selCount > 0
+            ? '선택한 씬을 시드 그룹에서 제외'
+            : '현재 시드 그룹 해제'}
+        </Item>
+        <Separator />
+        <Item id="delete" onClick={handleSceneItemClick}>
+          {selCount > 1 ? `선택한 씬(${selCount}) 삭제` : '해당 씬 삭제'}
+        </Item>
+        <Separator />
+        <Item id="delete-all-selected-images" onClick={handleSceneItemClick}>
+          선택한 씬 이미지 모두 삭제
+        </Item>
+        <Item
+          id="delete-all-selected-images-except-fav"
+          onClick={handleSceneItemClick}
+        >
+          선택한 씬 이미지 모두 삭제 (즐겨찾기 제외)
+        </Item>
+      </Menu>
+      <Menu
+        id={ContextMenuType.GallaryImage}
+        onVisibilityChange={contextMenuBackLayer(ContextMenuType.GallaryImage)}
+      >
+        <Item id="download" onClick={handleImageItemClick2}>
+          이미지 다운로드
+        </Item>
+        <Item id="fav" onClick={handleImageItemClick2}>
+          즐겨찾기 토글
+        </Item>
+        <Item id="transform" onClick={handleImageItemClick2}>
+          이미지 변형
+        </Item>
+        <Item id="upscale" onClick={handleImageItemClick2}>
+          업스케일 ×2 (Anlas)
+        </Item>
+        <Item id="delete" onClick={handleImageItemClick2}>
+          해당 이미지 삭제
+        </Item>
+        <Item id="duplicate" onClick={handleImageItemClick2}>
+          해당 이미지 복제
+        </Item>
+        <Item id="copy" onClick={handleImageItemClick2}>
+          다른 씬으로 이미지 복사
+        </Item>
+        {!isMobile && (
+          <Item id="clipboard" onClick={handleImageItemClick2}>
+            클립보드로 이미지 복사
+          </Item>
+        )}
+        {!isMobile && (
+          <Item id="reveal" onClick={handleImageItemClick2}>
+            파일 탐색기에서 열기
+          </Item>
+        )}
+        <Separator />
+        <Item id="save-global" onClick={handleImageItemClick2}>
+          글로벌 프리셋으로 복사
+        </Item>
+        <Item id="save-artist" onClick={handleImageItemClick2}>
+          작가 라이브러리에 저장
+        </Item>
+      </Menu>
+      <Menu
+        id={ContextMenuType.Image}
+        onVisibilityChange={contextMenuBackLayer(ContextMenuType.Image)}
+      >
+        <Item id="upscale" onClick={handleImageItemClick}>
+          업스케일 ×2 (Anlas)
+        </Item>
+        <Item id="download" onClick={handleImageItemClick}>
+          이미지 다운로드
+        </Item>
+        <Item id="fav" onClick={handleImageItemClick}>
+          즐겨찾기 토글
+        </Item>
+        <Item id="duplicate" onClick={handleImageItemClick}>
+          해당 이미지 복제
+        </Item>
+        <Item id="copy" onClick={handleImageItemClick}>
+          다른 씬으로 이미지 복사
+        </Item>
+        {!isMobile && (
+          <Item id="clipboard" onClick={handleImageItemClick}>
+            클립보드로 이미지 복사
+          </Item>
+        )}
+        {!isMobile && (
+          <Item id="reveal" onClick={handleImageItemClick}>
+            파일 탐색기에서 열기
+          </Item>
+        )}
+        <Separator />
+        <Item id="save-global" onClick={handleImageItemClick}>
+          글로벌 프리셋으로 복사
+        </Item>
+        <Item id="save-artist" onClick={handleImageItemClick}>
+          작가 라이브러리에 저장
+        </Item>
+      </Menu>
+      <Menu
+        id={ContextMenuType.HistoryImage}
+        onVisibilityChange={contextMenuBackLayer(ContextMenuType.HistoryImage)}
+      >
+        <Item id="upscale" onClick={handleHistoryItemClick}>
+          업스케일 ×2 (Anlas)
+        </Item>
+        <Item id="goto-scene" onClick={handleHistoryItemClick}>
+          해당 씬으로 이동
+        </Item>
+        <Item id="open-grid" onClick={handleHistoryItemClick}>
+          이미지 그리드에서 보기
+        </Item>
+        <Item id="fav" onClick={handleHistoryItemClick}>
+          즐겨찾기 토글
+        </Item>
+        <Item id="download" onClick={handleHistoryItemClick}>
+          이미지 다운로드
+        </Item>
+        {!isMobile && (
+          <Item id="reveal" onClick={handleHistoryItemClick}>
+            파일 탐색기에서 열기
+          </Item>
+        )}
+        <Separator />
+        <Item id="delete" onClick={handleHistoryItemClick}>
+          해당 이미지 삭제
+        </Item>
+      </Menu>
+      <Menu
+        id={ContextMenuType.Style}
+        onVisibilityChange={contextMenuBackLayer(ContextMenuType.Style)}
+      >
+        <Item id="export" onClick={handleStyleItemClick}>
+          해당 그림체 내보내기
+        </Item>
+        <Item id="to-global" onClick={handleStyleItemClick}>
+          글로벌로 복사
+        </Item>
+        <Item id="edit" onClick={handleStyleItemClick}>
+          해당 그림체 편집
+        </Item>
+        <Item id="delete" onClick={handleStyleItemClick}>
+          해당 그림체 삭제
+        </Item>
+      </Menu>
+    </>
+  );
+});

@@ -1,0 +1,243 @@
+import { OpusUsageService } from '../OpusUsageService';
+
+describe('OpusUsageService', () => {
+  test('미구독은 잔량과 무관하게 유료 위험이며 저할당량 경고를 소모하지 않는다', () => {
+    const service = new OpusUsageService({ getOpusUsageStatus: jest.fn() });
+    const usage = {
+      opusSubscribed: false,
+      percent: 100,
+      isNegative: false,
+      timeUntilNextPercent: 0,
+    };
+    expect(service.isPaidRisk(usage)).toBe(true);
+    expect(service.takeLowWarning({ ...usage, percent: 5 })).toBe(false);
+    expect(
+      service.takeLowWarning({ ...usage, opusSubscribed: true, percent: 5 }),
+    ).toBe(true);
+    service.approvePaidRisk();
+    service.invalidateAccount();
+    expect(service.hasSessionPaidApproval()).toBe(true);
+  });
+  test('새로고침 실패 후에도 이전 값은 남기고 재시도 버튼은 다시 활성화한다', async () => {
+    const getOpusUsageStatus = jest
+      .fn()
+      .mockResolvedValueOnce({
+        percent: 91,
+        isNegative: false,
+        timeUntilNextPercent: 30,
+      })
+      .mockRejectedValueOnce(new Error('network'));
+    const service = new OpusUsageService({ getOpusUsageStatus } as any);
+    await service.refresh(true);
+    const { fetchedAt } = service;
+    await service.refresh(true);
+    expect(service.state).toBe('stale');
+    expect(service.refreshing).toBe(false);
+    expect(service.status?.percent).toBe(91);
+    expect(service.fetchedAt).toBe(fetchedAt);
+  });
+
+  test('계정 전환 전 조회의 늦은 응답은 새 계정 표시를 덮지 않는다', async () => {
+    let resolveOld!: (value: any) => void;
+    const getOpusUsageStatus = jest
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOld = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        percent: 77,
+        isNegative: false,
+        timeUntilNextPercent: 30,
+      });
+    const service = new OpusUsageService({ getOpusUsageStatus } as any);
+    const old = service.refresh(true);
+    service.invalidateAccount();
+    expect(service.status).toBeUndefined();
+    await service.refresh(true);
+    resolveOld({ percent: 0, isNegative: true, timeUntilNextPercent: 30 });
+    await old;
+    expect(service.status?.percent).toBe(77);
+    expect(service.refreshing).toBe(false);
+  });
+
+  test('자동 순회가 채택한 잔량도 진행 중이던 조회보다 우선한다', async () => {
+    let resolve!: (value: any) => void;
+    const service = new OpusUsageService({
+      getOpusUsageStatus: () =>
+        new Promise((_resolve) => {
+          resolve = _resolve;
+        }),
+    } as any);
+    const pending = service.refresh();
+    service.adoptKnownStatus({
+      percent: 60,
+      isNegative: false,
+      timeUntilNextPercent: 20,
+    });
+    resolve({ percent: 1, isNegative: false, timeUntilNextPercent: 20 });
+    await pending;
+    expect(service.status?.percent).toBe(60);
+  });
+
+  test('동시 조회를 하나로 합치고 정상 상태를 저장한다', async () => {
+    let resolve!: (value: any) => void;
+    const getOpusUsageStatus = jest.fn(
+      () =>
+        new Promise<any>((_resolve) => {
+          resolve = _resolve;
+        }),
+    );
+    const service = new OpusUsageService({ getOpusUsageStatus } as any);
+
+    const a = service.refresh(true);
+    const b = service.refresh(true);
+    resolve({ percent: 8, isNegative: false, timeUntilNextPercent: 20 });
+
+    await expect(a).resolves.toMatchObject({ percent: 8 });
+    await expect(b).resolves.toMatchObject({ percent: 8 });
+    expect(getOpusUsageStatus).toHaveBeenCalledTimes(1);
+    expect(service.state).toBe('ready');
+    expect(service.takeLowWarning(service.status)).toBe(true);
+    expect(service.takeLowWarning(service.status)).toBe(false);
+  });
+
+  test('조회 실패와 0퍼센트를 유료 전환 위험으로 본다', async () => {
+    const service = new OpusUsageService({
+      getOpusUsageStatus: jest.fn().mockRejectedValue(new Error('network')),
+    } as any);
+
+    await expect(service.refresh(true)).resolves.toBeUndefined();
+    expect(service.state).toBe('error');
+    expect(service.isPaidRisk(undefined)).toBe(true);
+    expect(
+      service.isPaidRisk({
+        percent: 0,
+        isNegative: false,
+        timeUntilNextPercent: 1,
+      }),
+    ).toBe(true);
+  });
+
+  test('자동 전환에서 확인한 새 토큰 상태를 추가 조회 없이 채택한다', () => {
+    const getOpusUsageStatus = jest.fn();
+    const service = new OpusUsageService({ getOpusUsageStatus } as any);
+
+    service.adoptKnownStatus({
+      percent: 35,
+      isNegative: false,
+      timeUntilNextPercent: 30,
+    });
+
+    expect(service.state).toBe('ready');
+    expect(service.status).toEqual(expect.objectContaining({ percent: 35 }));
+    expect(service.fetchedAt).toBeGreaterThan(0);
+    expect(getOpusUsageStatus).not.toHaveBeenCalled();
+  });
+
+  test('자연 회복으로 임계값을 넘었다가 다시 내려와도 세션 경고를 반복하지 않는다', async () => {
+    const getOpusUsageStatus = jest
+      .fn()
+      .mockResolvedValueOnce({
+        percent: 9,
+        isNegative: false,
+        timeUntilNextPercent: 30,
+      })
+      .mockResolvedValueOnce({
+        percent: 11,
+        isNegative: false,
+        timeUntilNextPercent: 30,
+      })
+      .mockResolvedValueOnce({
+        percent: 9,
+        isNegative: false,
+        timeUntilNextPercent: 30,
+      });
+    const service = new OpusUsageService({ getOpusUsageStatus } as any);
+
+    await service.refresh(true);
+    expect(service.takeLowWarning(service.status, 10)).toBe(true);
+    await service.refresh(true);
+    await service.refresh(true);
+
+    expect(service.takeLowWarning(service.status, 10)).toBe(false);
+  });
+
+  test('토큰 자동 전환 상태 채택도 이미 표시한 세션 경고를 재무장하지 않는다', () => {
+    const service = new OpusUsageService({
+      getOpusUsageStatus: jest.fn(),
+    } as any);
+    const low = {
+      percent: 8,
+      isNegative: false,
+      timeUntilNextPercent: 30,
+    };
+
+    expect(service.takeLowWarning(low, 10)).toBe(true);
+    service.adoptKnownStatus({ ...low, percent: 40 });
+
+    expect(service.takeLowWarning(low, 10)).toBe(false);
+  });
+});
+
+describe('`/user/data` 캐시 전달(2026-10-03 갈래 T2)', () => {
+  test('force 는 backend 캐시를 쓰고, fresh 만 backend 에 force 를 넘긴다', async () => {
+    const getOpusUsageStatus = jest.fn(async () => ({
+      percent: 50,
+      isNegative: false,
+      timeUntilNextPercent: 30,
+    }));
+    const service = new OpusUsageService({ getOpusUsageStatus } as any);
+    await service.refresh(true);
+    expect(getOpusUsageStatus).toHaveBeenLastCalledWith();
+    await service.refresh(true, { fresh: true });
+    expect(getOpusUsageStatus).toHaveBeenLastCalledWith({ force: true });
+  });
+});
+
+describe('Anlas 소비 세션 승인', () => {
+  test('승인하지 않은 새 세션은 소진 확인이 필요하다', () => {
+    const service = new OpusUsageService({
+      getOpusUsageStatus: jest.fn(),
+    } as any);
+    expect(service.hasSessionPaidApproval()).toBe(false);
+  });
+
+  test('시간 경과와 소진/소량 회복 반복에도 승인 상태를 유지한다', () => {
+    jest.useFakeTimers();
+    try {
+      const service = new OpusUsageService({
+        getOpusUsageStatus: jest.fn(),
+      } as any);
+      service.approvePaidRisk();
+      jest.advanceTimersByTime(24 * 60 * 60 * 1000);
+      for (const percent of [0, 1, 0, 1, 0]) {
+        service.adoptKnownStatus({
+          percent,
+          isNegative: percent === 0,
+          timeUntilNextPercent: 60,
+        });
+        expect(service.hasSessionPaidApproval()).toBe(true);
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('계정 전환과 로그인 상태 초기화는 같은 앱 세션의 승인을 취소하지 않는다', () => {
+    const service = new OpusUsageService({
+      getOpusUsageStatus: jest.fn(),
+    } as any);
+    service.approvePaidRisk();
+    service.invalidateAccount();
+    expect(service.hasSessionPaidApproval()).toBe(true);
+    service.clear();
+    expect(service.hasSessionPaidApproval()).toBe(true);
+    const restarted = new OpusUsageService({
+      getOpusUsageStatus: jest.fn(),
+    } as any);
+    expect(restarted.hasSessionPaidApproval()).toBe(false);
+  });
+});

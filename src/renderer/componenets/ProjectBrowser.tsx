@@ -1,0 +1,1611 @@
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useLayoutEffect,
+} from 'react';
+import { observer } from 'mobx-react-lite';
+import {
+  FaStar,
+  FaSearch,
+  FaFolder,
+  FaPlus,
+  FaEllipsisV,
+  FaCheck,
+  FaPen,
+  FaTimes,
+  FaPalette,
+  FaChevronDown,
+  FaChevronRight,
+  FaFolderPlus,
+  FaWindowRestore,
+} from 'react-icons/fa';
+import { ActionIcon } from './ActionIcon';
+import {
+  sessionService,
+  imageService,
+  isMobile,
+  backend,
+  templateService,
+} from '../models';
+import { appState } from '../models/AppService';
+import {
+  nameErrorMessage,
+  projectNameRules,
+  promptName,
+  suggestFolderCopyName,
+} from '../models/nameInput';
+import { projectPath } from '../models/projectPaths';
+import { planFolderDeletePrompt } from '../models/folderDeleteFlow';
+import ModalOverlay from './ModalOverlay';
+import Tooltip from './Tooltip';
+import MobileColorPicker from './MobileColorPicker';
+import useLatestRef from './useLatestRef';
+import { getRecentProjects, pushRecentProject } from './recentProjects';
+// 폴더 색상 팔레트 (단일 출처 folderColors.ts — 드로어와 동일)
+import { FOLDER_COLORS, DEFAULT_FOLDER_COLOR, withAlpha } from './folderColors';
+
+// 한글 + 숫자 혼합 자연 정렬
+const naturalCmp = (a: string, b: string) =>
+  a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+
+// 폴더 뷰 식별자: 'all' | 'fav' | 'unfiled' | 폴더이름
+type FolderView = string;
+
+// 프로젝트 카드 썸네일
+function ProjectThumbnail({ name }: { name: string }) {
+  const [image, setImage] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setImage(null);
+    const fetchByRef = async (ref: { scene: string; image: string }) => {
+      try {
+        return (
+          (await imageService.fetchImageSmall(
+            projectPath('outs', name, ref.scene, ref.image),
+            200,
+          )) ?? undefined
+        );
+      } catch {
+        return undefined;
+      }
+    };
+    (async () => {
+      try {
+        // 1) 캐시 적중 → 세션 풀로딩 없이 바로 표시
+        const ref = sessionService.getThumbnailRef(name);
+        let small: string | undefined;
+        if (ref) small = await fetchByRef(ref);
+        if (cancelled) return;
+        // 2) 미스 또는 stale(이미지 삭제 등) → 1회 해석 후 캐시
+        if (!small) {
+          const resolved = await sessionService.resolveThumbnail(name);
+          if (cancelled) return;
+          if (resolved) {
+            sessionService.setThumbnailRef(
+              name,
+              resolved.scene,
+              resolved.image,
+            );
+            small = await fetchByRef(resolved);
+          } else {
+            sessionService.clearThumbnailRef(name);
+          }
+        }
+        if (!cancelled) setImage(small ?? null);
+      } catch (error) {
+        if (!cancelled) {
+          setImage(null);
+          console.warn('프로젝트 미리보기를 불러오지 못했습니다.', name, error);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [name]);
+
+  if (!image) {
+    return (
+      <div className="w-full aspect-[3/4] bg-[var(--c-surface)] rounded-md" />
+    );
+  }
+  return (
+    <img
+      alt="프로젝트 미리보기"
+      src={image}
+      className="w-full aspect-[3/4] object-cover rounded-md"
+      draggable={false}
+    />
+  );
+}
+
+// 프로젝트 카드
+function ProjectCard({
+  name,
+  isFav,
+  isActive,
+  isSelected,
+  folder: _folder,
+  onSelect,
+  onToggleFav,
+  onMove,
+  draggable,
+  onDragStart,
+  onDragEnd,
+  isDragging,
+}: {
+  name: string;
+  isFav: boolean;
+  isActive: boolean;
+  isSelected?: boolean;
+  folder: string | null;
+  onSelect: () => void;
+  onToggleFav: () => void;
+  onMove: () => void;
+  draggable?: boolean;
+  onDragStart?: (e: React.DragEvent) => void;
+  onDragEnd?: (e: React.DragEvent) => void;
+  isDragging?: boolean;
+}) {
+  return (
+    <div
+      draggable={draggable}
+      onDragStart={
+        onDragStart
+          ? (e: React.DragEvent) => {
+              e.stopPropagation();
+              onDragStart(e);
+            }
+          : undefined
+      }
+      onDragEnd={
+        onDragEnd
+          ? (e: React.DragEvent) => {
+              e.stopPropagation();
+              onDragEnd(e);
+            }
+          : undefined
+      }
+      style={isDragging ? { opacity: 0.4 } : undefined}
+      className={`relative cursor-pointer rounded-lg border-2 overflow-hidden transition-all hover:brightness-95 active:brightness-90 ${
+        isSelected
+          ? 'border-sky-500 ring-2 ring-sky-400'
+          : isActive
+            ? 'border-sky-500 ring-2 ring-sky-300'
+            : isFav
+              ? 'border-yellow-400'
+              : 'line-color'
+      }`}
+    >
+      <button
+        type="button"
+        className="absolute inset-0 z-0 rounded-lg"
+        aria-label={`${name} 프로젝트 선택`}
+        aria-current={isActive ? 'page' : undefined}
+        aria-pressed={isSelected}
+        onClick={onSelect}
+      />
+      <div className="contents pointer-events-none">
+        <div className="relative">
+          <ProjectThumbnail name={name} />
+          {isSelected && (
+            <div className="absolute inset-0 bg-sky-500/30 p-1">
+              <div className="bg-sky-500 text-white rounded-full w-5 h-5 flex items-center justify-center">
+                <FaCheck size={10} />
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="px-2 py-2 bg-[var(--c-surface-2)] flex items-center gap-1">
+          <Tooltip content={isFav ? '즐겨찾기 해제' : '즐겨찾기'}>
+            <button
+              type="button"
+              className="relative z-10 pointer-events-auto flex-none text-sm"
+              aria-label={isFav ? '즐겨찾기 해제' : '즐겨찾기'}
+              aria-pressed={isFav}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleFav();
+              }}
+            >
+              <FaStar
+                className={
+                  isFav
+                    ? 'text-yellow-400'
+                    : 'text-gray-300 dark:text-slate-600'
+                }
+                size={15}
+              />
+            </button>
+          </Tooltip>
+          <span className="text-[15px] text-default truncate flex-1">
+            {name}
+          </span>
+          {/* 새 창에서 열기 (멀티 윈도우 W6 P1, 데스크톱 전용) — 이미 다른 창에서
+            열려 있으면 새 창의 락 확보가 실패해 토스트+소유 창 포커스로 안내된다. */}
+          {!isMobile && (
+            <Tooltip content="새 창에서 열기">
+              <button
+                type="button"
+                className="relative z-10 pointer-events-auto flex-none text-faint hover:text-sky-500 px-0.5"
+                aria-label="새 창에서 열기"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  backend.openNewWindow(name);
+                }}
+              >
+                <FaWindowRestore size={13} />
+              </button>
+            </Tooltip>
+          )}
+          <Tooltip content="폴더로 이동">
+            <button
+              type="button"
+              aria-label="폴더로 이동"
+              className="relative z-10 pointer-events-auto flex-none text-faint hover:text-gray-700 dark:hover:text-gray-200 px-0.5"
+              onClick={(e) => {
+                e.stopPropagation();
+                onMove();
+              }}
+            >
+              <FaEllipsisV size={14} />
+            </button>
+          </Tooltip>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 폴더 내비게이션 항목
+function NavItem({
+  active,
+  onClick,
+  icon,
+  label,
+  count,
+  draggable,
+  onDragStart,
+  onDragEnd,
+  onDragOver,
+  onDragLeave,
+  onDrop,
+  dropping,
+  dragging,
+  tint,
+  onExport,
+  onClone,
+  onColor,
+  colorActive,
+  onRename,
+  onDelete,
+  onAddProject,
+  onSubfolder,
+  onMenu,
+  editing,
+  editValue,
+  onEditChange,
+  onEditCommit,
+  onEditCancel,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon?: React.ReactNode;
+  label: string;
+  count?: number;
+  draggable?: boolean;
+  onDragStart?: (e: React.DragEvent) => void;
+  onDragEnd?: (e: React.DragEvent) => void;
+  onDragOver?: (e: React.DragEvent) => void;
+  onDragLeave?: (e: React.DragEvent) => void;
+  onDrop?: (e: React.DragEvent) => void;
+  dropping?: boolean;
+  dragging?: boolean;
+  tint?: string;
+  onExport?: () => void;
+  onClone?: () => void;
+  onColor?: () => void;
+  colorActive?: boolean;
+  onRename?: () => void;
+  onDelete?: () => void;
+  onAddProject?: () => void;
+  onSubfolder?: () => void;
+  onMenu?: () => void;
+  editing?: boolean;
+  editValue?: string;
+  onEditChange?: (v: string) => void;
+  onEditCommit?: () => void;
+  onEditCancel?: () => void;
+}) {
+  // 인라인 편집 모드: 라벨이 입력창으로 바뀌고 저장(V)/취소 버튼 노출
+  if (editing) {
+    return (
+      <div className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-[15px] whitespace-nowrap flex-none md:w-full bg-[var(--c-surface)] ring-2 ring-sky-400">
+        {icon}
+        <input
+          // The rename field mounts only after the user's explicit edit action.
+          // eslint-disable-next-line jsx-a11y/no-autofocus
+          autoFocus
+          data-esc-cancel
+          value={editValue}
+          onChange={(e) => onEditChange?.(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              onEditCommit?.();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              onEditCancel?.();
+            }
+          }}
+          onClick={(e) => e.stopPropagation()}
+          className="w-24 md:w-auto md:flex-1 min-w-0 bg-transparent outline-none text-default text-sm"
+        />
+        <Tooltip content="저장">
+          <button
+            type="button"
+            aria-label="저장"
+            onClick={(e) => {
+              e.stopPropagation();
+              onEditCommit?.();
+            }}
+            className="relative z-10 pointer-events-auto text-green-500 hover:text-green-600 px-0.5"
+          >
+            <FaCheck size={13} />
+          </button>
+        </Tooltip>
+        <Tooltip content="취소">
+          <button
+            type="button"
+            aria-label="취소"
+            onClick={(e) => {
+              e.stopPropagation();
+              onEditCancel?.();
+            }}
+            className="relative z-10 pointer-events-auto text-faint hover:text-gray-600 dark:hover:text-gray-200 px-0.5"
+          >
+            <FaTimes size={13} />
+          </button>
+        </Tooltip>
+      </div>
+    );
+  }
+  return (
+    <div
+      draggable={draggable}
+      onDragStart={
+        onDragStart
+          ? (e: React.DragEvent) => {
+              e.stopPropagation();
+              onDragStart(e);
+            }
+          : undefined
+      }
+      onDragEnd={
+        onDragEnd
+          ? (e: React.DragEvent) => {
+              e.stopPropagation();
+              onDragEnd(e);
+            }
+          : undefined
+      }
+      onDragOver={
+        onDragOver
+          ? (e: React.DragEvent) => {
+              e.stopPropagation();
+              onDragOver(e);
+            }
+          : undefined
+      }
+      onDragLeave={
+        onDragLeave
+          ? (e: React.DragEvent) => {
+              e.stopPropagation();
+              onDragLeave(e);
+            }
+          : undefined
+      }
+      onDrop={
+        onDrop
+          ? (e: React.DragEvent) => {
+              e.stopPropagation();
+              onDrop(e);
+            }
+          : undefined
+      }
+      style={{
+        ...(dragging ? { opacity: 0.4 } : {}),
+        ...(tint && !active ? { backgroundColor: withAlpha(tint, '26') } : {}),
+      }}
+      className={`relative flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-[15px] whitespace-nowrap transition-colors flex-none md:w-full ${
+        dropping ? 'ring-2 ring-sky-400 ' : ''
+      }${active ? 'bg-sky-500 text-white' : 'btn-neutral text-body'}`}
+    >
+      <button
+        type="button"
+        className="absolute inset-0 z-0 rounded-lg"
+        aria-label={label}
+        aria-pressed={active}
+        onClick={onClick}
+      />
+      <span className="contents pointer-events-none">
+        {icon}
+        <span className="truncate min-w-0 max-w-[7rem] md:max-w-none md:flex-1 text-left">
+          {label}
+        </span>
+        {count != null && (
+          <span
+            className={`text-xs flex-none ${active ? 'text-sky-100' : 'text-faint dark:text-faint'}`}
+          >
+            {count}
+          </span>
+        )}
+        {onMenu && isMobile ? (
+          /* 모바일: ⋮ 메뉴 버튼 하나로 폴더 동작 5종 노출 */
+          <Tooltip content="폴더 메뉴">
+            <button
+              type="button"
+              aria-label="폴더 메뉴"
+              onClick={(e) => {
+                e.stopPropagation();
+                onMenu();
+              }}
+              className={`relative z-10 pointer-events-auto ml-1 flex-none px-1.5 py-0.5 ${active ? 'text-white' : 'text-muted'}`}
+            >
+              <FaEllipsisV size={15} />
+            </button>
+          </Tooltip>
+        ) : (
+          <>
+            {onExport && (
+              <Tooltip content="폴더 내보내기/불러오기">
+                <button
+                  type="button"
+                  aria-label="폴더 내보내기/불러오기"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onExport();
+                  }}
+                  className={`relative z-10 pointer-events-auto ml-0.5 flex-none opacity-60 hover:opacity-100 ${
+                    active ? 'text-white' : 'hover:text-amber-500'
+                  }`}
+                >
+                  <ActionIcon id="backup-export" size={11} />
+                </button>
+              </Tooltip>
+            )}
+            {onClone && (
+              <Tooltip content="폴더 복제">
+                <button
+                  type="button"
+                  aria-label="폴더 복제"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onClone();
+                  }}
+                  className={`relative z-10 pointer-events-auto ml-0.5 flex-none opacity-60 hover:opacity-100 ${
+                    active ? 'text-white' : 'hover:text-green-500'
+                  }`}
+                >
+                  <ActionIcon id="duplicate" size={11} />
+                </button>
+              </Tooltip>
+            )}
+            {onColor && (
+              <Tooltip content="폴더 색상">
+                <button
+                  type="button"
+                  aria-label="폴더 색상"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onColor();
+                  }}
+                  className={`relative z-10 pointer-events-auto ml-0.5 flex-none opacity-60 hover:opacity-100 ${
+                    active
+                      ? 'text-white'
+                      : colorActive
+                        ? 'text-sky-500 opacity-100'
+                        : ''
+                  }`}
+                >
+                  <FaPalette size={12} />
+                </button>
+              </Tooltip>
+            )}
+            {onRename && (
+              <Tooltip content="이름 편집">
+                <button
+                  type="button"
+                  aria-label="이름 편집"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRename();
+                  }}
+                  className={`relative z-10 pointer-events-auto flex-none opacity-60 hover:opacity-100 ${active ? 'text-white' : ''}`}
+                >
+                  <FaPen size={11} />
+                </button>
+              </Tooltip>
+            )}
+            {onDelete && (
+              <Tooltip content="폴더 삭제">
+                <button
+                  type="button"
+                  aria-label="폴더 삭제"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete();
+                  }}
+                  className={`relative z-10 pointer-events-auto flex-none opacity-60 hover:opacity-100 ${active ? 'text-white' : 'hover:text-red-500'}`}
+                >
+                  <ActionIcon id="delete" size={11} />
+                </button>
+              </Tooltip>
+            )}
+            {onAddProject && (
+              <Tooltip content="이 폴더에 새 프로젝트">
+                <button
+                  type="button"
+                  aria-label="이 폴더에 새 프로젝트"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAddProject();
+                  }}
+                  className={`relative z-10 pointer-events-auto flex-none opacity-60 hover:opacity-100 ${active ? 'text-white' : 'hover:text-sky-500'}`}
+                >
+                  <FaPlus size={11} />
+                </button>
+              </Tooltip>
+            )}
+            {onSubfolder && (
+              <Tooltip content="서브폴더 만들기">
+                <button
+                  type="button"
+                  aria-label="서브폴더 만들기"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSubfolder();
+                  }}
+                  className={`relative z-10 pointer-events-auto flex-none opacity-60 hover:opacity-100 ${active ? 'text-white' : 'hover:text-indigo-500'}`}
+                >
+                  <FaFolderPlus size={11} />
+                </button>
+              </Tooltip>
+            )}
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+const ProjectBrowser = observer(({ onClose }: { onClose: () => void }) => {
+  const [filter, setFilter] = useState('');
+  const [sessionNames, setSessionNames] = useState<string[]>([]);
+  const [view, setView] = useState<FolderView>('all');
+  const [, setVersion] = useState(0);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const selectedRef = useLatestRef(selected);
+  const [drag, setDrag] = useState<{
+    type: 'project' | 'folder';
+    name: string;
+  } | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [editingFolder, setEditingFolder] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [colorPickerFor, setColorPickerFor] = useState<string | null>(null);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
+    new Set(),
+  );
+  const filterRef = useRef<HTMLInputElement>(null);
+  const dndEnabled = !isMobile;
+
+  const refresh = useCallback(() => {
+    // 숨김 씬 템플릿 제외 (씬 템플릿 개편 2026-07-18)
+    setSessionNames(
+      templateService.filterVisibleProjects(sessionService.list()),
+    );
+    setVersion((v) => v + 1);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const onUpdate = () => refresh();
+    sessionService.addEventListener('listupdated', onUpdate);
+    return () => sessionService.removeEventListener('listupdated', onUpdate);
+  }, [refresh]);
+
+  useLayoutEffect(() => {
+    if (!isMobile) filterRef.current?.focus();
+  }, []);
+
+  // Ctrl+E로 닫기: 그리드는 검색창 자동 포커스 때문에 전역 단축키가 억제되므로
+  // 그리드가 열려 있을 때의 닫기 토글은 여기서 직접 처리한다.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'e' || e.key === 'E')) {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onClose]);
+
+  const folders = sessionService.getOrderedFolders();
+
+  // 선택된 폴더 뷰가 사라졌으면 전체로 복귀
+  useEffect(() => {
+    if (
+      view !== 'all' &&
+      view !== 'fav' &&
+      view !== 'unfiled' &&
+      !folders.includes(view)
+    ) {
+      setView('all');
+    }
+  }, [view, folders]);
+
+  const curName = appState.curSession?.name;
+  const recentProjects = getRecentProjects().filter((n) =>
+    sessionNames.includes(n),
+  );
+
+  const inView = useCallback((v: FolderView, name: string) => {
+    if (v === 'all') return true;
+    if (v === 'fav') return sessionService.isFavorite(name);
+    if (v === 'unfiled') return sessionService.getFolderOf(name) === null;
+    const f = sessionService.getFolderOf(name);
+    return f === v || (f !== null && f.startsWith(`${v}/`));
+  }, []);
+
+  const countIn = (v: FolderView) =>
+    sessionNames.filter((n) => inView(v, n)).length;
+
+  const allSorted = [...sessionNames].sort((a, b) => {
+    const aFav = sessionService.isFavorite(a);
+    const bFav = sessionService.isFavorite(b);
+    if (aFav !== bFav) return aFav ? -1 : 1;
+    return naturalCmp(a, b);
+  });
+
+  const filtered = allSorted
+    .filter((n) => inView(view, n))
+    .filter((n) =>
+      filter.trim() ? n.toLowerCase().includes(filter.toLowerCase()) : true,
+    );
+
+  const selectProject = useCallback(
+    async (name: string) => {
+      const session = await sessionService.get(name);
+      if (session) {
+        appState.curSession = session;
+        pushRecentProject(name);
+      }
+      onClose();
+    },
+    [onClose],
+  );
+
+  const toggleFav = useCallback(
+    (name: string) => {
+      sessionService.toggleFavorite(name);
+      refresh();
+    },
+    [refresh],
+  );
+
+  // A1: 현재 폴더 뷰에 새 프로젝트 생성 (폴더 뷰가 아니면 루트)
+  const createProjectInView = useCallback(async () => {
+    const folder =
+      view !== 'all' && view !== 'fav' && view !== 'unfiled' ? view : null;
+    // 이름 규칙·중복(어느 폴더에 있는지 포함)은 입력 창 안에서 검사(D2)
+    const name = await promptName({
+      title: folder
+        ? `"${folder}" 폴더에 새 프로젝트 이름`
+        : '신규 프로젝트 이름',
+      ...projectNameRules(sessionService),
+    });
+    if (!name) return;
+    try {
+      await sessionService.add(name);
+      if (folder) {
+        try {
+          await sessionService.moveToFolder(name, folder);
+        } catch (error) {
+          refresh();
+          appState.pushMessage(
+            `프로젝트 "${name}"을 만들었지만 폴더로 이동하지 못했습니다: ${String(error)}`,
+            'error',
+          );
+          return;
+        }
+      }
+      refresh();
+      appState.pushMessage(`프로젝트 "${name}"을(를) 만들었습니다.`);
+    } catch (e: any) {
+      appState.pushMessage(
+        nameErrorMessage(e, 'project', name, '프로젝트 생성에 실패했습니다.'),
+        'error',
+      );
+    }
+  }, [view, refresh]);
+
+  // 특정 폴더에 새 프로젝트 생성 (메뉴/버튼 공용)
+  const createProjectInFolder = useCallback(
+    async (folder: string) => {
+      const name = await promptName({
+        title: `"${folder}" 폴더에 새 프로젝트 이름`,
+        ...projectNameRules(sessionService),
+      });
+      if (!name) return;
+      try {
+        await sessionService.add(name);
+        try {
+          await sessionService.moveToFolder(name, folder);
+        } catch (error) {
+          refresh();
+          appState.pushMessage(
+            `프로젝트 "${name}"을 만들었지만 폴더로 이동하지 못했습니다: ${String(error)}`,
+            'error',
+          );
+          return;
+        }
+        refresh();
+        appState.pushMessage(`프로젝트 "${name}"을(를) 만들었습니다.`);
+      } catch (e: any) {
+        appState.pushMessage(
+          nameErrorMessage(e, 'project', name, '프로젝트 생성에 실패했습니다.'),
+          'error',
+        );
+      }
+    },
+    [refresh],
+  );
+
+  // A3: 다중 선택 일괄 이동
+  const toggleSelect = useCallback((name: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }, []);
+
+  const exitSelect = useCallback(() => {
+    setSelectMode(false);
+    setSelected(new Set());
+  }, []);
+
+  const bulkMove = useCallback(async () => {
+    const count = selected.size;
+    if (count === 0) return;
+    const folderList = sessionService.getOrderedFolders();
+    const items: { text: string; value: string }[] = [
+      { text: '📤 미분류로 이동', value: '__root__' },
+      ...folderList.map((f) => ({ text: `📁 ${f}`, value: f })),
+    ];
+    const target = await appState.pushDialogAsync({
+      type: 'select',
+      text: `선택한 ${count}개 프로젝트 이동`,
+      items,
+    });
+    if (!target) return;
+    const folder = target === '__root__' ? null : target;
+    const moved = new Set<string>();
+    const failures: string[] = [];
+    for (const name of selected) {
+      try {
+        await sessionService.moveToFolder(name, folder);
+        moved.add(name);
+      } catch (error) {
+        failures.push(`${name}: ${String(error)}`);
+      }
+    }
+    if (failures.length === 0 && selectedRef.current === selected) {
+      exitSelect();
+    } else {
+      setSelected(
+        (current) => new Set([...current].filter((name) => !moved.has(name))),
+      );
+    }
+    refresh();
+    appState.pushMessage(
+      failures.length
+        ? `${moved.size}개 프로젝트를 이동했습니다. ${failures.length}개는 이동하지 못했습니다.
+${failures.join('\n')}`
+        : `${moved.size}개 프로젝트를 이동했습니다.`,
+      failures.length ? 'error' : 'info',
+    );
+  }, [selected, selectedRef, exitSelect, refresh]);
+
+  // 프로젝트를 폴더로 이동 (선택 다이얼로그)
+  const moveProject = useCallback(
+    async (name: string) => {
+      const currentFolder = sessionService.getFolderOf(name);
+      const folderList = sessionService.getOrderedFolders();
+      const items: { text: string; value: string }[] = [];
+      if (currentFolder !== null)
+        items.push({ text: '📤 미분류로 이동', value: '__root__' });
+      for (const f of folderList) {
+        if (f !== currentFolder) items.push({ text: `📁 ${f}`, value: f });
+      }
+      if (items.length === 0) {
+        appState.pushMessage(
+          '이동할 폴더가 없습니다. 먼저 새 폴더를 만들어주세요.',
+        );
+        return;
+      }
+      const target = await appState.pushDialogAsync({
+        type: 'select',
+        text: `"${name}" 폴더 이동`,
+        items,
+      });
+      if (!target) return;
+      try {
+        await sessionService.moveToFolder(
+          name,
+          target === '__root__' ? null : target,
+        );
+        refresh();
+      } catch (e: any) {
+        appState.pushMessage(e.message || '폴더 이동에 실패했습니다.');
+      }
+    },
+    [refresh],
+  );
+
+  // ===== 드래그&드롭 =====
+  const canDropOnFolder = useCallback(
+    (f: string) =>
+      drag != null &&
+      (drag.type === 'project'
+        ? sessionService.getFolderOf(drag.name) !== f
+        : drag.name !== f && !f.startsWith(`${drag.name}/`)),
+    [drag],
+  );
+
+  const reorderFolders = useCallback((moved: string, target: string) => {
+    if (moved === target) return;
+    const cur = sessionService.getOrderedFolders();
+    const from = cur.indexOf(moved);
+    const to = cur.indexOf(target);
+    if (from < 0 || to < 0) return;
+    const without = cur.filter((f) => f !== moved);
+    const tIdx = without.indexOf(target);
+    const insertAt = from < to ? tIdx + 1 : tIdx;
+    without.splice(insertAt, 0, moved);
+    sessionService.setFolderOrder(without);
+  }, []);
+
+  const moveProjectTo = useCallback(
+    async (name: string, folder: string | null) => {
+      if (sessionService.getFolderOf(name) === folder) return;
+      try {
+        await sessionService.moveToFolder(name, folder);
+        refresh();
+      } catch (e: any) {
+        appState.pushMessage(e?.message || '이동에 실패했습니다.');
+      }
+    },
+    [refresh],
+  );
+
+  const handleFolderDrop = useCallback(
+    async (targetFolder: string) => {
+      const d = drag;
+      setDrag(null);
+      setDropTarget(null);
+      if (!d) return;
+      if (d.type === 'folder') {
+        const source = d.name;
+        if (source === targetFolder) return;
+        const srcParent = sessionService.folderParentPath(source);
+        const tgtParent = sessionService.folderParentPath(targetFolder);
+        if (srcParent === tgtParent) {
+          reorderFolders(source, targetFolder);
+        } else {
+          const leaf = sessionService.folderLeafName(source);
+          const newPath = `${targetFolder}/${leaf}`;
+          try {
+            await sessionService.renameFolder(source, newPath);
+            refresh();
+          } catch (e: any) {
+            appState.pushMessage(e?.message || '폴더 이동에 실패했습니다.');
+          }
+        }
+      } else moveProjectTo(d.name, targetFolder);
+    },
+    [drag, reorderFolders, moveProjectTo, refresh],
+  );
+
+  const handleUnfiledDrop = useCallback(() => {
+    const d = drag;
+    setDrag(null);
+    setDropTarget(null);
+    if (!d || d.type !== 'project') return;
+    moveProjectTo(d.name, null);
+  }, [drag, moveProjectTo]);
+
+  const createFolder = useCallback(
+    async (parentPath?: string) => {
+      const hint = parentPath
+        ? `"${sessionService.folderLeafName(parentPath)}" 안에 새 폴더 (예: 서브폴더 또는 상위/하위)`
+        : '새 폴더 이름을 입력하세요 (예: 폴더 또는 상위/하위)';
+      // 「상위/하위」 경로 입력 허용 — 단계마다 경로 안전 검사, 같은 경로의 폴더는 창 안에서 거부(D2)
+      const toFull = (v: string) => (parentPath ? `${parentPath}/${v}` : v);
+      const value = await promptName({
+        title: hint,
+        kind: 'folder',
+        pathSafe: true,
+        allowSlash: true,
+        existing: (v) => sessionService.listFolders().includes(toFull(v)),
+      });
+      if (!value) return;
+      const fullPath = toFull(value);
+      try {
+        await sessionService.createFolder(fullPath);
+        setView(fullPath);
+        refresh();
+      } catch (e: any) {
+        appState.pushMessage(e.message || '폴더 생성에 실패했습니다.', 'error');
+      }
+    },
+    [refresh],
+  );
+
+  const handleNewFolder = useCallback(async () => {
+    await createFolder();
+  }, [createFolder]);
+
+  const pickColor = useCallback(async (folder: string, c: string | null) => {
+    setColorPickerFor(null);
+    try {
+      await sessionService.setFolderColor(folder, c);
+    } catch (error) {
+      appState.pushMessage(
+        `폴더 색상을 저장하지 못했습니다: ${String(error)}`,
+        'error',
+      );
+    }
+  }, []);
+
+  // 커스텀 컬러 피커 전용: 크로뮴은 색상 팝업을 드래그하는 동안 change 이벤트가
+  // 연속 발생하므로, 패널을 닫지 않고(input 언마운트 → 팝업 닫힘 방지) 저장만
+  // 디바운스한다. 이렇게 해야 슬라이더로 색을 자유롭게 조정할 수 있다.
+  const customColorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pickCustomColor = useCallback((folder: string, c: string) => {
+    if (customColorTimer.current) clearTimeout(customColorTimer.current);
+    customColorTimer.current = setTimeout(() => {
+      sessionService.setFolderColor(folder, c).catch((error: unknown) => {
+        appState.pushMessage(
+          `폴더 색상을 저장하지 못했습니다: ${String(error)}`,
+          'error',
+        );
+      });
+    }, 200);
+  }, []);
+
+  // ===== 폴더 인라인 이름 편집 / 삭제 =====
+  const startRename = useCallback((folder: string) => {
+    setColorPickerFor(null);
+    setEditingFolder(folder);
+    setEditValue(sessionService.folderLeafName(folder));
+  }, []);
+
+  const cancelRename = useCallback(() => {
+    setEditingFolder(null);
+    setEditValue('');
+  }, []);
+
+  const commitRename = useCallback(async () => {
+    const folder = editingFolder;
+    if (!folder) return;
+    const newLeaf = editValue.trim();
+    if (!newLeaf || sessionService.folderLeafName(folder) === newLeaf) {
+      cancelRename();
+      return;
+    }
+    const parent = sessionService.folderParentPath(folder);
+    const newFullPath = parent ? `${parent}/${newLeaf}` : newLeaf;
+    try {
+      await sessionService.renameFolder(folder, newFullPath);
+      if (view === folder) setView(newFullPath);
+      cancelRename();
+      refresh();
+    } catch (e: any) {
+      appState.pushMessage(e.message || '이름 변경에 실패했습니다.');
+    }
+  }, [editingFolder, editValue, view, refresh, cancelRename]);
+
+  const deleteFolderConfirm = useCallback(
+    (folder: string) => {
+      const cleanup = () => {
+        if (view === folder) setView('all');
+        if (editingFolder === folder) cancelRename();
+        refresh();
+      };
+      // 판단·문구는 드로어와 공용(models/folderDeleteFlow.planFolderDeletePrompt — 하위 폴더 포함 개수)
+      const prompt = planFolderDeletePrompt(
+        sessionService.folderLeafName(folder),
+        sessionService.getProjectsInFolder(folder),
+      );
+      // 빈 폴더 → 단순 확인
+      if (prompt.kind === 'empty') {
+        appState.pushDialog({
+          type: 'confirm',
+          danger: true,
+          text: prompt.text,
+          callback: async () => {
+            try {
+              await sessionService.deleteFolder(folder);
+              cleanup();
+            } catch (e: any) {
+              appState.pushMessage(e.message || '폴더 삭제에 실패했습니다.');
+            }
+          },
+        });
+        return;
+      }
+      // 프로젝트가 있는 폴더 → 삭제 방식 선택
+      appState.pushDialog({
+        type: 'select',
+        text: prompt.text,
+        // 두 선택지 모두 삭제(폴더만은 즉시 실행, 프로젝트 포함은 확인 1회 더) — 빨강(D1)
+        items: [
+          { text: prompt.folderOnlyText, value: 'folderOnly', danger: true },
+          {
+            text: prompt.withProjectsText,
+            value: 'withProjects',
+            danger: true,
+          },
+        ],
+        callback: async (value) => {
+          if (value === 'folderOnly') {
+            try {
+              await sessionService.deleteFolder(folder);
+              cleanup();
+            } catch (e: any) {
+              appState.pushMessage(e.message || '폴더 삭제에 실패했습니다.');
+            }
+          } else if (value === 'withProjects') {
+            // 위험 동작 → 2차 확인
+            appState.pushDialog({
+              type: 'confirm',
+              danger: true,
+              text: prompt.confirmWithProjectsText,
+              callback: async () => {
+                await appState.deleteFolderWithProjects(folder);
+                cleanup();
+              },
+            });
+          }
+        },
+      });
+    },
+    [view, refresh, editingFolder, cancelRename],
+  );
+
+  const cloneFolder = useCallback(
+    async (sourceFolder: string) => {
+      const leafName = sessionService.folderLeafName(sourceFolder);
+      const parent = sessionService.folderParentPath(sourceFolder);
+      const toTarget = (v: string) => (parent ? `${parent}/${v}` : v);
+      // 원본 이름 기반 제안값을 채워 연다(D2) — 같은 자리의 폴더와 겹치면 창 안에서 거부
+      const value = await promptName({
+        title: `"${leafName}" 폴더를 복제합니다. 새 폴더 이름을 입력하세요.`,
+        initial: suggestFolderCopyName(leafName, (v) =>
+          sessionService.listFolders().includes(toTarget(v)),
+        ),
+        kind: 'folder',
+        pathSafe: true,
+        existing: (v) => sessionService.listFolders().includes(toTarget(v)),
+      });
+      if (!value) return;
+
+      const mode = await appState.pushDialogAsync({
+        text: '이미지 파일을 함께 복사할까요?',
+        type: 'select',
+        items: [
+          { text: '설정만 복사 (프롬프트, 프리셋 등)', value: 'config' },
+          { text: '이미지 포함 복사 (휴지통 제외)', value: 'with-images' },
+        ],
+      });
+      if (!mode) return;
+
+      const withImages = mode === 'with-images';
+      const targetPath = toTarget(value);
+      try {
+        appState.setProgressDialog({
+          text: '폴더 복제 중...',
+          done: 0,
+          total: 1,
+        });
+        await sessionService.cloneFolder(sourceFolder, targetPath, withImages);
+        appState.setProgressDialog(undefined);
+        refresh();
+        appState.pushMessage(`"${value}" 폴더로 복제되었습니다.`);
+      } catch (e: any) {
+        appState.setProgressDialog(undefined);
+        appState.pushMessage(e.message || '폴더 복제에 실패했습니다.', 'error');
+      }
+    },
+    [refresh],
+  );
+
+  // 모바일: 폴더마다 ⋮ 메뉴 (데스크톱은 인라인 버튼 유지)
+  const openFolderMenu = async (f: string) => {
+    const leafName = sessionService.folderLeafName(f);
+    const v = await appState.pushDialogAsync({
+      type: 'select',
+      text: `폴더 "${leafName}"`,
+      items: [
+        { text: '📤 내보내기/불러오기', value: 'export' },
+        { text: '📋 폴더 복제', value: 'clone' },
+        { text: '🎨 색상 변경', value: 'color' },
+        { text: '✏️ 이름 편집', value: 'rename' },
+        { text: '🗑️ 폴더 삭제', value: 'delete' },
+        { text: '➕ 이 폴더에 새 프로젝트', value: 'add' },
+        { text: '📂 이 폴더에 서브폴더', value: 'subfolder' },
+      ],
+    });
+    if (!v) return;
+    if (v === 'export') appState.folderBackupMenu(f);
+    else if (v === 'clone') cloneFolder(f);
+    else if (v === 'color') setColorPickerFor((p) => (p === f ? null : f));
+    else if (v === 'rename') startRename(f);
+    else if (v === 'delete') deleteFolderConfirm(f);
+    else if (v === 'add') createProjectInFolder(f);
+    else if (v === 'subfolder') createFolder(f);
+  };
+
+  return (
+    <ModalOverlay
+      isOpen
+      onClose={onClose}
+      title="프로젝트 탐색"
+      width="max-w-3xl md:max-w-7xl"
+    >
+      <div
+        className="flex flex-col md:flex-row gap-3"
+        style={{ height: '70vh' }}
+      >
+        {/* 폴더 내비게이션 (PC: 좌측 세로 / 모바일: 상단 가로 스크롤) */}
+        <div className="flex md:flex-col gap-1.5 md:w-64 md:flex-none flex-none md:min-h-0">
+          {/* 스크롤 영역: 폴더 목록 */}
+          <div className="flex md:flex-col gap-1.5 overflow-x-auto md:overflow-y-auto flex-1 min-w-0 md:min-h-0 pb-1 md:pb-0">
+            <NavItem
+              active={view === 'all'}
+              onClick={() => setView('all')}
+              icon={<FaFolder className="opacity-70" size={14} />}
+              label="전체"
+              count={countIn('all')}
+            />
+            <NavItem
+              active={view === 'fav'}
+              onClick={() => setView('fav')}
+              icon={<FaStar className="text-yellow-400" size={14} />}
+              label="즐겨찾기"
+              count={countIn('fav')}
+            />
+            <NavItem
+              active={view === 'unfiled'}
+              onClick={() => setView('unfiled')}
+              icon={<FaFolder className="opacity-40" size={14} />}
+              label="미분류"
+              count={countIn('unfiled')}
+              onDragOver={(e) => {
+                if (
+                  drag?.type === 'project' &&
+                  sessionService.getFolderOf(drag.name) !== null
+                ) {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                  setDropTarget('__unfiled__');
+                }
+              }}
+              onDragLeave={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                  setDropTarget((t) => (t === '__unfiled__' ? null : t));
+                }
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                handleUnfiledDrop();
+              }}
+              dropping={
+                dropTarget === '__unfiled__' &&
+                drag?.type === 'project' &&
+                sessionService.getFolderOf(drag.name) !== null
+              }
+            />
+            {(() => {
+              const rootFolders = folders.filter((f) => !f.includes('/'));
+              const renderFolderNode = (
+                f: string,
+                depth: number,
+              ): React.ReactNode => {
+                const childFolders = sessionService.getChildFolders(f);
+                const isOpen = expandedFolders.has(f);
+                const folderColor =
+                  sessionService.getFolderColor(f) || DEFAULT_FOLDER_COLOR;
+                const picking = colorPickerFor === f;
+                const leafName = sessionService.folderLeafName(f);
+                const hasChildren = childFolders.length > 0;
+                const toggleExpand = () => {
+                  setExpandedFolders((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(f)) next.delete(f);
+                    else next.add(f);
+                    return next;
+                  });
+                };
+                return (
+                  <div
+                    key={f}
+                    className="flex flex-col gap-1 flex-none md:w-full"
+                    style={
+                      depth > 0 ? { paddingLeft: `${depth * 12}px` } : undefined
+                    }
+                  >
+                    <NavItem
+                      active={view === f}
+                      onClick={() => {
+                        if (hasChildren) toggleExpand();
+                        setView(f);
+                      }}
+                      icon={
+                        hasChildren ? (
+                          <span className="flex items-center gap-0.5">
+                            {isOpen ? (
+                              <FaChevronDown
+                                size={10}
+                                className="flex-none text-faint"
+                              />
+                            ) : (
+                              <FaChevronRight
+                                size={10}
+                                className="flex-none text-faint"
+                              />
+                            )}
+                            <FaFolder
+                              size={14}
+                              style={{ color: folderColor }}
+                            />
+                          </span>
+                        ) : (
+                          <FaFolder size={14} style={{ color: folderColor }} />
+                        )
+                      }
+                      label={leafName}
+                      count={countIn(f)}
+                      tint={folderColor}
+                      onExport={() => appState.folderBackupMenu(f)}
+                      onClone={() => cloneFolder(f)}
+                      onColor={() => setColorPickerFor(picking ? null : f)}
+                      colorActive={picking}
+                      onRename={() => startRename(f)}
+                      onDelete={() => deleteFolderConfirm(f)}
+                      onAddProject={() => createProjectInFolder(f)}
+                      onSubfolder={() => createFolder(f)}
+                      onMenu={() => openFolderMenu(f)}
+                      editing={editingFolder === f}
+                      editValue={editValue}
+                      onEditChange={setEditValue}
+                      onEditCommit={commitRename}
+                      onEditCancel={cancelRename}
+                      draggable={dndEnabled && editingFolder !== f}
+                      onDragStart={(e) => {
+                        setDrag({ type: 'folder', name: f });
+                        e.dataTransfer.effectAllowed = 'move';
+                      }}
+                      onDragEnd={() => {
+                        setDrag(null);
+                        setDropTarget(null);
+                      }}
+                      onDragOver={(e) => {
+                        if (canDropOnFolder(f)) {
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'move';
+                          setDropTarget(f);
+                        }
+                      }}
+                      onDragLeave={(e) => {
+                        if (
+                          !e.currentTarget.contains(e.relatedTarget as Node)
+                        ) {
+                          setDropTarget((t) => (t === f ? null : t));
+                        }
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        handleFolderDrop(f);
+                      }}
+                      dropping={dropTarget === f && canDropOnFolder(f)}
+                      dragging={drag?.type === 'folder' && drag.name === f}
+                    />
+                    {picking && (
+                      <div className="flex flex-wrap items-center gap-1.5 px-2 py-2 rounded-lg bg-[var(--c-surface)] w-[12rem] md:w-full">
+                        {FOLDER_COLORS.map((c) => {
+                          const selectedName = folderColor === c;
+                          return (
+                            <button
+                              type="button"
+                              key={c}
+                              onClick={() => pickColor(f, c)}
+                              title={c}
+                              aria-label={`폴더 색상 ${c}`}
+                              aria-pressed={selectedName}
+                              className="w-6 h-6 rounded-full flex-none transition-transform hover:scale-110"
+                              style={{
+                                backgroundColor: c,
+                                boxShadow: selectedName
+                                  ? `0 0 0 2px #fff, 0 0 0 4px ${c}`
+                                  : 'none',
+                              }}
+                            />
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => pickColor(f, null)}
+                          className="px-2 h-6 rounded-md text-xs flex-none btn-neutral text-gray-600 dark:text-gray-200"
+                        >
+                          기본
+                        </button>
+                        {/* 직접 색상 선택: 데스크톱은 OS 네이티브 피커, 모바일은
+                        빈약한 WebView 다이얼로그 대신 내장 HSL 피커 사용 */}
+                        {!isMobile ? (
+                          <label
+                            title="직접 색상 선택"
+                            className="relative w-6 h-6 rounded-full flex-none cursor-pointer overflow-hidden border line-color transition-transform hover:scale-110"
+                            style={{
+                              background:
+                                'conic-gradient(red, orange, yellow, lime, cyan, blue, magenta, red)',
+                            }}
+                          >
+                            <span className="sr-only">직접 색상 선택</span>
+                            <input
+                              type="color"
+                              defaultValue={
+                                /^#[0-9a-fA-F]{6}$/.test(folderColor)
+                                  ? folderColor
+                                  : '#0ea5e9'
+                              }
+                              onInput={(e) =>
+                                pickCustomColor(f, e.currentTarget.value)
+                              }
+                              onChange={(e) =>
+                                pickCustomColor(f, e.target.value)
+                              }
+                              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                            />
+                          </label>
+                        ) : (
+                          <MobileColorPicker
+                            initial={
+                              /^#[0-9a-fA-F]{6}$/.test(folderColor)
+                                ? folderColor
+                                : '#0ea5e9'
+                            }
+                            onChange={(hex) => pickCustomColor(f, hex)}
+                            onClose={() => setColorPickerFor(null)}
+                          />
+                        )}
+                      </div>
+                    )}
+                    {isOpen &&
+                      childFolders.map((child) =>
+                        renderFolderNode(child, depth + 1),
+                      )}
+                  </div>
+                );
+              };
+              return rootFolders.map((f) => renderFolderNode(f, 0));
+            })()}
+            <button
+              type="button"
+              onClick={handleNewFolder}
+              className="btn-ghost flex items-center justify-center md:justify-start gap-1.5 px-2.5 py-1.5 rounded-lg text-sm whitespace-nowrap flex-none md:w-full border border-dashed line-color text-muted"
+            >
+              <FaPlus size={11} />
+              <span>새 폴더</span>
+            </button>
+          </div>
+        </div>
+
+        {/* 검색 + 그리드 */}
+        <div className="flex-1 flex flex-col min-w-0 min-h-0 gap-3">
+          <div className="relative flex-none">
+            <FaSearch
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+              size={14}
+            />
+            <input
+              ref={filterRef}
+              type="text"
+              placeholder="프로젝트 검색..."
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 rounded-lg border line-color bg-[var(--c-input-bg)] text-default text-sm focus:outline-none focus:ring-2 focus:ring-sky-400"
+            />
+          </div>
+
+          {/* 액션 바: 새 프로젝트 / 다중 선택 */}
+          <div className="flex items-center gap-2 flex-none">
+            {!selectMode ? (
+              <>
+                <button
+                  type="button"
+                  onClick={createProjectInView}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-sm btn-solid-sky"
+                >
+                  <FaPlus size={11} />새 프로젝트
+                  {view !== 'all' && view !== 'fav' && view !== 'unfiled' && (
+                    <span className="opacity-80">· 📁{view}</span>
+                  )}
+                </button>
+                <div className="flex-1" />
+                <button
+                  type="button"
+                  onClick={() => setSelectMode(true)}
+                  className="px-2.5 py-1.5 rounded-lg text-sm btn-neutral text-body"
+                >
+                  선택
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="text-sm text-sky-600 dark:text-sky-400 font-medium">
+                  {selected.size}개 선택
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSelected(new Set(filtered))}
+                  className="btn-ghost px-2 py-1.5 rounded-lg text-sm text-muted"
+                >
+                  전체 선택
+                </button>
+                <div className="flex-1" />
+                <button
+                  type="button"
+                  onClick={bulkMove}
+                  disabled={selected.size === 0}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-sm btn-solid-sky disabled:opacity-40"
+                >
+                  <FaFolder size={12} /> 폴더로 이동
+                </button>
+                <button
+                  type="button"
+                  onClick={exitSelect}
+                  className="px-2.5 py-1.5 rounded-lg text-sm btn-neutral text-body"
+                >
+                  취소
+                </button>
+              </>
+            )}
+          </div>
+
+          <div className="flex-1 overflow-y-auto min-h-0">
+            {/* 최근 프로젝트 (전체 뷰 + 검색 없을 때만, 선택 모드 제외) */}
+            {view === 'all' &&
+              !filter.trim() &&
+              !selectMode &&
+              recentProjects.length > 0 && (
+                <div className="mb-4">
+                  <div className="text-xs font-medium text-muted mb-2">
+                    최근 프로젝트
+                  </div>
+                  <div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+                    {recentProjects.map((name) => (
+                      <ProjectCard
+                        key={`recent-${name}`}
+                        name={name}
+                        isFav={sessionService.isFavorite(name)}
+                        isActive={curName === name}
+                        folder={sessionService.getFolderOf(name)}
+                        onSelect={() => selectProject(name)}
+                        onToggleFav={() => toggleFav(name)}
+                        onMove={() => moveProject(name)}
+                        draggable={dndEnabled && !selectMode}
+                        onDragStart={(e) => {
+                          setDrag({ type: 'project', name });
+                          e.dataTransfer.effectAllowed = 'move';
+                        }}
+                        onDragEnd={() => {
+                          setDrag(null);
+                          setDropTarget(null);
+                        }}
+                        isDragging={
+                          drag?.type === 'project' && drag.name === name
+                        }
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+            {/* 프로젝트 그리드 */}
+            <div>
+              <div className="text-xs font-medium text-muted mb-2">
+                {filter.trim()
+                  ? `검색 결과 (${filtered.length})`
+                  : `프로젝트 (${filtered.length})`}
+              </div>
+              {filtered.length === 0 ? (
+                // 빈 목록 / 로딩 / 스캔 실패를 구분해 표시 — 스캔 실패를 "프로젝트가
+                // 없습니다"로 보여주면 데이터가 사라진 것으로 오인된다.
+                <div className="text-sm text-faint text-center py-8">
+                  {filter.trim() ? (
+                    '검색 결과가 없습니다'
+                  ) : sessionService.listState === 'error' ? (
+                    <div className="flex flex-col items-center gap-2">
+                      <span>프로젝트 목록을 불러오지 못했습니다</span>
+                      <button
+                        type="button"
+                        className="round-button back-sky px-4 h-8"
+                        onClick={() =>
+                          sessionService.update().catch((error: unknown) => {
+                            appState.pushMessage(
+                              `프로젝트 목록을 새로 고치지 못했습니다: ${String(error)}`,
+                              'error',
+                            );
+                          })
+                        }
+                      >
+                        다시 시도
+                      </button>
+                    </div>
+                  ) : sessionService.listState === 'loading' ? (
+                    '프로젝트 목록을 불러오는 중…'
+                  ) : (
+                    '프로젝트가 없습니다'
+                  )}
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+                  {filtered.map((name) => (
+                    <ProjectCard
+                      key={name}
+                      name={name}
+                      isFav={sessionService.isFavorite(name)}
+                      isActive={curName === name}
+                      isSelected={selectMode && selected.has(name)}
+                      folder={sessionService.getFolderOf(name)}
+                      onSelect={() =>
+                        selectMode ? toggleSelect(name) : selectProject(name)
+                      }
+                      onToggleFav={() => toggleFav(name)}
+                      onMove={() => moveProject(name)}
+                      draggable={dndEnabled && !selectMode}
+                      onDragStart={(e) => {
+                        setDrag({ type: 'project', name });
+                        e.dataTransfer.effectAllowed = 'move';
+                      }}
+                      onDragEnd={() => {
+                        setDrag(null);
+                        setDropTarget(null);
+                      }}
+                      isDragging={
+                        drag?.type === 'project' && drag.name === name
+                      }
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </ModalOverlay>
+  );
+});
+
+export { pushRecentProject };
+export default ProjectBrowser;

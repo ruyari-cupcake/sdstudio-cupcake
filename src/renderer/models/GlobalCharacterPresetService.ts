@@ -1,0 +1,861 @@
+import { observable, action } from 'mobx';
+import { v4 as uuidv4 } from 'uuid';
+import { persistService } from './PersistenceService';
+import { StoreLoadGuard } from './StoreLoadGuard';
+import type { Backend } from '../backend';
+import type { ImageService } from './ImageService';
+import { type Session, CharacterPreset, type ICharacterPreset } from './types';
+import { dataUriToBase64 } from './imageDataUri';
+
+type GlobalCharacterStorage = Pick<
+  Backend,
+  | 'readFile'
+  | 'writeFile'
+  | 'renameFile'
+  | 'notifyGlobalStoreChanged'
+  | 'existFile'
+  | 'readDataFile'
+  | 'writeDataFile'
+  | 'deleteFile'
+>;
+type GlobalCharacterImages = Pick<
+  ImageService,
+  | 'getVibeImagePath'
+  | 'getReferenceImagePath'
+  | 'storeVibeImage'
+  | 'storeReferenceImage'
+>;
+
+const GLOBAL_CHAR_PRESETS_FILE = 'global_character_presets.json';
+const GLOBAL_CHAR_IMAGES_DIR = 'global_char_images';
+
+export interface IGlobalCharacterPresetEntry {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  // 이미지 경로(vibes/characterReferences/representativeImage)는 글로벌 파일명을 가리킨다.
+  preset: ICharacterPreset;
+  // 1단계 평면 폴더(중첩 없음, 배치 생성 P0 — 2026-07-16 합의).
+  // 빈 문자열/미지정 = 루트(미분류). 폴더 목록의 진실 원천은 스토어의
+  // folders 레지스트리(아래) — 엔트리의 이 필드는 소속 지정이다.
+  folder?: string;
+}
+
+export interface IGlobalCharacterPresetStore {
+  version: 1;
+  presets: IGlobalCharacterPresetEntry[];
+  // 폴더 레지스트리(1단계 평면, 배열 순서 = 표시 순서) — 빈 폴더 허용
+  // ("폴더 먼저 만들고 옮기는" 워크플로). 필드 추가 = 구버전 호환 무해.
+  // 구 데이터(파생 방식)는 listFolders 가 엔트리에서 자동 복구 병합한다.
+  folders?: string[];
+}
+
+// 글로벌(프로젝트 공통) 캐릭터 프리셋.
+// 캐릭터 프리셋 이미지는 세션 디렉터리에 종속되므로, 글로벌은 전용 디렉터리에
+// 이미지를 따로 보관하고(data URI 파일), 불러올 때 세션으로 복사한다.
+export class GlobalCharacterPresetService extends EventTarget {
+  constructor(
+    private readonly backend: GlobalCharacterStorage,
+    private readonly imageService: GlobalCharacterImages,
+  ) {
+    super();
+  }
+
+  @observable accessor presets: IGlobalCharacterPresetEntry[] = [];
+
+  // 폴더 레지스트리 — 순서가 곧 표시 순서. listFolders 로만 읽을 것
+  // (파생 폴더 자동 복구 병합 포함).
+  @observable accessor folders: string[] = [];
+
+  @observable accessor loaded: boolean = false;
+
+  private readonly loadGuard = new StoreLoadGuard();
+
+  private saveTimeout: any = null;
+
+  // ---------- lifecycle ----------
+  async load(): Promise<void> {
+    this.loaded = false;
+    await this.loadGuard.run(async () => {
+      if (!(await this.backend.existFile(GLOBAL_CHAR_PRESETS_FILE))) {
+        this.presets = [];
+        this.folders = [];
+        return;
+      }
+      const str = await this.backend.readFile(GLOBAL_CHAR_PRESETS_FILE);
+      let json: IGlobalCharacterPresetStore;
+      try {
+        json = JSON.parse(str) as IGlobalCharacterPresetStore;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        await this.backend.renameFile(
+          GLOBAL_CHAR_PRESETS_FILE,
+          `${GLOBAL_CHAR_PRESETS_FILE}.corrupt-${Date.now()}`,
+        );
+        this.presets = [];
+        this.folders = [];
+        return;
+      }
+      this.presets =
+        json && Array.isArray(json.presets)
+          ? json.presets
+              .filter(
+                (p) =>
+                  p &&
+                  typeof p.id === 'string' &&
+                  typeof p.name === 'string' &&
+                  p.preset,
+              )
+              // folder 문자열 방어 — 비문자열/빈 값은 루트로 정규화
+              .map((p) => ({
+                ...p,
+                folder:
+                  typeof p.folder === 'string' && p.folder.trim()
+                    ? p.folder
+                    : undefined,
+              }))
+          : [];
+      // 폴더 레지스트리 로드 방어 — 문자열만·trim·중복 제거
+      const rawFolders = Array.isArray((json as any)?.folders)
+        ? ((json as any).folders as unknown[])
+        : [];
+      const folders: string[] = [];
+      for (const f of rawFolders) {
+        if (typeof f !== 'string') continue;
+        const t = f.trim();
+        if (t && !folders.includes(t)) folders.push(t);
+      }
+      this.folders = folders;
+    });
+    this.loaded = true;
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  async save(
+    presets: IGlobalCharacterPresetEntry[] = this.presets,
+    folders: string[] = this.folders,
+  ) {
+    this.loadGuard.assertWritable();
+    const store: IGlobalCharacterPresetStore = {
+      version: 1,
+      presets,
+      folders,
+    };
+    const data = JSON.stringify(store);
+    await persistService.writeAtomic(
+      this.backend,
+      GLOBAL_CHAR_PRESETS_FILE,
+      data,
+    );
+    // 전역 저장소 동기화(W6 P2): 다른 창들이 디스크에서 재로드하도록 알림
+    this.backend
+      .notifyGlobalStoreChanged('global-character-presets')
+      .catch(() => {});
+  }
+
+  scheduleSave() {
+    if (this.saveTimeout) clearTimeout(this.saveTimeout);
+    this.saveTimeout = setTimeout(() => {
+      this.saveTimeout = null;
+      void this.save().catch((error) => {
+        console.error('글로벌 캐릭터 프리셋 저장 실패:', error);
+      });
+    }, 2000);
+  }
+
+  async flushSave(
+    presets: IGlobalCharacterPresetEntry[] = this.presets,
+    folders: string[] = this.folders,
+  ) {
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+      this.saveTimeout = null;
+    }
+    await this.save(presets, folders);
+  }
+
+  // ---------- read ----------
+  list(): IGlobalCharacterPresetEntry[] {
+    return this.presets.slice();
+  }
+
+  get(id: string): IGlobalCharacterPresetEntry | undefined {
+    return this.presets.find((p) => p.id === id);
+  }
+
+  getByName(name: string): IGlobalCharacterPresetEntry | undefined {
+    return this.presets.find((p) => p.name === name);
+  }
+
+  // ---------- 폴더 (1단계 평면, 영속 레지스트리 — 2026-07-16 UX 개편) ----------
+  // 폴더는 folders 레지스트리가 진실 원천(빈 폴더 허용 — 폴더 먼저 만들고
+  // 옮기는 워크플로). 레지스트리에 없는데 엔트리에만 존재하는 파생 폴더
+  // (수동 편집/구 데이터)는 목록 뒤에 정렬 병합해 자동 복구한다.
+  listFolders(): string[] {
+    const derived = new Set<string>();
+    for (const p of this.presets) if (p.folder) derived.add(p.folder);
+    for (const f of this.folders) derived.delete(f);
+    const extras = Array.from(derived).sort((a, b) =>
+      a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }),
+    );
+    return [...this.folders, ...extras];
+  }
+
+  // 새 폴더 등록 (빈 폴더 허용) — trim·중복 거부. 반환 = 정규화된 이름.
+  @action
+  async createFolder(nameInput: string): Promise<string> {
+    const name = (nameInput ?? '').trim();
+    if (!name) throw new Error('폴더 이름을 입력해 주세요');
+    if (this.listFolders().includes(name)) {
+      throw new Error('이미 존재하는 폴더입니다');
+    }
+    this.folders = [...this.folders, name];
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+    return name;
+  }
+
+  // 폴더 삭제 — 소속 엔트리는 미분류로 이동, 레지스트리에서 제거.
+  @action
+  async deleteFolder(name: string): Promise<void> {
+    let entryChanged = false;
+    this.presets = this.presets.map((p) => {
+      if (p.folder !== name) return p;
+      entryChanged = true;
+      return { ...p, folder: undefined, updatedAt: Date.now() };
+    });
+    const registryChanged = this.folders.includes(name);
+    if (!entryChanged && !registryChanged) return;
+    this.folders = this.folders.filter((f) => f !== name);
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  // 폴더 지정/해제 — null/빈 값은 루트(undefined)로 정규화.
+  // 새 폴더 이름이 오면 레지스트리에 자동 등록한다.
+  @action
+  async setFolder(id: string, folder: string | null): Promise<void> {
+    const entry = this.get(id);
+    if (!entry) return;
+    const f = (folder ?? '').trim();
+    const next = f || undefined;
+    if (entry.folder === next) return;
+    entry.folder = next;
+    entry.updatedAt = Date.now();
+    if (next && !this.folders.includes(next)) {
+      this.folders = [...this.folders, next];
+    }
+    this.presets = [...this.presets];
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  // 폴더 이름 변경 — 레지스트리 이관 + 해당 폴더의 엔트리 일괄 이관.
+  @action
+  async renameFolder(oldName: string, nameInput: string): Promise<void> {
+    const newName = nameInput.trim();
+    if (!newName) throw new Error('폴더 이름을 입력해 주세요');
+    if (oldName === newName) return;
+    if (this.listFolders().includes(newName)) {
+      throw new Error('이미 존재하는 폴더입니다');
+    }
+    // 레지스트리 이관 — 파생 전용(미등록) 폴더였다면 새 이름으로 등록해 복구
+    this.folders = this.folders.includes(oldName)
+      ? this.folders.map((f) => (f === oldName ? newName : f))
+      : [...this.folders, newName];
+    this.presets = this.presets.map((p) =>
+      p.folder === oldName
+        ? { ...p, folder: newName, updatedAt: Date.now() }
+        : p,
+    );
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  // ---------- image helpers (data URI 파일) ----------
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the instance service API used by injected callers.
+  getImagePath(filename: string): string {
+    return `${GLOBAL_CHAR_IMAGES_DIR}/${filename.split('/').pop()!}`;
+  }
+
+  // 카드 표시용 등: data URI 그대로 반환 (img src로 바로 사용 가능)
+  async fetchImageData(filename: string): Promise<string | null> {
+    if (!filename) return null;
+    try {
+      const path = this.getImagePath(filename);
+      const exists = await this.backend.existFile(path);
+      if (!exists) return null;
+      return await this.backend.readDataFile(path);
+    } catch {
+      return null;
+    }
+  }
+
+  private async storeImageData(dataUri: string): Promise<string> {
+    // read-data-file은 data URI를 주지만 write-data-file은 raw base64를 기대한다.
+    const base64 = dataUri.includes(',') ? dataUri.split(',')[1] : dataUri;
+    const filename = `${uuidv4()}.png`;
+    await this.backend.writeDataFile(
+      `${GLOBAL_CHAR_IMAGES_DIR}/${filename}`,
+      base64,
+    );
+    return filename;
+  }
+
+  private async deleteImageData(filename: string) {
+    if (!filename) return;
+    try {
+      await this.backend.deleteFile(this.getImagePath(filename));
+    } catch (error) {
+      console.warn('참조가 제거된 글로벌 이미지 정리 실패:', filename, error);
+    }
+  }
+
+  // 이름 충돌 시 `_n` 접미사 부여 — 일괄 생성(batchCreatePlan)과 같은 관례
+  private resolveNameCollision(name: string): string {
+    if (!this.getByName(name)) return name;
+    let i = 1;
+    while (this.getByName(`${name}_${i}`)) i++;
+    return `${name}_${i}`;
+  }
+
+  // ---------- 로컬 → 글로벌 ----------
+  @action
+  async addFromSessionPreset(
+    session: Session,
+    preset: CharacterPreset,
+  ): Promise<IGlobalCharacterPresetEntry> {
+    const json: ICharacterPreset = JSON.parse(JSON.stringify(preset.toJSON()));
+    const createdImages: string[] = [];
+    const copyImage = async (path: string): Promise<string> => {
+      const data = await this.backend.readDataFile(path);
+      if (!data) throw new Error(`프리셋 이미지가 비어 있습니다: ${path}`);
+      const filename = await this.storeImageData(data);
+      createdImages.push(filename);
+      return filename;
+    };
+    let entry: IGlobalCharacterPresetEntry;
+    let nextPresets: IGlobalCharacterPresetEntry[];
+    try {
+      for (const vibe of json.vibes || []) {
+        if (vibe.path) {
+          vibe.path = await copyImage(
+            this.imageService.getVibeImagePath(session, vibe.path),
+          );
+        }
+      }
+      for (const ref of json.characterReferences || []) {
+        if (ref.path) {
+          ref.path = await copyImage(
+            this.imageService.getReferenceImagePath(session, ref.path),
+          );
+        }
+      }
+      if (json.representativeImage) {
+        json.representativeImage = await copyImage(
+          this.imageService.getVibeImagePath(session, json.representativeImage),
+        );
+      }
+      const name = this.resolveNameCollision(
+        (json.name || '이름없음').trim() || '이름없음',
+      );
+      json.name = name;
+      delete json.fromGlobalId;
+      delete json.fromGlobalRev;
+      entry = {
+        id: uuidv4(),
+        name,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        preset: json,
+      };
+      nextPresets = [...this.presets, entry];
+      await this.flushSave(nextPresets);
+    } catch (error) {
+      for (const filename of createdImages) {
+        try {
+          await this.deleteImageData(filename);
+        } catch (cleanupError) {
+          console.warn(
+            '글로벌 프리셋 이미지 복사 취소 정리 실패:',
+            cleanupError,
+          );
+        }
+      }
+      throw error;
+    }
+    this.presets = nextPresets;
+    this.dispatchEvent(new CustomEvent('changed', {}));
+    return entry;
+  }
+
+  // ---------- 글로벌 → 로컬 ----------
+  // 멱등(증식 방지, 2026-07-17): 같은 글로벌에서 불러온 로컬 사본(fromGlobalId
+  // 링크)이 이미 있으면 — 글로벌이 그대로면 그 사본을 그대로 재사용(이미지
+  // 재복사 없음), 글로벌이 바뀌었으면 그 사본을 자리에서 갱신한다. 반복
+  // 적용/해제로 "이름 (글로벌)…" 사본이 늘어나지 않는다. 무링크 동명 로컬은
+  // 갱신 대상이 아니다(순수 로컬 프리셋 덮어쓰기 방지, 2026-07-19).
+  async instantiateIntoSession(
+    session: Session,
+    id: string,
+  ): Promise<CharacterPreset> {
+    const entry = this.get(id);
+    if (!entry) throw new Error('프리셋을 찾을 수 없습니다');
+    // 링크(fromGlobalId)된 사본만 재사용·갱신한다. 같은 이름의 무링크 로컬은
+    // 우연히 이름만 같은 순수 로컬 프리셋일 수 있어 제자리 갱신하면 바이브/
+    // 레퍼런스가 소실된다 — 갱신 금지, 이름 충돌은 아래 접미 처리로 해소.
+    const existing = session
+      .getCharacterPresets()
+      .find((p) => p.fromGlobalId === id);
+    if (existing && existing.fromGlobalRev === entry.updatedAt) {
+      return existing;
+    }
+    const json: ICharacterPreset = JSON.parse(JSON.stringify(entry.preset));
+
+    const createdPaths: string[] = [];
+    const copyImage = async (
+      token: string,
+      reference: boolean,
+    ): Promise<string> => {
+      const dataUri = await this.fetchImageData(token);
+      if (!dataUri)
+        throw new Error(`글로벌 프리셋 이미지가 없습니다: ${token}`);
+      const path = reference
+        ? await this.imageService.storeReferenceImage(
+            session,
+            dataUriToBase64(dataUri),
+          )
+        : await this.imageService.storeVibeImage(
+            session,
+            dataUriToBase64(dataUri),
+          );
+      createdPaths.push(
+        reference
+          ? this.imageService.getReferenceImagePath(session, path)
+          : this.imageService.getVibeImagePath(session, path),
+      );
+      return path;
+    };
+    try {
+      for (const vibe of json.vibes || []) {
+        if (vibe.path) vibe.path = await copyImage(vibe.path, false);
+      }
+      for (const ref of json.characterReferences || []) {
+        if (ref.path) ref.path = await copyImage(ref.path, true);
+      }
+      if (json.representativeImage) {
+        json.representativeImage = await copyImage(
+          json.representativeImage,
+          false,
+        );
+      }
+    } catch (error) {
+      for (const path of createdPaths) {
+        try {
+          await this.backend.deleteFile(path);
+        } catch (cleanupError) {
+          console.warn('세션 프리셋 이미지 복사 취소 정리 실패:', cleanupError);
+        }
+      }
+      throw error;
+    }
+
+    const preset = CharacterPreset.fromJSON(json);
+    preset.fromGlobalId = id;
+    preset.fromGlobalRev = entry.updatedAt;
+    if (existing) {
+      // 기존 사본을 자리에서 갱신 — 이름은 글로벌을 따라가되, 링크된 자기 자신이
+      // 아닌 다른 로컬과 충돌하면 접미. 이름이 유지되면 fromPreset 적용 태그도
+      // 그대로 이어진다.
+      let nm = preset.name;
+      while (
+        session.hasCharacterPreset(nm) &&
+        session.getCharacterPreset(nm) !== existing
+      )
+        nm += ' (글로벌)';
+      preset.name = nm;
+      session.updateCharacterPreset(existing.name, preset);
+    } else {
+      // 최초 불러오기 — 로컬 이름 충돌 방지
+      let nm = preset.name;
+      while (session.hasCharacterPreset(nm)) nm += ' (글로벌)';
+      preset.name = nm;
+      session.addCharacterPreset(preset);
+    }
+    return preset;
+  }
+
+  // ---------- 파일 내보내기/불러오기 (PC↔모바일 크로스 작업 이동, 2026-07-18) ----------
+  // 파일 형식 = 로컬 캐릭터 프리셋 내보내기(CharacterPresetEditor 의
+  // ExportedPresetData version 1)와 동일: 프리셋 JSON + vibeImages/referenceImages/
+  // representativeImageData 로 이미지 데이터 인라인. filename 은 프리셋 json 의
+  // path 토큰과 일치시키므로 **로컬↔글로벌 교차 불러오기**가 가능하다.
+  // globalFolder 는 글로벌 전용 추가 필드 — 로컬 불러오기는 모른 채 무시(무해).
+  async exportToFileData(): Promise<any> {
+    const out: any = { version: 1, presets: [] };
+    for (const entry of this.presets) {
+      const json: any = JSON.parse(JSON.stringify(entry.preset));
+      json.vibeImages = [];
+      for (const vibe of json.vibes || []) {
+        if (!vibe.path) continue;
+        const data = await this.fetchImageData(vibe.path);
+        if (data) json.vibeImages.push({ filename: vibe.path, data });
+      }
+      json.referenceImages = [];
+      for (const ref of json.characterReferences || []) {
+        if (!ref.path) continue;
+        const data = await this.fetchImageData(ref.path);
+        if (data) json.referenceImages.push({ filename: ref.path, data });
+      }
+      if (json.representativeImage) {
+        const data = await this.fetchImageData(json.representativeImage);
+        if (data) json.representativeImageData = data;
+      }
+      if (entry.folder) json.globalFolder = entry.folder;
+      out.presets.push(json);
+    }
+    return out;
+  }
+
+  // 파일 항목의 표시 이름(정규화) — 충돌 판정과 등록 이름이 같은 규칙을 쓰게 한 곳에.
+  private static fileEntryName(raw: any): string {
+    const n = typeof raw?.name === 'string' ? raw.name.trim() : '';
+    return n || '이름없음';
+  }
+
+  // 파일 안 항목 중 기존 글로벌 프리셋과 이름이 같은 개수(불러오기 정책 선택용).
+  // 형식이 아니면 0 — 실제 형식 검사는 importFromFileData 가 throw 로 한다.
+  countFileConflicts(data: any): number {
+    if (!data || !Array.isArray(data.presets)) return 0;
+    const existing = new Set(this.presets.map((p) => p.name));
+    let n = 0;
+    for (const raw of data.presets) {
+      if (!raw || typeof raw !== 'object') continue;
+      if (existing.has(GlobalCharacterPresetService.fileEntryName(raw))) n++;
+    }
+    return n;
+  }
+
+  // 파일 데이터 → 글로벌 엔트리 등록. 이미지는 새 글로벌 파일명(uuid)으로 저장 후
+  // path 재지정(기존 글로벌 이미지와 충돌 없음).
+  // 이름이 같은 기존 항목 처리(policy, 드라이브 동기화 ② B2 — 기본 'rename' = 종전 동작):
+  //  - rename   : 새 엔트리로 추가, 이름은 `_n` 접미(resolveNameCollision 기존 규칙)
+  //  - skip     : 추가하지 않음(이미지도 저장하지 않음)
+  //  - overwrite: updateEntry 로 **id 를 유지한 채 내용만 교체** — 프로젝트 사본의
+  //               fromGlobalId 링크가 끊기지 않고, 다음 적용 때 fromGlobalRev 차이로
+  //               갱신된다. 기존 한 항목은 한 번만 덮어쓴다(파일 안 같은 이름이 또
+  //               나오면 rename 으로 추가). 파일에 폴더가 있으면 그 폴더로 옮긴다.
+  // 충돌 판정 기준은 불러오기 시작 시점의 기존 목록이다(파일 안 같은 이름끼리는 충돌 아님).
+  // 파일/이미지/저장 오류는 전체 불러오기를 취소하고 기존 항목을 보존한다.
+  @action
+  async importFromFileData(
+    data: any,
+    policy: 'rename' | 'skip' | 'overwrite' = 'rename',
+  ): Promise<{ added: number; updated: number; skipped: number }> {
+    if (!data || !Array.isArray(data.presets)) {
+      throw new Error('올바른 캐릭터 프리셋 파일이 아닙니다');
+    }
+    const existingByName = new Map<string, string>();
+    for (const p of this.presets) {
+      if (!existingByName.has(p.name)) existingByName.set(p.name, p.id);
+    }
+    let nextPresets = this.presets.slice();
+    const nextFolders = (this.folders ?? []).slice();
+    const overwrittenIds = new Set<string>();
+    const createdImages: string[] = [];
+    const replacedImages = new Set<string>();
+    const storeImage = async (image: string): Promise<string> => {
+      const filename = await this.storeImageData(image);
+      createdImages.push(filename);
+      return filename;
+    };
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+    try {
+      for (const raw of data.presets) {
+        if (!raw || typeof raw !== 'object') continue;
+        const fileName = GlobalCharacterPresetService.fileEntryName(raw);
+        const existingId = existingByName.get(fileName);
+        if (existingId && policy === 'skip') {
+          skipped++;
+          continue;
+        }
+        const existing =
+          existingId &&
+          policy === 'overwrite' &&
+          !overwrittenIds.has(existingId)
+            ? nextPresets.find((p) => p.id === existingId)
+            : undefined;
+        const json: any = JSON.parse(JSON.stringify(raw));
+        const folder =
+          typeof json.globalFolder === 'string' && json.globalFolder.trim()
+            ? json.globalFolder.trim()
+            : undefined;
+        const map = new Map<string, string>();
+        for (const img of [
+          ...(json.vibeImages || []),
+          ...(json.referenceImages || []),
+        ]) {
+          if (!img?.filename || typeof img.data !== 'string') continue;
+          const filename = String(img.filename).split('/').pop()!;
+          map.set(filename, await storeImage(img.data));
+        }
+        const resolveImage = (token: string): string => {
+          if (!token) return '';
+          const filename = map.get(String(token).split('/').pop()!);
+          if (!filename)
+            throw new Error(`불러올 프리셋 이미지가 없습니다: ${token}`);
+          return filename;
+        };
+        for (const vibe of json.vibes || [])
+          vibe.path = resolveImage(vibe.path);
+        for (const ref of json.characterReferences || [])
+          ref.path = resolveImage(ref.path);
+        if (json.representativeImage) {
+          json.representativeImage =
+            typeof json.representativeImageData === 'string'
+              ? await storeImage(json.representativeImageData)
+              : resolveImage(json.representativeImage);
+        }
+        delete json.vibeImages;
+        delete json.referenceImages;
+        delete json.representativeImageData;
+        delete json.globalFolder;
+        const clean: ICharacterPreset = CharacterPreset.fromJSON(
+          json as ICharacterPreset,
+        ).toJSON();
+        delete clean.fromGlobalId;
+        delete clean.fromGlobalRev;
+        let name = fileName;
+        if (!existing) {
+          const usedNames = new Set(nextPresets.map((p) => p.name));
+          let i = 1;
+          while (usedNames.has(name)) name = `${fileName}_${i++}`;
+        }
+        clean.name = name;
+        if (folder && !nextFolders.includes(folder)) nextFolders.push(folder);
+        if (existing) {
+          for (const token of this.collectImageTokens(existing.preset))
+            replacedImages.add(token);
+          const replacement: IGlobalCharacterPresetEntry = {
+            ...existing,
+            name,
+            preset: clean,
+            updatedAt: Date.now(),
+            ...(folder ? { folder } : {}),
+          };
+          nextPresets = nextPresets.map((p) =>
+            p.id === existing.id ? replacement : p,
+          );
+          overwrittenIds.add(existing.id);
+          updated++;
+        } else {
+          nextPresets.push({
+            id: uuidv4(),
+            name,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            preset: clean,
+            ...(folder ? { folder } : {}),
+          });
+          added++;
+        }
+      }
+      if (added === 0 && updated === 0) return { added, updated, skipped };
+      await this.flushSave(nextPresets, nextFolders);
+    } catch (error) {
+      for (const filename of createdImages) {
+        try {
+          await this.deleteImageData(filename);
+        } catch (cleanupError) {
+          console.warn('프리셋 파일 불러오기 취소 정리 실패:', cleanupError);
+        }
+      }
+      throw error;
+    }
+    this.presets = nextPresets;
+    this.folders = nextFolders;
+    this.dispatchEvent(new CustomEvent('changed', {}));
+    const referenced = new Set(
+      nextPresets.flatMap((p) => this.collectImageTokens(p.preset)),
+    );
+    for (const token of new Set([...replacedImages, ...createdImages])) {
+      if (referenced.has(token)) continue;
+      try {
+        await this.deleteImageData(token);
+      } catch (error) {
+        console.warn('교체된 프리셋 이미지 정리 실패:', error);
+      }
+    }
+    return { added, updated, skipped };
+  }
+
+  // ---------- 편집기용 이미지 저장 (FileUploadBase64는 raw base64 제공) ----------
+  async storeVibeForEditor(base64: string): Promise<string> {
+    const filename = `${uuidv4()}.png`;
+    await this.backend.writeDataFile(
+      `${GLOBAL_CHAR_IMAGES_DIR}/${filename}`,
+      base64,
+    );
+    return filename;
+  }
+
+  async storeReferenceForEditor(base64: string): Promise<string> {
+    // 글로벌 보관은 원본 유지; 실제 정규화/리사이즈는 프로젝트로 불러올 때 수행
+    const filename = `${uuidv4()}.png`;
+    await this.backend.writeDataFile(
+      `${GLOBAL_CHAR_IMAGES_DIR}/${filename}`,
+      base64,
+    );
+    return filename;
+  }
+
+  private async copyImageToken(token: string): Promise<string> {
+    const dataUri = await this.fetchImageData(token);
+    if (!dataUri) return token;
+    return await this.storeImageData(dataUri);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Internal callers share the service image-token policy.
+  private collectImageTokens(preset: ICharacterPreset): string[] {
+    const t: string[] = [];
+    for (const v of preset.vibes || []) if (v.path) t.push(v.path);
+    for (const r of preset.characterReferences || [])
+      if (r.path) t.push(r.path);
+    if (preset.representativeImage) t.push(preset.representativeImage);
+    return t;
+  }
+
+  // ---------- 글로벌 직접 신규/수정/복제/정렬 ----------
+  // 글로벌 모드 편집기에서 만든 프리셋(이미지 토큰이 이미 글로벌 디렉터리를 가리킴)을 등록
+  @action
+  async addPresetObject(
+    preset: CharacterPreset,
+  ): Promise<IGlobalCharacterPresetEntry> {
+    const json: ICharacterPreset = preset.toJSON();
+    const name = this.resolveNameCollision(
+      (json.name || '이름없음').trim() || '이름없음',
+    );
+    json.name = name;
+    // 글로벌 유래 링크는 새 글로벌 엔트리와 무관 — 제거
+    delete json.fromGlobalId;
+    delete json.fromGlobalRev;
+    const entry: IGlobalCharacterPresetEntry = {
+      id: uuidv4(),
+      name,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      preset: json,
+    };
+    this.presets = [...this.presets, entry];
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+    return entry;
+  }
+
+  @action
+  async updateEntry(id: string, preset: CharacterPreset): Promise<void> {
+    const entry = this.get(id);
+    if (!entry) throw new Error('프리셋을 찾을 수 없습니다');
+    const oldTokens = new Set(this.collectImageTokens(entry.preset));
+    const json: ICharacterPreset = preset.toJSON();
+    let nm = (json.name || '이름없음').trim() || '이름없음';
+    const other = this.getByName(nm);
+    if (other && other.id !== id) nm = this.resolveNameCollision(nm);
+    json.name = nm;
+    const newTokens = new Set(this.collectImageTokens(json));
+    entry.name = nm;
+    entry.preset = json;
+    entry.updatedAt = Date.now();
+    this.presets = [...this.presets];
+    // 더 이상 참조되지 않는 글로벌 이미지 정리
+    for (const t of oldTokens)
+      if (!newTokens.has(t)) await this.deleteImageData(t);
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  @action
+  async duplicateEntry(id: string): Promise<void> {
+    const entry = this.get(id);
+    if (!entry) return;
+    const json: ICharacterPreset = JSON.parse(JSON.stringify(entry.preset));
+    for (const v of json.vibes || [])
+      if (v.path) v.path = await this.copyImageToken(v.path);
+    for (const r of json.characterReferences || [])
+      if (r.path) r.path = await this.copyImageToken(r.path);
+    if (json.representativeImage)
+      json.representativeImage = await this.copyImageToken(
+        json.representativeImage,
+      );
+    const name = this.resolveNameCollision(
+      `${entry.name || '이름없음'} 복사본`,
+    );
+    json.name = name;
+    const newEntry: IGlobalCharacterPresetEntry = {
+      id: uuidv4(),
+      name,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      preset: json,
+    };
+    const idx = this.presets.findIndex((p) => p.id === id);
+    const arr = [...this.presets];
+    arr.splice(idx < 0 ? arr.length : idx + 1, 0, newEntry);
+    this.presets = arr;
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  @action
+  reorder(from: number, to: number) {
+    if (
+      from === to ||
+      from < 0 ||
+      to < 0 ||
+      from >= this.presets.length ||
+      to >= this.presets.length
+    )
+      return;
+    const arr = [...this.presets];
+    const [m] = arr.splice(from, 1);
+    arr.splice(to, 0, m);
+    this.presets = arr;
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  // ---------- write ----------
+  @action
+  async rename(id: string, newNameInput: string) {
+    const entry = this.get(id);
+    if (!entry) throw new Error('프리셋을 찾을 수 없습니다');
+    const newName = newNameInput.trim();
+    if (!newName) throw new Error('이름을 입력해 주세요');
+    if (entry.name === newName) return;
+    if (this.getByName(newName)) throw new Error('이미 존재하는 이름입니다');
+    entry.name = newName;
+    entry.preset.name = newName;
+    entry.updatedAt = Date.now();
+    this.presets = [...this.presets];
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+
+  @action
+  async delete(id: string) {
+    const entry = this.get(id);
+    if (!entry) return;
+    const imgs: string[] = [];
+    for (const v of entry.preset.vibes || []) imgs.push(v.path);
+    for (const r of entry.preset.characterReferences || []) imgs.push(r.path);
+    if (entry.preset.representativeImage)
+      imgs.push(entry.preset.representativeImage);
+    for (const f of imgs) await this.deleteImageData(f);
+    this.presets = this.presets.filter((p) => p.id !== id);
+    this.scheduleSave();
+    this.dispatchEvent(new CustomEvent('changed', {}));
+  }
+}

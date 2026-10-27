@@ -1,0 +1,1866 @@
+import * as Hangul from 'hangul-js';
+import {
+  createContext,
+  forwardRef,
+  useContext,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import Denque from 'denque';
+import {
+  FaBook,
+  FaBox,
+  FaDatabase,
+  FaExpand,
+  FaTag,
+  FaTimes,
+  FaUndo,
+} from 'react-icons/fa';
+import { FaPerson } from 'react-icons/fa6';
+import { FixedSizeList as List } from 'react-window';
+import getCaretCoordinates from 'textarea-caret';
+import { observer } from 'mobx-react-lite';
+import { ActionIcon } from './ActionIcon';
+import { isMobile, backend, artistLibraryService } from '../models';
+import { backStackService } from '../models/BackStackService';
+import {
+  artistNameOfSegment,
+  makeArtistLookup,
+  promptSegmentAt,
+} from '../models/artistTags';
+import { highlightPrompt } from '../models/PromptService';
+import { type WordTag, calcGapMatch } from '../models/Tags';
+import { appState } from '../models/AppService';
+import { PromptAutoExpandContext } from './PromptAutoExpand';
+import {
+  adjustPromptWeightAtSelection,
+  getPromptCommentAtSelection,
+  getPromptWeightAtSelection,
+  togglePromptCommentAtSelection,
+} from '../models/promptTransforms';
+import type { PromptWeightAdjustment } from '../models/promptTransforms';
+import {
+  clearFocusedPromptEditor,
+  setFocusedPromptEditor,
+  type FocusedPromptEditor,
+} from '../models/promptEditorFocus';
+import {
+  autocompleteTagCategory,
+  trimAutocompleteWord,
+} from '../models/promptAutocomplete';
+import { PROMPT_WEIGHT_OPEN_AT_START_RE } from '../models/promptWeightSyntax';
+import useLatestRef from './useLatestRef';
+import EditorMutex from './editorMutex';
+
+interface PromptEditTextAreaProps {
+  value: string;
+  className?: string;
+  innerRef?: any;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}
+
+interface HistoryEntry {
+  text: string;
+  cursorPos: number[];
+  copmositionBuffer: string[];
+}
+
+function isMacPlatform() {
+  return navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+}
+
+const mutex = new EditorMutex();
+
+const MAX_HISTORY_SIZE = 4096; // 1024 * 4096 bytes = 4 MB
+
+class CursorMemorizeEditor {
+  compositionBuffer: string[];
+
+  previousRange: number[] | any;
+
+  curText: string;
+
+  domText: string;
+
+  container: HTMLElement;
+
+  editor: HTMLElement;
+
+  clipboard: HTMLElement;
+
+  highlightPrompt: (
+    text: string,
+    curWord: string,
+    updateAutoComplete: boolean,
+  ) => string;
+
+  onUpdated: (text: string) => void;
+
+  onUpArrow: () => void;
+
+  onDownArrow: () => void;
+
+  onEnter: () => void;
+
+  onEsc: () => void;
+
+  autocomplete: boolean;
+
+  historyBuf: any;
+
+  redoBuf: any;
+
+  shuffling: boolean;
+
+  constructor(
+    container: HTMLElement,
+    editor: HTMLElement,
+    clipboard: HTMLElement,
+    renderHighlight: (
+      text: string,
+      curWord: string,
+      updateAutoComplete: boolean,
+    ) => string,
+    onUpdated: (text: string) => void,
+    historBuf: any,
+    redoBuf: any,
+    onUpArrow: () => void,
+    onDownArrow: () => void,
+    onEnter: () => void,
+    onEsc: () => void,
+  ) {
+    this.container = container;
+    this.compositionBuffer = [];
+    this.previousRange = undefined;
+    this.curText = '';
+    this.domText = '';
+    this.editor = editor;
+    this.clipboard = clipboard;
+    this.highlightPrompt = renderHighlight;
+    this.onUpdated = onUpdated;
+    this.historyBuf = historBuf;
+    this.redoBuf = redoBuf;
+    this.autocomplete = false;
+    this.onUpArrow = onUpArrow;
+    this.onDownArrow = onDownArrow;
+    this.onEnter = onEnter;
+    this.onEsc = onEsc;
+    this.shuffling = false;
+  }
+
+  getCaretPosition() {
+    const selection = window.getSelection()!;
+    const res = [0, 0];
+    const done = [false, false];
+    if (selection.rangeCount === 0) return res;
+    const range = selection.getRangeAt(0);
+    const { startContainer } = range;
+    const { endContainer } = range;
+    const { startOffset } = range;
+    const { endOffset } = range;
+    const nodeIterator = document.createNodeIterator(
+      this.editor,
+      // eslint-disable-next-line no-bitwise -- DOM NodeFilter accepts a bit mask.
+      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+      null,
+    );
+    for (
+      let currentNode = nodeIterator.nextNode();
+      currentNode;
+      currentNode = nodeIterator.nextNode()
+    ) {
+      for (let [i, container, offset] of [
+        [0, startContainer, startOffset],
+        [1, endContainer, endOffset],
+      ]) {
+        i = i as number;
+        offset = offset as number;
+        container = container as Node;
+        if (currentNode === container) {
+          if (container.nodeType === 3) {
+            res[i] += offset;
+          } else if ((container as any).tagName !== 'BR') {
+            for (let j = 0; j < offset; j += 1) {
+              const child = container.childNodes[j];
+              res[i] += (child as any).textContent.length;
+              if ((child as any).tagName === 'BR') res[i] += 1;
+            }
+          }
+          done[i] = true;
+        } else if (!done[i]) {
+          if (currentNode.nodeType === 3) {
+            res[i] += currentNode.textContent!.length;
+          }
+          if (currentNode.nodeName === 'BR') {
+            res[i] += 1;
+          }
+        }
+      }
+    }
+    return res;
+  }
+
+  async setCaretPosition(pos: number[] | any) {
+    await new Promise((resolve) => {
+      requestAnimationFrame(resolve);
+    });
+    const selection = window.getSelection()!;
+    const range = document.createRange();
+    for (let i = 0; i < 2; i += 1) {
+      let offset = 0;
+      const nodeIterator = document.createNodeIterator(
+        this.editor,
+        // eslint-disable-next-line no-bitwise -- DOM NodeFilter accepts a bit mask.
+        NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+        null,
+      );
+      for (
+        let currentNode = nodeIterator.nextNode();
+        currentNode;
+        currentNode = nodeIterator.nextNode()
+      ) {
+        if (currentNode.nodeName === 'BR') {
+          if (offset === pos[i]) {
+            if (i === 0) {
+              range.setStart(currentNode, pos[i] - offset);
+            } else {
+              range.setEnd(currentNode, pos[i] - offset);
+            }
+            break;
+          }
+          offset += 1;
+        }
+        if (currentNode.nodeType === 3) {
+          const nodeLength = currentNode.textContent!.length;
+          if (offset + nodeLength >= pos[i]) {
+            if (i === 0) {
+              range.setStart(currentNode, pos[i] - offset);
+            } else {
+              range.setEnd(currentNode, pos[i] - offset);
+            }
+            break;
+          }
+          offset += nodeLength;
+        }
+      }
+    }
+
+    selection.removeAllRanges();
+    selection.addRange(range);
+    this.previousRange = pos;
+    const rect = range.getBoundingClientRect();
+    const parentRect = this.container.getBoundingClientRect();
+    if (rect.bottom > parentRect.bottom) {
+      this.container.scrollTop += rect.bottom - parentRect.bottom;
+    }
+  }
+
+  updateDOM(text: string, newPos: number, updateAutoComplete: boolean = true) {
+    this.domText = text;
+    const cur = this.getCurWord(newPos);
+    this.editor.innerHTML = `${this.highlightPrompt(text, cur, updateAutoComplete)}<span></span><br>`;
+  }
+
+  updateCurText(text: string, _push: boolean = true) {
+    this.curText = text;
+    this.onUpdated(text);
+  }
+
+  pushHistory() {
+    if (this.historyBuf.length > MAX_HISTORY_SIZE) {
+      this.historyBuf.shift();
+    }
+    const pos = this.getCaretPosition();
+    let text = this.curText;
+    if (this.compositionBuffer.length > 0) {
+      text =
+        text.substring(0, pos[0] - 1) +
+        Hangul.assemble(this.compositionBuffer) +
+        text.substring(pos[0] - 1);
+    }
+    this.historyBuf.push({
+      text,
+      cursorPos: this.getCaretPosition(),
+      compositionBuffer: this.compositionBuffer,
+    });
+    this.redoBuf.clear();
+  }
+
+  async adjustWeight(delta: number) {
+    const selection = window.getSelection();
+    if (
+      !selection ||
+      selection.rangeCount === 0 ||
+      !this.editor.contains(selection.getRangeAt(0).commonAncestorContainer)
+    ) {
+      return false;
+    }
+    const [start, end] = this.getCaretPosition();
+    const adjusted = adjustPromptWeightAtSelection(
+      this.curText,
+      start,
+      end,
+      delta,
+    );
+    if (!adjusted) return false;
+    this.pushHistory();
+    this.compositionBuffer = [];
+    this.updateCurText(adjusted.text);
+    this.updateDOM(adjusted.text, adjusted.selectionStart, false);
+    await this.setCaretPosition([
+      adjusted.selectionStart,
+      adjusted.selectionEnd,
+    ]);
+    return true;
+  }
+
+  getCurWord(start: number) {
+    const curText = this.domText;
+    let startIdx = start;
+    while (startIdx > 0 && !',\n'.includes(curText[startIdx - 1])) {
+      startIdx -= 1;
+    }
+    if (appState.fullWordAutoComplete) {
+      // 콤마 사이 전체 단어 모드
+      let endIdx = start;
+      while (endIdx < curText.length && !',\n'.includes(curText[endIdx])) {
+        endIdx += 1;
+      }
+      return curText.substring(startIdx, endIdx).trim();
+    }
+    // 기본: 커서 왼쪽만
+    return curText.substring(startIdx, start).trim();
+  }
+
+  setCurWord(word: string) {
+    mutex.runExclusive(async () => {
+      const [start, ,] = this.getCaretPosition();
+      const curText = this.domText;
+      let startIdx = start;
+      while (startIdx > 0 && !',\n'.includes(curText[startIdx - 1])) {
+        startIdx -= 1;
+      }
+      let endIdx = start;
+      if (appState.fullWordAutoComplete) {
+        // 전체 단어 모드: 커서 오른쪽도 포함하여 교체
+        while (endIdx < curText.length && !',\n'.includes(curText[endIdx])) {
+          endIdx += 1;
+        }
+      }
+      const replacement =
+        startIdx !== 0 && curText[startIdx - 1] !== '\n' ? ` ${word}` : word;
+      this.updateCurText(
+        curText.substring(0, startIdx) +
+          replacement +
+          curText.substring(endIdx),
+      );
+      this.updateDOM(this.curText, startIdx, false);
+      this.compositionBuffer = [];
+      await this.setCaretPosition([
+        startIdx + replacement.length,
+        startIdx + replacement.length,
+      ]);
+    });
+  }
+
+  async handleInput(
+    inputChar: string,
+    _collapsed: boolean,
+    pos: number[] | undefined = undefined,
+  ) {
+    this.pushHistory();
+    const koreanRegex = /[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]/g;
+    const [start, end] = pos || this.getCaretPosition();
+    this.updateCurText(
+      this.curText.substring(0, start) + this.curText.substring(end),
+      false,
+    );
+    let newPos = start;
+    if (koreanRegex.test(inputChar)) {
+      const txtB = Hangul.assemble(this.compositionBuffer);
+      if (this.compositionBuffer.length === 0) {
+        newPos += 1;
+      }
+      this.compositionBuffer.push(inputChar);
+      let txt = Hangul.assemble(this.compositionBuffer);
+      if (txt.length === 2) {
+        this.updateCurText(
+          this.curText.substring(0, start - 1) +
+            txt[0] +
+            this.curText.substring(start - 1),
+        );
+        let found;
+        for (let i = 0; i < this.compositionBuffer.length; i += 1) {
+          if (Hangul.assemble(this.compositionBuffer.slice(0, i)) === txt[0]) {
+            found = i;
+            break;
+          }
+        }
+        this.compositionBuffer = this.compositionBuffer.slice(found);
+        newPos += 1;
+        [, txt] = txt;
+        this.updateDOM(
+          this.curText.substring(0, start) +
+            txt +
+            this.curText.substring(start),
+          newPos,
+        );
+      } else if (txtB.length === 0) {
+        this.updateDOM(
+          this.curText.substring(0, start) +
+            txt +
+            this.curText.substring(start),
+          newPos,
+        );
+      } else {
+        this.updateDOM(
+          this.curText.substring(0, start - 1) +
+            txt +
+            this.curText.substring(start - 1),
+          newPos,
+        );
+      }
+    } else if (this.compositionBuffer.length) {
+      const txt = Hangul.assemble(this.compositionBuffer);
+      this.updateCurText(
+        this.curText.substring(0, start - 1) +
+          txt +
+          inputChar +
+          this.curText.substring(start - 1),
+      );
+      this.compositionBuffer = [];
+      newPos += 1;
+      this.updateDOM(this.curText, newPos);
+    } else {
+      this.updateCurText(
+        this.curText.substring(0, start) +
+          inputChar +
+          this.curText.substring(start),
+      );
+      newPos += 1;
+      this.updateDOM(this.curText, newPos);
+    }
+    await this.setCaretPosition([newPos, newPos]);
+  }
+
+  handleWindowMouseDown(_e: any) {
+    if (this.compositionBuffer.length) this.flushCompositon(this.previousRange);
+  }
+
+  flushCompositon(prev: number[]) {
+    if (!prev) return false;
+    const [start, ,] = prev;
+    if (this.compositionBuffer.length) {
+      const txt = Hangul.assemble(this.compositionBuffer);
+      this.updateCurText(
+        this.curText.substring(0, start - 1) +
+          txt +
+          this.curText.substring(start - 1),
+      );
+      this.compositionBuffer = [];
+      return true;
+    }
+    return false;
+  }
+
+  async handleKeyDown(e: any) {
+    await mutex.runExclusive(async () => {
+      const koreanRegex = /[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]/g;
+      const selection = window.getSelection()!;
+      const range = selection.getRangeAt(0);
+      const [start, end] = this.getCaretPosition();
+      const { collapsed } = range;
+      if (e.ctrlKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        e.preventDefault();
+        await this.adjustWeight(e.key === 'ArrowUp' ? 0.05 : -0.05);
+        return;
+      }
+      if (koreanRegex.test(e.key || '')) {
+        e.preventDefault();
+        this.shuffling = true;
+        this.editor.blur();
+        this.shuffling = false;
+        await this.handleInput(e.key || '', collapsed, [start, end]);
+        return;
+      }
+      if (this.autocomplete && !e.shiftKey) {
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          this.onUpArrow();
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          this.onDownArrow();
+          return;
+        }
+      }
+      if (
+        e.key === 'ArrowLeft' ||
+        e.key === 'ArrowRight' ||
+        e.key === 'ArrowUp' ||
+        e.key === 'ArrowDown' ||
+        (e.key === 'a' && (e.metaKey || e.ctrlKey))
+      ) {
+        this.flushCompositon(this.previousRange);
+        return;
+      }
+      if (e.key === 'c' && (e.metaKey || e.ctrlKey)) {
+        this.flushCompositon(this.previousRange);
+        return;
+      }
+      if (e.key === 'x' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        this.pushHistory();
+        await navigator.clipboard.writeText(this.curText.substring(start, end));
+        this.updateCurText(
+          this.curText.substring(0, start) + this.curText.substring(end),
+        );
+        this.updateDOM(this.curText, start);
+        await this.setCaretPosition([start, start]);
+        return;
+      }
+      if ((e.key === 'z' || e.key === 'Z') && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        if (e.shiftKey) {
+          if (this.redoBuf.length > 0) {
+            const entry = this.redoBuf.pop()!;
+            this.compositionBuffer = [];
+            this.historyBuf.push(entry);
+            this.updateCurText(entry.text, false);
+            this.updateDOM(this.curText, entry.cursorPos, false);
+            await this.setCaretPosition(entry.cursorPos);
+          }
+        } else if (this.historyBuf.length > 0) {
+          const entry = this.historyBuf.pop()!;
+          this.compositionBuffer = [];
+          this.redoBuf.push(entry);
+          this.updateCurText(entry.text, false);
+          this.updateDOM(this.curText, entry.cursorPos, false);
+          await this.setCaretPosition(entry.cursorPos);
+        }
+        return;
+      }
+      if (e.key === 'y' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        if (this.redoBuf.length > 0) {
+          const entry = this.redoBuf.pop()!;
+          this.compositionBuffer = [];
+          this.historyBuf.push(entry);
+          this.updateCurText(entry.text, false);
+          this.updateDOM(this.curText, entry.curPos, false);
+          await this.setCaretPosition(entry.cursorPos);
+        }
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (this.autocomplete) {
+          this.onEnter();
+          return;
+        }
+        let cursor = start;
+        this.pushHistory();
+        if (!range.collapsed) {
+          this.updateCurText(
+            this.curText.substring(0, start) + this.curText.substring(end),
+            false,
+          );
+        } else if (this.flushCompositon(this.previousRange)) {
+          cursor += 1;
+        }
+        this.updateCurText(
+          `${this.curText.substring(0, cursor)}\n${this.curText.substring(
+            cursor,
+          )}`,
+        );
+        this.updateDOM(this.curText, start + 1, false);
+        await this.setCaretPosition([start + 1, start + 1]);
+        return;
+      }
+      if (e.key === 'Delete') {
+        e.preventDefault();
+        const newPos = start;
+        if (range.collapsed) {
+          if (start !== this.curText.length) {
+            this.pushHistory();
+            this.flushCompositon(this.previousRange);
+            this.updateCurText(
+              this.curText.substring(0, start) +
+                this.curText.substring(start + 1),
+            );
+            this.updateDOM(this.curText, newPos);
+          }
+        } else {
+          this.pushHistory();
+          if (this.compositionBuffer.length) {
+            this.compositionBuffer = [];
+          }
+          this.updateCurText(
+            this.curText.substring(0, start) + this.curText.substring(end),
+          );
+          this.updateDOM(this.curText, newPos);
+        }
+        await this.setCaretPosition([newPos, newPos]);
+      }
+      if (e.key === 'Backspace') {
+        e.preventDefault();
+        let newPos = start;
+        if (range.collapsed) {
+          let delAmount = 1;
+          const massDel = e.shiftKey || e.metaKey;
+          if (massDel) {
+            let i = start - 2;
+            const blanks = ' \t\n\u200B';
+            if (!blanks.includes(this.curText[start - 1])) {
+              while (i >= 0 && !blanks.includes(this.curText[i])) {
+                i -= 1;
+                delAmount += 1;
+              }
+            }
+          }
+          if (start !== 0) {
+            this.pushHistory();
+            if (this.compositionBuffer.length) {
+              if (!massDel) {
+                this.compositionBuffer.pop();
+                const txt = Hangul.assemble(this.compositionBuffer);
+                if (txt === '') {
+                  newPos -= 1;
+                  this.updateDOM(this.curText, newPos);
+                } else {
+                  this.updateDOM(
+                    this.curText.substring(0, start - 1) +
+                      txt +
+                      this.curText.substring(start - 1),
+                    newPos,
+                  );
+                }
+              } else {
+                newPos -= delAmount;
+                this.compositionBuffer = [];
+                this.updateCurText(
+                  this.curText.substring(0, start - delAmount) +
+                    this.curText.substring(start - 1),
+                );
+                this.updateDOM(this.curText, newPos);
+              }
+            } else {
+              newPos -= delAmount;
+              this.updateCurText(
+                this.curText.substring(0, start - delAmount) +
+                  this.curText.substring(start),
+              );
+              this.updateDOM(this.curText, newPos);
+            }
+          }
+        } else {
+          this.pushHistory();
+          if (this.compositionBuffer.length) {
+            this.compositionBuffer = [];
+          }
+          this.updateCurText(
+            this.curText.substring(0, start) + this.curText.substring(end),
+          );
+          this.updateDOM(this.curText, newPos);
+        }
+        await this.setCaretPosition([newPos, newPos]);
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        if (this.autocomplete) {
+          e.stopPropagation();
+          this.onEsc();
+        } else {
+          this.flushCompositon(this.previousRange);
+        }
+      }
+    });
+  }
+
+  async handleBeforeInput(e: any) {
+    e.preventDefault();
+    await mutex.runExclusive(async () => {
+      // 우클릭 메뉴의 "잘라내기"(webContents.cut)는 beforeinput(deleteByCut)으로 들어온다.
+      // 네이티브 cut 이 클립보드 복사는 이미 수행하므로, 여기선 선택 영역 삭제만 처리한다.
+      // (이 처리가 없으면 복사만 되고 삭제가 안 돼 "복사처럼" 동작했음)
+      if (e.inputType === 'deleteByCut') {
+        const [start, end] = this.getCaretPosition();
+        if (start === end) return;
+        this.pushHistory();
+        this.updateCurText(
+          this.curText.substring(0, start) + this.curText.substring(end),
+        );
+        this.updateDOM(this.curText, start);
+        await this.setCaretPosition([start, start]);
+        return;
+      }
+      const koreanRegex = /[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]/g;
+      if (koreanRegex.test(e.data || '')) return;
+      if (!e.data) return;
+      await this.handleInput(e.data || '', false);
+    });
+  }
+
+  async handleCompositionUpdate(e: any) {
+    e.preventDefault();
+    await mutex.runExclusive(async () => {
+      if (!e.data) return;
+      const selection = window.getSelection()!;
+      const range = selection.getRangeAt(0);
+      const [start, end] = this.getCaretPosition();
+      const { collapsed } = range;
+      this.shuffling = true;
+      this.clipboard.focus();
+      this.shuffling = false;
+      await new Promise((resolve) => {
+        requestAnimationFrame(resolve);
+      });
+      await new Promise((resolve) => {
+        requestAnimationFrame(resolve);
+      });
+      await this.handleInput(e.data || '', collapsed, [start, end]);
+    });
+  }
+
+  async handlePaste(e: any) {
+    e.preventDefault();
+    await mutex.runExclusive(async () => {
+      this.pushHistory();
+      const text = e.clipboardData.getData('text');
+      const [start, end] = this.getCaretPosition();
+      let cursor = start;
+      if (this.flushCompositon(this.previousRange)) {
+        cursor += 1;
+      }
+      this.updateCurText(
+        this.curText.substring(0, cursor) + text + this.curText.substring(end),
+      );
+      this.updateDOM(this.curText, cursor + text.length, false);
+      await this.setCaretPosition([cursor + text.length, cursor + text.length]);
+    });
+  }
+}
+
+function PromptAutoComplete({
+  tags,
+  curWord,
+  clientX,
+  clientY,
+  selectedTag,
+  onSelectTag,
+}: {
+  tags: WordTag[];
+  curWord: string;
+  clientX: number;
+  clientY: number;
+  selectedTag: number;
+  onSelectTag: (idx: number) => void;
+}) {
+  const [posX, setPosX] = useState(0);
+  const [posY, setPosY] = useState(0);
+  const matchMasks = useMemo(
+    () => tags.map((tag) => calcGapMatch(curWord, tag.word).path),
+    [tags, curWord],
+  );
+  const listRef = useRef<List>(null);
+  const categoryIcon = (category: number) => {
+    if (category === 0) return <FaTag />;
+    if (category === 1) return <ActionIcon id="artist" />;
+    if (category === 3) return <FaBook />;
+    if (category === 4) return <FaPerson />;
+    if (category === 5) return <FaDatabase />;
+    return <FaBox />;
+  };
+  useEffect(() => {
+    // 팝업 높이(아래 style/List 의 200px 과 동일해야 함)와 캐럿과의 간격.
+    const POPUP_HEIGHT = 200;
+    const GAP = 22;
+    const reposition = () => {
+      setPosX(clientX);
+      // visualViewport 는 모바일 소프트 키보드가 올라오면 그만큼 줄어든다.
+      // 이를 이용해 팝업이 키보드(또는 화면 하단)에 가리는지 판단한다.
+      const vv = window.visualViewport;
+      const visibleTop = vv ? vv.offsetTop : 0;
+      const visibleBottom = visibleTop + (vv ? vv.height : window.innerHeight);
+      let y = clientY + GAP;
+      if (y + POPUP_HEIGHT > visibleBottom) {
+        // 아래로 펼치면 잘리는 경우 캐럿 위로 뒤집는다.
+        const above = clientY - GAP - POPUP_HEIGHT;
+        y =
+          above >= visibleTop
+            ? above
+            : Math.max(visibleTop, visibleBottom - POPUP_HEIGHT);
+      }
+      setPosY(y);
+    };
+    reposition();
+    // 팝업이 떠 있는 동안 키보드가 나타나거나 뷰포트가 스크롤되면 위치를 다시 계산.
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', reposition);
+    vv?.addEventListener('scroll', reposition);
+    return () => {
+      vv?.removeEventListener('resize', reposition);
+      vv?.removeEventListener('scroll', reposition);
+    };
+  }, [clientX, clientY]);
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollToItem(selectedTag, 'smart');
+  }, [selectedTag, tags.length]);
+  const processWord = (word: string, mask: number[]) => {
+    const sections = [];
+    let currentSection = { text: '', bold: false, start: 0 };
+
+    for (let i = 0; i < word.length; i += 1) {
+      const char = word[i];
+      const isBold = mask && mask.includes(i);
+
+      if (isBold !== currentSection.bold) {
+        if (currentSection.text) {
+          sections.push(currentSection);
+        }
+        currentSection = { text: char, bold: isBold, start: i };
+      } else {
+        currentSection.text += char;
+      }
+    }
+
+    if (currentSection.text) {
+      sections.push(currentSection);
+    }
+
+    return sections;
+  };
+
+  const formatCount = (count: number) => {
+    if (count > 1000) {
+      return `${(count / 1000).toFixed(1)}k`;
+    }
+    return count;
+  };
+
+  const renderRow = ({ index, style }: { index: number; style: any }) => {
+    return (
+      <button
+        type="button"
+        role="option"
+        aria-selected={index === selectedTag}
+        tabIndex={-1}
+        className={`hover:bg-black/5 dark:hover:bg-white/10 cursor-pointer ${
+          index === selectedTag
+            ? 'flex items-center p-1 bg-black/10 dark:bg-white/15'
+            : 'flex items-center p-1'
+        }`}
+        style={style}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => onSelectTag(index)}
+      >
+        <span className="text-muted mr-1 flex-none">
+          {tags[index].word.startsWith('<') ? (
+            <ActionIcon id="piece-editor" />
+          ) : (
+            categoryIcon(tags[index].category)
+          )}
+        </span>
+        <div className="flex-1 truncate h-full">
+          {matchMasks.length
+            ? processWord(tags[index].word, matchMasks[index]).map(
+                (section) => (
+                  <span
+                    key={section.start}
+                    className={section.bold ? 'font-bold' : ''}
+                  >
+                    {section.text}
+                  </span>
+                ),
+              )
+            : tags[index].word}
+          {(tags[index].redirect ?? 'null').trim() !== 'null' && (
+            <span className="text-faint">→{tags[index].redirect}</span>
+          )}
+        </div>
+        {!tags[index].word.startsWith('<') && (
+          <div className="flex-none text-right">
+            {formatCount(tags[index].freq)}
+          </div>
+        )}
+      </button>
+    );
+  };
+  return (
+    <div
+      role="presentation"
+      onMouseDown={(e) => {
+        e.stopPropagation();
+      }}
+      className="fixed bg-[var(--c-zone)] border line-color rounded-lg shadow-lg z-[var(--z-prompt-popup)] text-default"
+      style={{
+        display:
+          tags.length > 0 && (clientX !== 0 || clientY !== 0)
+            ? 'block'
+            : 'none',
+        width: '90vw',
+        maxWidth: '400px',
+        height: '200px',
+        left: isMobile ? '5vw' : posX,
+        top: posY,
+      }}
+    >
+      <List
+        ref={listRef}
+        className="always-show-scroll"
+        height={200}
+        itemCount={tags.length}
+        itemKey={(index) => `${tags[index].word}:${tags[index].category}`}
+        itemSize={31}
+        /*
+        // @ts-ignore */
+        overscanRowCount={16}
+      >
+        {renderRow}
+      </List>
+    </div>
+  );
+}
+
+interface PromptEditTextAreaProps {
+  value: string;
+  whiteBg?: boolean;
+  innerRef?: any;
+  disabled?: boolean;
+  lineHighlight?: boolean;
+  onChange: (value: string) => void;
+}
+
+function useLatest(value: any) {
+  const ref = useRef(value);
+
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+
+  return ref;
+}
+
+function replaceMiddleWord(str: string, newWord: string) {
+  // 가중치 접두어/접미어 보존: (숫자)::내용:: — 숫자 표기(.6:: 포함)는 promptWeightSyntax 단일 출처.
+  // 가중치 묶음(1.5::a, b::)의 마지막 태그처럼 닫는 :: 만 있는 구획도 보존한다(2026-10-02).
+  const wpMatch = str.match(PROMPT_WEIGHT_OPEN_AT_START_RE);
+  const weightPrefix = wpMatch ? wpMatch[0] : '';
+  const afterPrefix = str.substring(weightPrefix.length);
+  const hasSuffix = afterPrefix.endsWith('::');
+  const inner = hasSuffix ? afterPrefix.slice(0, -2) : afterPrefix;
+  // 괄호 보존: {[내용]}
+  const leftMatch = inner.match(/^[{[]*\s*(?:artist\s*:\s*)?/i);
+  const trimmedLeft = leftMatch ? leftMatch[0] : '';
+  const rightMatch = inner.match(/[}\]]*$/);
+  const trimmedRight = rightMatch ? rightMatch[0] : '';
+  return (
+    weightPrefix +
+    trimmedLeft +
+    newWord +
+    trimmedRight +
+    (hasSuffix ? '::' : '')
+  );
+}
+
+interface EditTextAreaProps {
+  value: string;
+  disabled?: boolean;
+  highlight: (
+    text: string,
+    curWord: string,
+    updateAutoComplete: boolean,
+  ) => string;
+  onUpdated: (text: string) => void;
+  history: Denque<HistoryEntry>;
+  redo: Denque<HistoryEntry>;
+  onUpArrow: () => void;
+  onDownArrow: () => void;
+  onEnter: () => void;
+  onEsc: () => void;
+  onFocus: () => void;
+  onBlur: () => void;
+  closeAutoComplete: () => void;
+}
+
+interface EditTextAreaRef {
+  onCloseAutoComplete: () => void;
+  onOpenAutoComplete: () => void;
+  setCurWord: (word: string) => void;
+  getCaretCoords(): Promise<number[]>;
+  /** 커서가 놓인 쉼표 구획(장식 포함 원문). 커서를 모르면 빈 문자열. */
+  getCaretSegment(): string;
+  /** 커서 구획의 가중치를 delta 만큼 조절(PC 휠·모바일 키보드 위 칩 공통). */
+  adjustWeight(delta: number): void;
+  undo(): void;
+}
+
+const EmulatedEditTextArea = observer(
+  forwardRef<EditTextAreaRef, EditTextAreaProps>(
+    (
+      {
+        value,
+        disabled,
+        highlight,
+        onUpdated,
+        history,
+        redo,
+        onUpArrow,
+        onDownArrow,
+        onEnter,
+        onEsc,
+        closeAutoComplete,
+        onFocus,
+        onBlur,
+      }: EditTextAreaProps,
+      ref: any,
+    ) => {
+      const editorRef = useRef<any>(null);
+      const containerRef = useRef<any>(null);
+      const clipboardRef = useRef<any>(null);
+      const editorModelRef = useRef<any>(null);
+
+      const callbacks = useLatestRef({
+        value,
+        highlight,
+        onUpdated,
+        onUpArrow,
+        onDownArrow,
+        onEnter,
+        onEsc,
+        closeAutoComplete,
+      });
+
+      useEffect(() => {
+        const element = editorRef.current;
+        if (!element) return undefined;
+        const editor = new CursorMemorizeEditor(
+          containerRef.current,
+          element,
+          clipboardRef.current,
+          (...args) => callbacks.current.highlight(...args),
+          (nextValue) => callbacks.current.onUpdated(nextValue),
+          history,
+          redo,
+          () => callbacks.current.onUpArrow(),
+          () => callbacks.current.onDownArrow(),
+          () => callbacks.current.onEnter(),
+          () => callbacks.current.onEsc(),
+        );
+        editorModelRef.current = editor;
+        editor.updateCurText(callbacks.current.value);
+        editor.updateDOM(callbacks.current.value, 0, false);
+        const handleKeyDown = (event: KeyboardEvent) =>
+          editor.handleKeyDown(event);
+        const handleBeforeInput = (event: InputEvent) =>
+          editor.handleBeforeInput(event);
+        const handleCompositionUpdate = (event: CompositionEvent) =>
+          editor.handleCompositionUpdate(event);
+        const handlePaste = (event: ClipboardEvent) =>
+          editor.handlePaste(event);
+        const handleWheel = (event: WheelEvent) => {
+          if (!event.ctrlKey || event.deltaY === 0) return;
+          event.preventDefault();
+          callbacks.current.closeAutoComplete();
+          mutex
+            .runExclusive(async () => {
+              await editor.adjustWeight(event.deltaY < 0 ? 0.05 : -0.05);
+            })
+            .catch((error) => appState.pushMessage(String(error), 'error'));
+        };
+        const handleWindowMouseDown = (event: MouseEvent) => {
+          callbacks.current.closeAutoComplete();
+          editor.handleWindowMouseDown(event);
+        };
+        element.addEventListener('keydown', handleKeyDown);
+        element.addEventListener('beforeinput', handleBeforeInput);
+        if (!isMacPlatform())
+          element.addEventListener(
+            'compositionupdate',
+            handleCompositionUpdate,
+          );
+        element.addEventListener('paste', handlePaste);
+        element.addEventListener('wheel', handleWheel, { passive: false });
+        window.addEventListener('mousedown', handleWindowMouseDown);
+        return () => {
+          window.removeEventListener('mousedown', handleWindowMouseDown);
+          element.removeEventListener('keydown', handleKeyDown);
+          element.removeEventListener('beforeinput', handleBeforeInput);
+          if (!isMacPlatform())
+            element.removeEventListener(
+              'compositionupdate',
+              handleCompositionUpdate,
+            );
+          element.removeEventListener('paste', handlePaste);
+          element.removeEventListener('wheel', handleWheel);
+          if (editorModelRef.current === editor) editorModelRef.current = null;
+        };
+      }, [callbacks, history, redo]);
+
+      useImperativeHandle(ref, () => ({
+        onCloseAutoComplete: () => {
+          editorModelRef.current.autocomplete = false;
+        },
+        onOpenAutoComplete: () => {
+          editorModelRef.current.autocomplete = true;
+        },
+        setCurWord: (word: string) => {
+          editorModelRef.current.setCurWord(word);
+        },
+        getCaretCoords: async () => {
+          let selection = window.getSelection()!;
+          if (selection.rangeCount === 0) return undefined;
+          let range = selection.getRangeAt(0);
+          let rect = range.getBoundingClientRect();
+          if (rect.right === 0 && rect.top === 0) {
+            await new Promise((resolve) => {
+              requestAnimationFrame(resolve);
+            });
+            selection = window.getSelection()!;
+            range = selection.getRangeAt(0);
+            rect = range.getBoundingClientRect();
+          }
+          return [rect.right, rect.top];
+        },
+        adjustWeight: (delta: number) => {
+          editorModelRef.current?.adjustWeight(delta);
+        },
+        getCaretSegment: () => {
+          const m = editorModelRef.current;
+          if (!m) return '';
+          const pos = m.getCaretPosition()[0] ?? 0;
+          return promptSegmentAt(m.curText ?? '', pos);
+        },
+        undo() {
+          editorModelRef.current.handleKeyDown({ key: 'z', metaKey: true });
+        },
+      }));
+
+      useEffect(() => {
+        if (!editorRef.current) return;
+        if (value !== editorModelRef.current.curText) {
+          editorModelRef.current.updateCurText(value, false);
+          editorModelRef.current.updateDOM(value, 0, false);
+        }
+      }, [value]);
+
+      return (
+        <>
+          <div ref={containerRef} className="overflow-auto h-full">
+            <div
+              className="w-full min-h-full focus:outline-0 whitespace-pre-wrap align-middle"
+              ref={editorRef}
+              contentEditable={disabled ? 'false' : 'true'}
+              onFocus={onFocus}
+              onBlur={onBlur}
+            />
+          </div>
+          <textarea
+            className="absolute top-0 left-0 opacity-0 w-0 h-0"
+            disabled={disabled}
+            ref={clipboardRef}
+            value=""
+            onChange={(e) => {
+              e.target.value = '';
+            }}
+          />
+        </>
+      );
+    },
+  ),
+);
+
+const NativeEditTextArea = observer(
+  forwardRef(
+    (
+      {
+        value,
+        disabled,
+        highlight,
+        onUpdated,
+        history,
+        redo,
+        onUpArrow,
+        onDownArrow,
+        onEnter,
+        onEsc,
+        closeAutoComplete,
+        onFocus,
+        onBlur,
+      }: EditTextAreaProps,
+      ref,
+    ) => {
+      const textareaRef = useRef<any>(null);
+      const highlightRef = useRef<any>(null);
+      const containerRef = useRef<any>(null);
+      const isAutoComplete = useRef(false);
+
+      const getCurWord = () => {
+        const start = textareaRef.current.selectionStart;
+        const curText = textareaRef.current.value;
+        let startIdx = start;
+        while (startIdx > 0 && !',\n'.includes(curText[startIdx - 1])) {
+          startIdx--;
+        }
+        if (appState.fullWordAutoComplete) {
+          let endIdx = start;
+          while (endIdx < curText.length && !',\n'.includes(curText[endIdx])) {
+            endIdx++;
+          }
+          return curText.substring(startIdx, endIdx).trim();
+        }
+        return curText.substring(startIdx, start).trim();
+      };
+
+      const renderText = () => {
+        const text = textareaRef.current.value;
+        highlightRef.current.innerHTML = `${highlight(text, getCurWord(), true)}<span></span><br>`;
+      };
+
+      const pushHistory = () => {
+        const text = textareaRef.current.value;
+        const start = textareaRef.current.selectionStart;
+        const end = textareaRef.current.selectionEnd;
+        if (history.length > MAX_HISTORY_SIZE) {
+          history.shift();
+        }
+        history.push({ text, cursorPos: [start, end], copmositionBuffer: [] });
+        redo.clear();
+      };
+
+      // 칩 조작(가중치·주석)의 텍스트 치환 결과를 적용 — 값·커서 → onUpdated → 하이라이트 → 히스토리.
+      const applyCaretEdit = (adjusted: PromptWeightAdjustment | undefined) => {
+        if (!adjusted) return;
+        textareaRef.current.value = adjusted.text;
+        textareaRef.current.selectionStart = adjusted.selectionStart;
+        textareaRef.current.selectionEnd = adjusted.selectionEnd;
+        onUpdated(adjusted.text);
+        renderText();
+        pushHistory();
+      };
+
+      const adjustWeight = (delta: number) => {
+        applyCaretEdit(
+          adjustPromptWeightAtSelection(
+            textareaRef.current.value,
+            textareaRef.current.selectionStart,
+            textareaRef.current.selectionEnd,
+            delta,
+          ),
+        );
+      };
+
+      const toggleComment = () => {
+        applyCaretEdit(
+          togglePromptCommentAtSelection(
+            textareaRef.current.value,
+            textareaRef.current.selectionStart,
+            textareaRef.current.selectionEnd,
+          ),
+        );
+      };
+
+      const doUndo = () => {
+        if (history.length > 1) {
+          const prev = history.pop()!;
+          redo.push(prev);
+          const entry = history.peekBack()!;
+          textareaRef.current.value = entry.text;
+          onUpdated(entry.text);
+          if (!isMobile) {
+            [
+              textareaRef.current.selectionStart,
+              textareaRef.current.selectionEnd,
+            ] = entry.cursorPos;
+          }
+          const text = textareaRef.current.value;
+          highlightRef.current.innerHTML = `${highlight(text, getCurWord(), false)}<span></span><br>`;
+        }
+      };
+
+      const doRedo = () => {
+        if (redo.length > 0) {
+          const entry = redo.pop()!;
+          history.push(entry);
+          textareaRef.current.value = entry.text;
+          onUpdated(entry.text);
+          [
+            textareaRef.current.selectionStart,
+            textareaRef.current.selectionEnd,
+          ] = entry.cursorPos;
+          renderText();
+        }
+      };
+
+      const callbacks = useLatestRef({
+        renderText,
+        pushHistory,
+        onUpdated,
+        onFocus,
+        onBlur,
+        highlight,
+        getCurWord,
+        adjustWeight,
+        toggleComment,
+        closeAutoComplete,
+      });
+
+      useEffect(() => {
+        const element = textareaRef.current;
+        const highlightElement = highlightRef.current;
+        if (!element || !highlightElement) return undefined;
+        const handleInput = () => {
+          callbacks.current.renderText();
+          callbacks.current.pushHistory();
+          callbacks.current.onUpdated(element.value);
+        };
+        const handleFocus = () => callbacks.current.onFocus();
+        const handleBlur = () => callbacks.current.onBlur();
+        const focusHandle: FocusedPromptEditor = {
+          element,
+          adjustWeight: (delta) => callbacks.current.adjustWeight(delta),
+          getCaretWeight: () =>
+            getPromptWeightAtSelection(
+              element.value,
+              element.selectionStart ?? 0,
+            ),
+          toggleComment: () => callbacks.current.toggleComment(),
+          isCaretInComment: () =>
+            !!getPromptCommentAtSelection(
+              element.value,
+              element.selectionStart ?? 0,
+            ),
+        };
+        const registerFocus = () => setFocusedPromptEditor(focusHandle);
+        const unregisterFocus = () => clearFocusedPromptEditor(focusHandle);
+        const handleWindowMouseDown = () =>
+          callbacks.current.closeAutoComplete();
+        element.addEventListener('input', handleInput);
+        element.addEventListener('focus', handleFocus);
+        element.addEventListener('blur', handleBlur);
+        element.addEventListener('focus', registerFocus);
+        element.addEventListener('blur', unregisterFocus);
+        if (document.activeElement === element) registerFocus();
+        highlightElement.innerHTML = `${callbacks.current.highlight(
+          element.value,
+          callbacks.current.getCurWord(),
+          false,
+        )}<span></span><br>`;
+        callbacks.current.pushHistory();
+        callbacks.current.onUpdated(element.value);
+        window.addEventListener('mousedown', handleWindowMouseDown);
+        return () => {
+          window.removeEventListener('mousedown', handleWindowMouseDown);
+          element.removeEventListener('input', handleInput);
+          element.removeEventListener('focus', handleFocus);
+          element.removeEventListener('blur', handleBlur);
+          element.removeEventListener('focus', registerFocus);
+          element.removeEventListener('blur', unregisterFocus);
+          unregisterFocus();
+        };
+      }, [callbacks, history, redo]);
+
+      useImperativeHandle(ref, () => ({
+        onCloseAutoComplete: () => {
+          isAutoComplete.current = false;
+        },
+        onOpenAutoComplete: () => {
+          isAutoComplete.current = true;
+        },
+        setCurWord: (word: string) => {
+          const start = textareaRef.current.selectionStart;
+          const curText = textareaRef.current.value;
+          let startIdx = start;
+          while (startIdx > 0 && !',\n'.includes(curText[startIdx - 1])) {
+            startIdx--;
+          }
+          let endIdx: number;
+          if (appState.fullWordAutoComplete) {
+            endIdx = start;
+            while (
+              endIdx < curText.length &&
+              !',\n'.includes(curText[endIdx])
+            ) {
+              endIdx += 1;
+            }
+          } else {
+            endIdx = start;
+          }
+          const replacement =
+            startIdx !== 0 && curText[startIdx - 1] !== '\n'
+              ? ` ${word}`
+              : word;
+          const newText =
+            curText.substring(0, startIdx) +
+            replacement +
+            curText.substring(endIdx);
+          textareaRef.current.value = newText;
+          onUpdated(newText);
+          textareaRef.current.selectionEnd = startIdx + replacement.length;
+          highlightRef.current.innerHTML = `${highlight(newText, '', false)}<span></span><br>`;
+          pushHistory();
+        },
+        getCaretCoords: async () => {
+          const caret = getCaretCoordinates(
+            textareaRef.current!,
+            textareaRef.current!.selectionEnd,
+          );
+          const rect = textareaRef.current!.getBoundingClientRect();
+          return [caret.left + rect.left, caret.top + rect.top];
+        },
+        getCaretSegment: () => {
+          const ta = textareaRef.current;
+          if (!ta) return '';
+          return promptSegmentAt(ta.value, ta.selectionStart ?? 0);
+        },
+        adjustWeight: (delta: number) => {
+          adjustWeight(delta);
+        },
+        undo() {
+          doUndo();
+        },
+      }));
+
+      useEffect(() => {
+        if (!textareaRef.current || !highlightRef.current) return;
+        // 바깥에서 바뀐 값(작가 접두 일괄 변경·찾기 및 변환 등)을 textarea 에 반영한다(2026-09-25 결함 수정).
+        // 예전에는 하이라이트만 다시 그려 화면의 글자가 프리셋과 어긋났다. 사용자 입력은 값이 같아 건너뛴다.
+        if (typeof value === 'string' && textareaRef.current.value !== value) {
+          textareaRef.current.value = value;
+        }
+        const text = textareaRef.current.value;
+        highlightRef.current.innerHTML = `${callbacks.current.highlight(text, callbacks.current.getCurWord(), false)}<span></span><br>`;
+        callbacks.current.pushHistory();
+      }, [value, callbacks]);
+
+      return (
+        <div className="w-full h-full overflow-auto">
+          <div ref={containerRef} className="native-text-area-container">
+            <div
+              ref={highlightRef}
+              className="native-text-area-highlight select-none"
+            />
+            <textarea
+              ref={textareaRef}
+              className="native-text-area-input native-text-area-highlight"
+              defaultValue={value}
+              disabled={disabled}
+              onWheel={(e: any) => {
+                if (!e.ctrlKey || e.deltaY === 0) return;
+                e.preventDefault();
+                closeAutoComplete();
+                adjustWeight(e.deltaY < 0 ? 0.05 : -0.05);
+              }}
+              onKeyDown={(e: any) => {
+                if (
+                  e.ctrlKey &&
+                  (e.key === 'ArrowUp' || e.key === 'ArrowDown')
+                ) {
+                  e.preventDefault();
+                  closeAutoComplete();
+                  adjustWeight(e.key === 'ArrowUp' ? 0.05 : -0.05);
+                } else if (e.key === 'ArrowUp') {
+                  if (isAutoComplete.current) {
+                    e.preventDefault();
+                  }
+                  onUpArrow();
+                } else if (e.key === 'ArrowDown') {
+                  if (isAutoComplete.current) {
+                    e.preventDefault();
+                  }
+                  onDownArrow();
+                } else if (e.key === 'Enter') {
+                  if (isAutoComplete.current) e.preventDefault();
+                  onEnter();
+                } else if (e.key === 'Escape') {
+                  if (isAutoComplete.current) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }
+                  onEsc();
+                } else if (
+                  (e.key === 'z' || e.key === 'Z') &&
+                  (e.metaKey || e.ctrlKey)
+                ) {
+                  e.preventDefault();
+                  if (e.shiftKey) doRedo();
+                  else doUndo();
+                } else if (e.key === 'y' && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  doRedo();
+                }
+              }}
+            />
+          </div>
+        </div>
+      );
+    },
+  ),
+);
+
+// 커서 구획의 작가 판별용 태그 DB 조회(앱 수명 동안 캐시).
+// 접두 없는 작가 = 작가 라이브러리 이름 또는 태그 DB 작가(artistTags.makeArtistLookup, 2026-10-05 라이브러리 대조 추가).
+const caretArtistLookup = makeArtistLookup(
+  (w) => backend.lookupTag(w),
+  (n) => !!artistLibraryService.findArtistByName(n),
+);
+
+/**
+ * 편집기 부속 버튼(작가 라이브러리 열기)을 편집기 바깥 라벨 줄에 두기 위한 슬롯(2026-09-26 사용자 요청).
+ * 라벨 줄(PreSetEdtior EditorField)이 공급자를 두면 편집기는 버튼을 그 줄 오른쪽 끝으로 보내고 안에는 그리지 않는다
+ * (우상단 안쪽 버튼이 첫 줄 프롬프트를 가리던 문제). 공급자가 없는 호출부(캐릭터·퀵 수정·조각 등)는 안쪽 우상단 폴백.
+ */
+export const PromptAccessorySlotContext = createContext<
+  ((node: React.ReactNode) => void) | null
+>(null);
+
+const PromptEditTextArea = observer(
+  ({
+    value,
+    onChange,
+    disabled,
+    whiteBg: _whiteBg,
+    lineHighlight,
+    innerRef,
+  }: PromptEditTextAreaProps) => {
+    const { curSession } = appState;
+    const editorRef = useRef<EditTextAreaRef | null>(null);
+    const historyRef = useRef<Denque<HistoryEntry>>(new Denque<HistoryEntry>());
+    const redoRef = useRef<Denque<HistoryEntry>>(new Denque<HistoryEntry>());
+    const [tags, setTags] = useState<any[]>([]);
+    const [selectedTag, setSelectedTag] = useState<number>(0);
+    const [curWord, setCurWord] = useState<string>('');
+    const [clientX, setClientX] = useState(0);
+    const [clientY, setClientY] = useState(0);
+    const tagsRef = useLatest(tags);
+    const [id, setId] = useState(0);
+    const cntRef = useRef(0);
+    const selectedTagRef = useLatest(selectedTag);
+    const curWordRef = useLatest(curWord);
+    const [fullScreen, setFullScreen] = useState(false);
+    const accessorySlot = useContext(PromptAccessorySlotContext);
+    // 모바일 「탭=확장 창」(클래식 동작). 자체 집중 모드가 있는 곳(V2 시트·PromptFocusShell·씬 편집 창)은 false 로 감싼다.
+    const autoExpand = useContext(PromptAutoExpandContext);
+    // 커서가 놓인 구획이 작가 태그면 그 이름(접두 제거). 「작가 라이브러리」 버튼이 라벨 줄 슬롯(있으면) 또는 편집기 오른쪽 위에 뜬다(2026-09-26).
+    // 접두가 있으면 즉시, 없으면 태그 DB 조회(캐시). 입력·클릭·키·selectionchange 뒤 150ms 디바운스.
+    const [caretArtist, setCaretArtist] = useState<string | null>(null);
+    const rootRef = useRef<HTMLDivElement | null>(null);
+    const caretTimer = useRef<number | null>(null);
+    const caretSeq = useRef(0);
+    const mountedRef = useRef(true);
+    const refreshCaretArtist = () => {
+      if (caretTimer.current) window.clearTimeout(caretTimer.current);
+      caretSeq.current += 1;
+      const seq = caretSeq.current;
+      caretTimer.current = window.setTimeout(() => {
+        caretTimer.current = null;
+        const seg = editorRef.current?.getCaretSegment?.() ?? '';
+        // This intentional input debounce coalesces caret movement; request ownership
+        // comes from the revision and component lifetime, never elapsed time.
+        const cand = artistNameOfSegment(seg);
+        const lookup =
+          cand && !cand.prefixed
+            ? caretArtistLookup(cand.name)
+            : Promise.resolve(!!cand);
+        lookup
+          .then((matched) => {
+            if (mountedRef.current && seq === caretSeq.current)
+              setCaretArtist(matched && cand ? cand.name : null);
+            return undefined;
+          })
+          .catch((error: unknown) => {
+            if (!mountedRef.current || seq !== caretSeq.current) return;
+            setCaretArtist(null);
+            console.warn('작가 태그를 확인하지 못했습니다.', error);
+          });
+      }, 150);
+    };
+    useEffect(() => {
+      mountedRef.current = true;
+      const onSel = () => {
+        const root = rootRef.current;
+        if (
+          root &&
+          document.activeElement &&
+          root.contains(document.activeElement)
+        )
+          refreshCaretArtist();
+      };
+      document.addEventListener('selectionchange', onSel);
+      return () => {
+        mountedRef.current = false;
+        caretSeq.current += 1;
+        cntRef.current += 1;
+        document.removeEventListener('selectionchange', onSel);
+        if (caretTimer.current) window.clearTimeout(caretTimer.current);
+        caretTimer.current = null;
+      };
+    }, []);
+    // 모바일 확장 창이 열려 있는 동안 Android 뒤로 가기는 이 창만 닫는다(포커스도 해제). 키보드가 떠 있으면 첫
+    // 뒤로 가기는 시스템이 키보드를 내리는 데 쓰고, 그다음 뒤로 가기가 여기로 온다 — 예전에는 그 뒤로 가기가
+    // 바깥(하단 시트 등)을 통째로 닫아 버렸다(2026-09-22 실기기 5차).
+    const closeFullScreenRef = useRef<() => void>(() => {});
+    useEffect(() => {
+      if (!isMobile || !fullScreen) return undefined;
+      const handle = backStackService.push(() => closeFullScreenRef.current());
+      return () => handle.remove();
+    }, [fullScreen]);
+    const EditTextAreaImpl = isMobile
+      ? NativeEditTextArea
+      : EmulatedEditTextArea;
+
+    const closeAutoComplete = () => {
+      cntRef.current += 1;
+      setTags([]);
+      setSelectedTag(0);
+      editorRef.current?.onCloseAutoComplete();
+      setId((selectedId) => selectedId + 1);
+    };
+
+    const onUpArrow = () => {
+      if (tagsRef.current.length === 0) return;
+      setSelectedTag(
+        (selectedTagRef.current - 1 + tagsRef.current.length) %
+          tagsRef.current.length,
+      );
+    };
+    const onDownArrow = () => {
+      if (tagsRef.current.length === 0) return;
+      setSelectedTag((selectedTagRef.current + 1) % tagsRef.current.length);
+    };
+    const onEsc = () => {
+      closeAutoComplete();
+    };
+    const onUpdated = (text: string) => {
+      onChange(text);
+    };
+    const highlight = (
+      text: string,
+      word: string,
+      updateAutoComplete: boolean,
+    ) => {
+      if (updateAutoComplete) {
+        if (word === '') {
+          closeAutoComplete();
+        } else {
+          cntRef.current += 1;
+          const myId = cntRef.current;
+          const query = trimAutocompleteWord(word);
+          const searchPromise = word.startsWith('<')
+            ? backend.searchPieces(query)
+            : backend.searchTags(query, autocompleteTagCategory(word));
+          searchPromise
+            .then(async (nextTags: any[]) => {
+              if (!mountedRef.current || myId !== cntRef.current)
+                return undefined;
+              const editor = editorRef.current;
+              if (!editor) return undefined;
+              if (nextTags.length > 0) {
+                const [x, y] = await editor.getCaretCoords();
+                if (
+                  !mountedRef.current ||
+                  myId !== cntRef.current ||
+                  editorRef.current !== editor
+                )
+                  return undefined;
+                setClientX(x);
+                setClientY(y);
+                setSelectedTag(0);
+                setCurWord(word);
+                setTags(nextTags);
+                editor.onOpenAutoComplete();
+              } else {
+                closeAutoComplete();
+              }
+
+              return undefined;
+            })
+            .catch((error: unknown) => {
+              if (!mountedRef.current || myId !== cntRef.current) return;
+              closeAutoComplete();
+              console.warn('자동완성 태그를 불러오지 못했습니다.', error);
+            });
+        }
+      }
+      return highlightPrompt(curSession!, text, lineHighlight ?? false);
+    };
+    const onEnter = () => {
+      if (tagsRef.current.length === 0) return;
+      const tag = tagsRef.current[selectedTagRef.current];
+      const tagWord =
+        (tag.redirect ?? 'null').trim() !== 'null'
+          ? tag.redirect.trim()
+          : tag.word;
+      const newWord = replaceMiddleWord(curWordRef.current, tagWord);
+      editorRef.current!.setCurWord(newWord);
+      closeAutoComplete();
+    };
+
+    const onSelectTag = (idx: number) => {
+      if (tagsRef.current.length === 0) return;
+      const tag = tagsRef.current[idx];
+      const tagWord =
+        (tag.redirect ?? 'null').trim() !== 'null'
+          ? tag.redirect.trim()
+          : tag.word;
+      const newWord = replaceMiddleWord(curWordRef.current, tagWord);
+      editorRef.current!.setCurWord(newWord);
+      closeAutoComplete();
+    };
+
+    // 모바일 포커스 확대(2026-09-27 클래식 복원, PromptAutoExpandContext): 자체 집중 모드가 없는 곳에서는 탭(포커스)만으로
+    // 확장 창을 연다 — 축소안(2026-09-22) 이전의 클래식 동작. 창 밖 click 감시는 되살리지 않는다(포커스 순간 요소가 고정
+    // 위치로 점프해 click 대상이 바뀌어 열림/닫힘이 탭 위치에 따라 갈렸고, 자동완성 항목 탭도 바깥 click 으로 닫히던 원인).
+    // 닫기는 X·배경 탭·뒤로 가기. V2 시트·PromptFocusShell·씬 편집 창은 컨텍스트 false 라 인라인 편집(집중 모드)이 기본.
+    // PC 는 원래 포커스 확대가 없어 영향 없음.
+    const onFoucs = () => {
+      if (isMobile && autoExpand && !disabled && !fullScreen)
+        setFullScreen(true);
+    };
+    const onBlur = () => {};
+    const closeFullScreen = () => {
+      setFullScreen(false);
+      // 배경 탭·뒤로 가기 = 편집 끝. 포커스도 풀어 키보드를 내린다(X 버튼은 인라인 편집을 이어갈 수 있게 포커스 유지).
+      const active = document.activeElement as HTMLElement | null;
+      if (active && typeof active.blur === 'function') active.blur();
+    };
+    closeFullScreenRef.current = closeFullScreen;
+
+    // 작가 라이브러리 버튼. 슬롯이 있으면 라벨 줄로(editor 밖), 없으면 편집기 안 우상단.
+    const artistButton = (name: string, extra: string) => (
+      <button
+        type="button"
+        data-caret-artist-btn
+        title={`작가 라이브러리에서 「${name}」 열기`}
+        aria-label={`작가 라이브러리에서 ${name} 열기`}
+        className={`flex items-center gap-1 px-1.5 h-5 rounded-md text-[11px] leading-none bg-[var(--c-zone)] border line-color text-sky-500 opacity-90 hover:opacity-100 max-w-[10rem] ${
+          extra
+        }`}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={(e) => {
+          e.stopPropagation();
+          appState.openArtistInLibrary(name);
+        }}
+      >
+        <ActionIcon id="artist" size={10} className="flex-none" />
+        <span className="truncate">{name}</span>
+      </button>
+    );
+    useEffect(() => {
+      if (!accessorySlot) return undefined;
+      accessorySlot(caretArtist ? artistButton(caretArtist, '') : null);
+      return () => accessorySlot(null);
+    }, [caretArtist, accessorySlot]);
+
+    // 입력창 배경 토큰(--c-input-bg)을 따라 커스터마이징 반영. 기본값은 기존 외형과
+    // 동일(다크=slate-700, 라이트=gray-200). 전체화면(확장 창)도 동일 토큰을 써서
+    // 테마 커스터마이징이 그대로 반영되도록 한다(그림자만 추가).
+    let bgColor = 'bg-[var(--c-input-bg)]';
+    if (fullScreen) bgColor = 'bg-[var(--c-input-bg)] shadow-lg';
+
+    return (
+      <>
+        <div
+          role="presentation"
+          ref={(el: HTMLDivElement | null) => {
+            rootRef.current = el;
+            if (typeof innerRef === 'function') innerRef(el);
+            else if (innerRef) innerRef.current = el;
+          }}
+          onKeyUp={refreshCaretArtist}
+          onClick={refreshCaretArtist}
+          onFocusCapture={refreshCaretArtist}
+          onBlurCapture={(event) => {
+            // relatedTarget is the next focus owner; no guessed task delay is needed.
+            if (
+              event.relatedTarget instanceof Node &&
+              event.currentTarget.contains(event.relatedTarget)
+            )
+              return;
+            caretSeq.current += 1;
+            if (caretTimer.current) window.clearTimeout(caretTimer.current);
+            caretTimer.current = null;
+            setCaretArtist(null);
+          }}
+          spellCheck={false}
+          draggable
+          onDragStart={(event) => event.preventDefault()}
+          className={
+            bgColor +
+            (!fullScreen
+              ? // input-ring: 인라인 입력 창 윤곽(B1). 전체화면은 shadow-lg 와 box-shadow 가
+                // 겹치므로 제외(그림자가 경계 역할).
+                ' input-ring overflow-hidden h-full relative rounded-md'
+              : ' left-0 m-4 p-2 overflow-hidden fixed z-[var(--z-prompt-popup)] h-96 prompt-full rounded-lg')
+          }
+        >
+          <div className="absolute right-0 top-0 z-10 flex items-center gap-1">
+            {caretArtist && !accessorySlot && artistButton(caretArtist, 'mt-1')}
+            <button
+              type="button"
+              aria-label={!fullScreen ? '크게 편집' : '크게 편집 닫기'}
+              onClick={() => {
+                if (!disabled) setFullScreen(!fullScreen);
+              }}
+              className="text-gray-500 hover:text-gray-600 dark:text-slate-400 dark:hover:text-slate-300 opacity-50 mr-1 mt-1"
+            >
+              {!fullScreen ? <FaExpand /> : <FaTimes />}
+            </button>
+          </div>
+          <EditTextAreaImpl
+            ref={editorRef}
+            value={value}
+            disabled={disabled}
+            highlight={highlight}
+            onUpdated={onUpdated}
+            history={historyRef.current}
+            redo={redoRef.current}
+            onUpArrow={onUpArrow}
+            onDownArrow={onDownArrow}
+            onEnter={onEnter}
+            onEsc={onEsc}
+            closeAutoComplete={closeAutoComplete}
+            onFocus={onFoucs}
+            onBlur={onBlur}
+          />
+          {isMobile && fullScreen && (
+            <div className="absolute right-0 bottom-0 z-10 p-1 active:brightness-90">
+              <FaUndo
+                size={20}
+                role="button"
+                aria-label="실행 취소"
+                className="opacity-50 mr-1 mb-1"
+                onClick={() => {
+                  editorRef.current!.undo();
+                }}
+              />
+            </div>
+          )}
+        </div>
+        <PromptAutoComplete
+          key={id}
+          curWord={curWord}
+          tags={tags}
+          clientX={clientX}
+          clientY={clientY}
+          selectedTag={selectedTag}
+          onSelectTag={onSelectTag}
+        />
+        {fullScreen && (
+          <div
+            role="presentation"
+            className="fixed bg-black opacity-15 w-screen h-screen top-0 left-0 z-[var(--z-prompt-back)]"
+            onClick={closeFullScreen}
+          />
+        )}
+      </>
+    );
+  },
+);
+
+export default PromptEditTextArea;

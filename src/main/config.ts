@@ -1,0 +1,253 @@
+import type {
+  GenerationEffort,
+  GenerationQualityPreset,
+  GenerationUcPreset,
+  ModelVersion,
+} from '../renderer/backends/imageGen';
+
+export type ImageEditor = 'photoshop' | 'gimp' | 'mspaint';
+
+export type ModelType = 'fast' | 'quality';
+
+export type RemoveBgQuality =
+  | 'low'
+  | 'normal'
+  | 'high'
+  | 'veryhigh'
+  | 'veryveryhigh';
+
+export interface DownloadSettings {
+  lastSavePath?: string;
+  defaultPrefix?: string;
+  defaultSuffix?: string;
+  autoNumbering?: boolean;
+  overwriteExisting?: boolean;
+  includeTimestamp?: boolean;
+}
+
+export interface ImageSaveSettings {
+  autoSaveEnabled?: boolean; // 자동 저장 활성화 여부 (기본값: true - 하위 호환성)
+  saveToHistory?: boolean; // 히스토리에 저장 (기본값: true)
+}
+
+export interface Config {
+  imageEditor?: ImageEditor;
+  modelType?: ModelType;
+  removeBgQuality?: RemoveBgQuality;
+  useLocalBgRemoval?: boolean;
+  useCUDA?: boolean;
+  saveLocation?: string;
+  noIpCheck?: boolean;
+  refreshImage?: boolean;
+  uuid?: string;
+  whiteMode?: boolean;
+  disableQuality?: boolean;
+  /** V5 품질 프리셋. 누락 시 기존 disableQuality 값으로 해석한다. */
+  qualityPreset?: GenerationQualityPreset;
+  /** V5 투명 배경 생성. 구버전은 모르는 선택 필드라 그대로 무시한다. */
+  transparentBackground?: boolean;
+  /** 저장된 Opus 토큰의 V5 할당량 기반 자동 순회. 누락/false면 비활성이다. */
+  multiTokenAutoRotate?: boolean;
+  /** 현재 토큰이 이 값 이하일 때 자동 순회를 시도한다. 1~24, 기본 10. */
+  multiTokenRotateWarningPercent?: number;
+  /** 이 값 이상 남은 후보 토큰만 사용한다. 경고값보다 최소 5%p 높아야 한다. */
+  multiTokenRotateTargetPercent?: number;
+  /** 느리게 회복된 다른 계정의 여유 할당량을 균형 있게 사용하는 추가 순회. */
+  multiTokenBalanceRotate?: boolean;
+  /** 균형 순회 후보로 볼 최소 잔량. 60~100, 기본 80. */
+  multiTokenRotateBalancePercent?: number;
+  modelVersion?: ModelVersion;
+  /** V5 Full effort. Legacy settings omit this and keep High. */
+  effort?: GenerationEffort;
+  /** NAI Undesired Content Preset — 생성 시 네거티브 앞에 병합되는 기본 프리셋.
+   *  모델별 제공 항목이 다르며(naiQualityPresets 단일 출처) 기본 'none' =
+   *  기존 사용자 결과 무변화(옵트인). */
+  ucPreset?: GenerationUcPreset;
+  /** 옛 요청 지연 키(5.4.0 이하, 0~1000ms 배수 구조). 새 키 requestDelayMs 가 없을 때만
+   *  환산해 읽고(requestTiming.resolveRequestDelaySettings), 저장할 때마다
+   *  역환산값 round(requestDelayMs ÷ 7.5)(0~1000)을 병기한다(롤백 시 옛 배수가 곱해져 비슷한 대기). */
+  delayTime?: number;
+  /** 요청 사이 기본 지연(ms, 0~10000). 없으면 옛 delayTime 환산, 그것도 없으면 기본값.
+   *  기본값·환산·실제 대기·소량 완화·급등·긴 휴식은 단일 출처 renderer/models/requestTiming.ts. */
+  requestDelayMs?: number;
+  /** 요청 사이 무작위 폭(ms, ±0~5000). 없으면 기본값(requestTiming). */
+  requestDelayJitterMs?: number;
+  /** 권장 최소값 미만 지연 경고에서 「다시 알리지 않음」을 골랐음. */
+  requestDelayWarningDismissed?: boolean;
+  furryMode?: boolean;
+  downloadSettings?: DownloadSettings;
+  imageSaveSettings?: ImageSaveSettings;
+  classicSceneCard?: boolean;
+  legacyProjectMode?: boolean;
+  /** 켜면 씬 에디터 첫 탭을 예전 프리셋 폼으로 표시(4탭 구조는 항상 유지). 기본 false = 첫 탭 단순화 */
+  legacySceneEditor?: boolean;
+  /** 켜면 이지모드·이미지 수정 작업모드와 선택 드롭다운을 다시 표시(기존 사용자용).
+   *  기본 false = 작업모드를 "이미지 생성" 하나로 고정하고 드롭다운 숨김. 데이터는 비파괴. */
+  legacyWorkflowMode?: boolean;
+  /** 켜면 PC 씬 툴바 버튼을 예전처럼 텍스트로 표시(레거시). 기본 false = 아이콘+툴팁.
+   *  모바일 아이콘 축약에는 영향 없음(모바일 텍스트 복원은 클래식 툴바가 담당). */
+  sceneToolbarLegacyText?: boolean;
+  /** 퀵 메뉴 구성(전역 액션 id 목록, globalActions 참조). 미설정 = 추천 기본 프리셋.
+   *  stale id 는 해석 시 조용히 무시(uiToolbar 선례). */
+  quickMenu?: string[];
+  /** 퀵 메뉴 ⚡ 플로팅 버튼 표시(옵트인, 2026-07-18 피드백 — 기본 숨김으로 전환).
+   *  기본 false = 버튼 숨김. PC 단축키(기본 Ctrl+K)는 버튼과 무관하게 항상 동작. */
+  quickMenuButton?: boolean;
+  /** 사용자 커스텀 테마 프리셋(릴리스 준비 ③) — 현재 색 구성(UiThemeConfig)+기본
+   *  모드(다크/화이트/트루다크) 스냅샷. 칩 클릭 = 저장 당시 모습 그대로 복원(템플릿
+   *  칩과 동일 UX). 옵셔널 = 하위호환. */
+  uiThemePresets?: {
+    name: string;
+    whiteMode: boolean;
+    trueDark?: boolean;
+    theme: UiThemeConfig;
+  }[];
+  /** 조합 에디터 뷰 모드(개인 지속). 'card'=기존 카드 격자 / 'list'=컴팩트 목록.
+   *  미설정 = 데스크톱 card·모바일 list(App 로드 시 결정). 옵셔널 = 하위호환. */
+  uiCombinationView?: 'card' | 'list';
+  exportConcurrency?: number;
+  /** 이미지 export 시 기본 목표 폴더(데스크톱 전용 — 프리셋에 폴더가 없을 때 사용) */
+  defaultExportFolder?: string;
+  /** 드라이브 동기화 폴더(데스크톱 전용, 기기 고유 — 설정 파일 내보내기 대상 아님).
+   *  Google Drive 등 동기화 앱이 올리는 로컬 폴더. 설정되면 백업·내보내기 끝에서
+   *  [드라이브 폴더 / 다운로드 폴더]를 고른다(models/driveSync.ts). */
+  syncFolder?: string;
+  /** 새로 생성되는 이미지를 저장 직후 WebP 로 자동 변환(데스크톱 전용, 기본 false).
+   *  변환 실패 시 원본 PNG 를 그대로 사용하므로 안전. 기존 이미지에는 영향 없음. */
+  autoConvertWebp?: boolean;
+  /** 자동 WebP 변환 품질(1~100, 기본 80 — 수동 일괄 변환 기본값과 동일) */
+  autoConvertWebpQuality?: number;
+  trueDark?: boolean;
+  // 저장소(스토리지) 접근이 불안정할 때 자동 저장을 일시정지해 데이터 손상을 막는다.
+  // 기본 ON. OFF 시 항상 저장을 시도(불안정 시 손상 위험은 있으나 작업 롤백 체감은 없음).
+  storageWriteGuard?: boolean;
+  // 아티스트 태깅의 WD 태거 모델 선택 (기본 wd-swinv2)
+  wdTaggerModel?: 'wd-swinv2' | 'wd-eva02';
+  // 모바일 권한 안내 모달에서 '거절'을 선택 — 해당 권한을 다시 묻지 않는다.
+  // (안내에서 '확인' 후 시스템 창에서 거부한 경우는 플래그를 세우지 않아 다음 부팅 때 재안내)
+  notifPermissionDeclined?: boolean;
+  batteryPermissionDeclined?: boolean;
+  // UI 테마 커스터마이징(구조화 의도). 미설정 시 기본 테마(다크/라이트).
+  // 실제 적용 CSS 변수는 buildThemeVars(uiTheme.ts)로 파생 — 단일 출처.
+  uiTheme?: UiThemeConfig;
+  // 툴바 버튼 배치 커스터마이징. 미설정 시 레지스트리(uiLayout.ts)의 기본 등급.
+  // 배치 해석은 resolveToolbar(uiLayout.ts)가 단일 출처.
+  uiToolbar?: UiToolbarConfig;
+  // 레이아웃 템플릿 id(배치 구조 프리셋). 미지정=classic. id 계약·강제 폴백 등
+  // 해석은 resolveLayout(layoutTemplates.ts)가 단일 출처.
+  uiLayoutTemplate?: string;
+  // 모바일 V2 부위별 적용(2026-09-27). 없으면 전부 켬.
+  uiMobileV2Parts?: {
+    main?: boolean;
+    editor?: boolean;
+    grid?: boolean;
+    detail?: boolean;
+  };
+  // 모바일 기본 배치=V2 전환 완료 표식(2026-09-27). 있으면 자동 전환·안내를 다시 하지 않는다(models/mobileV2Default.ts).
+  mobileV2IntroDone?: boolean;
+  // PC 전용 플로팅 생성 컨트롤(TaskQueueControl)의 분리 여부·위치.
+  // detached=true면 하단바에서 떼어내 화면 위 플로팅 카드로 표시(모바일 무시).
+  genWidget?: { detached?: boolean; x?: number; y?: number };
+  // 레이아웃 슬롯 개인화 — 템플릿(uiLayoutTemplate) 기본값 위에 얹는 오버라이드.
+  // 전부 옵셔널: 미설정 = 템플릿 기본 = 기존 동작(롤백 안전).
+  // 해석은 resolveLayout(layoutTemplates.ts)가 단일 출처.
+  uiLayoutSlots?: UiLayoutSlots;
+  // 창 배치(PC 전용) — 이미지 뷰어 등 FloatView 가 차지하는 영역.
+  // 'cover'(기본)=좌우 패널 위로 넓게 펼침(히스토리 도크는 유지, v4.14.0 동작) /
+  // 'center'=중앙 콘텐츠만 덮어 좌우 패널을 병행 열람. 모바일은 도크가 없어 항상 center.
+  uiFloatViewMode?: 'cover' | 'center';
+  // 앱 글꼴(개인 설정) — 'system'(기본, 기존 시스템 글꼴 스택) /
+  // 'pretendard'(번들 Pretendard Variable). id 는 config 저장 키라 배포 후 불변.
+  uiFont?: 'pretendard' | 'system';
+  // 클래식 마감(개인 설정) — true 면 UI 심미 개편(보더/라운딩 등) 이전 모양으로 복원.
+  // 적용은 App.tsx 가 html 에 finish-classic 클래스를 토글(App.css 토큰 오버라이드).
+  uiClassicFinish?: boolean;
+  // 알약형 버튼(커스텀 탭) — true 면 모던 마감에서도 아이콘만 버튼을 알약형으로(--r-btn-icon 9999px).
+  // 적용은 App.tsx 가 html 에 pill-buttons 클래스를 토글. 기본 false, 클래식 마감은 항상 알약.
+  uiPillButtons?: boolean;
+  // 프리셋 에디터 요소 순서 사용자 오버라이드(L1-2) — 워크플로우 타입별로 최상위 UI
+  // 요소의 렌더 순서를 개인화한다. 키는 wfiElementKey(WorkFlow.ts)가 반환하는 안정 키
+  // (배포 후 불변 계약). 미설정/빈 배열 = 오버라이드 없음 = 정의 순서 그대로(기존 동작).
+  // 최종 렌더 순서 해석은 resolvePresetOrder(presetLayout.ts)가 단일 출처 —
+  // stale 키는 조용히 무시하고 신규 키는 정의 위치에 삽입한다(롤백/전방호환 안전).
+  uiPresetLayout?: Record<string, string[]>;
+  // 프리셋 패널 버튼 하단 아이콘 행(릴리스 준비 ② B) — true 면 프리셋 패널의 넓은
+  // 버튼(캐릭터 프롬프트·샘플링/모델·바이브·캐릭터 레퍼런스)을 본문에서 빼 패널
+  // 최하단의 아이콘 한 줄로 정리한다(존재하는 버튼만 — 워크플로우별 상이).
+  // 미설정/false = 현행 세로 넓은 버튼 그대로(롤백 안전). PC·모바일 공용.
+  uiPresetIconRow?: boolean;
+  // 동반 슬롯(L3-1 → E2) — 프리셋 에디터 "호스트 행" 옆에 붙일 전역(portable) 툴바 버튼.
+  // 키 = hostKey(wfiElementKey 안정 키, 예 'characterPrompts'·'vibes'·'characterReferences'
+  // ·'sampling-group'), 값 = 붙일 버튼 id 목록(uiLayout.ts portable 버튼 id, 예
+  // 'character-presets') — 둘 다 배포 후 불변. 미설정/빈 배열 = 슬롯 없음 = 현행 렌더
+  // (롤백 안전). 어떤 hostKey·버튼이 허용되는지(호스트 목록 COMPANION_HOSTS + 풀=portable
+  // 전체)와 해석·유일성(first-host-wins)은 companionSlots.ts 가 단일 출처 — 호스트 목록
+  // 밖 hostKey·풀 밖 버튼 id 는 조용히 무시한다(stale 무시 방침).
+  uiCompanionSlots?: Record<string, string[]>;
+  // 같은 프로젝트 중복 열기 허용(읽기 전용 미러). 기본 false/undefined = 종전대로
+  // 배타(다른 창이 연 프로젝트는 소유 창으로 포커스만). true 면 충돌 시 "소유 창으로
+  // 이동 / 읽기 전용 미러로 열기" 선택지를 제시한다. 미러 창은 락을 보유하지 않아
+  // 디스크에 쓰지 못하고(P0 가드), 이미지 즐겨찾기·삭제·생성 예약만 소유 창에 위임된다.
+  allowDuplicateProjectOpen?: boolean;
+}
+
+// 레이아웃 슬롯 개인화 — 템플릿(uiLayoutTemplate) 기본값 위에 얹는 오버라이드.
+// 전부 옵셔널: 미설정 = 템플릿 기본 = 기존 동작(롤백 안전).
+export interface UiLayoutSlots {
+  historySide?: 'left' | 'right'; // 이미지 히스토리 패널 (기본 right)
+  presetSide?: 'left' | 'right'; // 프리셋 에디터 패널 (기본 left)
+  projectSide?: 'left' | 'right'; // 프로젝트 사이드 바(드로어 진입) (기본 left)
+  genControl?: 'docked' | 'floating'; // 생성 컨트롤 (기본 docked, compact 는 floating)
+}
+
+// 버튼 하나의 사용자 배치: 'default'=레지스트리 기본 등급을 따름 /
+// 'pinned'=툴바 고정 / 'menu'=⋯ 오버플로 메뉴로 / 'hidden'=숨김
+export type ToolbarButtonPlacement = 'default' | 'pinned' | 'menu' | 'hidden';
+
+// 한 영역(scene·project 등)의 배치 순서. 배열 순서가 곧 렌더 순서.
+// 배열의 원소는 uiLayout.ts 레지스트리의 버튼 id. schema=2(편집 모드)에서 사용.
+export interface UiToolbarAreaLayout {
+  inline?: string[]; // 인라인 배치 순서
+  menu?: string[]; // ⋯메뉴 배치 순서
+  hidden?: string[]; // 숨김
+}
+
+// 툴바 배치 커스터마이징의 "의도"(원본). 전부 옵셔널=하위호환.
+// buttons 의 키는 uiLayout.ts 레지스트리의 버튼 id(전 영역 공용, 배포 후 불변 계약).
+export interface UiToolbarConfig {
+  // 클래식 툴바(계층화 도입 이전 배치)로 롤백. true 면 계층화·오버플로 메뉴·
+  // buttons 오버라이드를 전부 무시하고 모든 버튼을 인라인 렌더(기존 사용자 안심용).
+  classic?: boolean;
+  buttons?: Record<string, ToolbarButtonPlacement>;
+  // schema=2(편집 모드): 영역별 순서 정보를 areas 에 저장. 미설정(v1)이면 buttons+tier
+  // 규칙으로 폴백. 롤백 안전: 구버전 앱은 areas/schema 를 무시하고 buttons 만 읽으므로
+  // 크래시 없이 "순서만 잃고 배치 의도는 유지"된다(moveToolbarButton 의 dual-write).
+  areas?: Record<string, UiToolbarAreaLayout>;
+  schema?: 2;
+}
+
+// UI 색 커스터마이징의 "의도"를 저장(파생값이 아닌 원본). 전부 옵셔널=하위호환.
+export interface UiThemeConfig {
+  surface?: string; // 배경색 (#rrggbb)
+  surface2?: string; // 패널/카드 배경(루트보다 한 단계 올라온 표면)
+  inputBg?: string; // 입력창 배경
+  // 구분 구역 배경: 폴더 등 "색 대비가 중요한" 영역. 미설정 시 커스텀 배경 색조를 따라가지
+  // 않고 기본 테마(명도) 고정 → 어떤 커스텀 테마에서도 텍스트·식별색 대비 유지. 수동 지정 가능.
+  zoneBg?: string;
+  // 테두리/구분선 색: 미설정 시 텍스트 패턴·배경색에서 적응 파생(배경에 옅게 녹는 선).
+  lineColor?: string;
+  textPattern?: 'light' | 'dark'; // 텍스트/아이콘 흑백 패턴(미설정=테마 기본)
+  unifyButtons?: boolean; // 버튼 색 통합(역할 3색) 모드 on/off
+  // 통합 모드(unifyButtons=true)에서의 역할별 색
+  accent?: string; // 강조(초록/하늘/주황 버튼 통합)
+  neutral?: string; // 일반(회색 버튼)
+  danger?: string; // 위험(빨강 버튼=삭제)
+  // 개별 모드(unifyButtons=false)에서의 색별 지정
+  buttons?: {
+    green?: string;
+    sky?: string;
+    orange?: string;
+    gray?: string;
+    red?: string;
+  };
+}

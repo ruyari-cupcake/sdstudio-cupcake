@@ -1,0 +1,553 @@
+import { v4 } from 'uuid';
+import ExifReader from 'exifreader';
+import extractChunks from 'png-chunks-extract';
+import { Buffer } from 'buffer';
+import { backend, imageService } from '.';
+import { dataUriToBase64 } from './ImageService';
+import defaultassets from '../defaultassets';
+import type {
+  IInpaintScene,
+  IPieceLibrary,
+  IPromptPiece,
+  IScene,
+  ISession,
+  IVibeItem,
+  Round,
+} from './types';
+import { getAppState } from './appStateRef';
+import { projectPath } from './projectPaths';
+
+export const defaultUC = `worst quality, bad quality, displeasing, very displeasing, lowres, bad anatomy, bad perspective, bad proportions, bad aspect ratio, bad face, long face, bad teeth, bad neck, long neck, bad arm, bad hands, bad ass, bad leg, bad feet, bad reflection, bad shadow, bad link, bad source, wrong hand, wrong feet, missing limb, missing eye, missing tooth, missing ear, missing finger, extra faces, extra eyes, extra eyebrows, extra mouth, extra tongue, extra teeth, extra ears, extra breasts, extra arms, extra hands, extra legs, extra digits, fewer digits, cropped head, cropped torso, cropped shoulders, cropped arms, cropped legs, mutation, deformed, disfigured, unfinished, chromatic aberration, text, error, jpeg artifacts, watermark, scan, scan artifacts`;
+
+function readJSONFromPNG(base64PNG: string) {
+  const buffer = Buffer.from(base64PNG, 'base64');
+  // buffer 폴리필의 Buffer 는 Uint8Array 서브클래스 — 제네릭 표기 차이만 있어 캐스트
+  const chunks = extractChunks(buffer as unknown as Uint8Array);
+  const jsonChunk = chunks.find((chunk) => chunk.name === 'tEXt');
+  if (jsonChunk) {
+    let base64JsonData = Buffer.from(jsonChunk.data).toString();
+    const startIndex = base64JsonData.indexOf('json:') + 5;
+    base64JsonData = base64JsonData.slice(startIndex);
+    const jsonData = JSON.parse(
+      Buffer.from(base64JsonData, 'base64').toString(),
+    );
+    return jsonData;
+  }
+  throw new Error('No JSON data found in the PNG.');
+}
+
+async function importStyle(session: any, base64: string) {
+  const json = readJSONFromPNG(base64);
+  if (!json.profile) {
+    return undefined;
+  }
+  const preset: any = json;
+  const path = `${imageService.getVibesDir(session!)}/${v4()}.png`;
+  await backend.writeDataFile(path, base64);
+  preset.profile = path.split('/').pop()!;
+  const presets = session.presets.filter((p: any) => p.type === 'style');
+  const usedNames = new Set(presets.map((p: any) => p.name));
+  let cnt = '';
+  while (usedNames.has(preset.name + cnt)) {
+    cnt = cnt === '' ? '1' : (parseInt(cnt, 10) + 1).toString();
+  }
+  preset.name += cnt;
+  session.presets.push(preset);
+  session.presetMode = 'style';
+  return preset;
+}
+
+function blobToDataUri(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.onerror = (e) => reject(e);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function importDefaultPresets(session: any) {
+  const images = await Promise.all(
+    defaultassets.map((x) => fetch(x).then((res) => res.blob())),
+  );
+  for (const image of images) {
+    const datauri = await blobToDataUri(image);
+    await importStyle(session, dataUriToBase64(datauri));
+  }
+}
+
+function getInpaintOrgPath(session: any, inpaint: any) {
+  return projectPath('inpaint_orgs', session.name, `${inpaint.name}.png`);
+}
+
+function base64ToArrayBuffer(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+
+  return bytes.buffer;
+}
+
+async function extractExifFromBase64(base64: string) {
+  const arrayBuffer = base64ToArrayBuffer(base64);
+  const exif = ExifReader.load(arrayBuffer);
+  return exif;
+}
+
+async function extractPromptDataFromBase64(base64: string) {
+  const exif = await extractExifFromBase64(base64);
+  const comment = exif.Comment;
+  if (comment && comment.value) {
+    const data = JSON.parse(comment.value as string);
+    if (data.prompt) {
+      return [
+        data.prompt,
+        data.seed,
+        data.scale,
+        data.sampler,
+        data.steps,
+        data.uc,
+      ];
+    }
+  }
+  throw new Error('No prompt data found');
+}
+
+async function migrateSessionLegacy(session: any) {
+  if (!Array.isArray(session.presets)) {
+    for (const preset of Object.values(session.presets)) {
+      if ((preset as any).vibe) {
+        (preset as any).vibes = [
+          { image: (preset as any).vibe, info: 1, strength: 0.6 },
+        ] as any;
+        (preset as any).vibe = undefined;
+      }
+      if ((preset as any).vibes == null) {
+        (preset as any).vibes = [];
+      }
+    }
+
+    for (const preset of Object.values(session.presets)) {
+      for (const vibe of (preset as any).vibes) {
+        if ((vibe as any).image) {
+          const path = `${imageService.getVibesDir(session)}/${v4()}.png`;
+          await backend.writeDataFile(path, (vibe as any).image);
+          vibe.path = path;
+          (vibe as any).image = undefined;
+        }
+      }
+    }
+
+    session.presetShareds = {
+      preset: {
+        type: 'preset',
+        vibes: [],
+      },
+      style: {
+        type: 'style',
+        backgroundPrompt: '',
+        characterPrompt: '',
+        uc: '',
+        vibes: [],
+      },
+    };
+
+    const newVibes: IVibeItem[] = [];
+    for (const preset of Object.values(session.presets)) {
+      for (const vibe of (preset as any).vibes) {
+        newVibes.push({
+          path: vibe.path.split('/').pop()!,
+          info: vibe.info,
+          strength: vibe.strength,
+        });
+      }
+    }
+    session.presetShareds.preset.vibes = newVibes;
+
+    const newPresets = [];
+    for (const [k, v] of Object.entries(session.presets as any)) {
+      (v as any).name = k;
+      (v as any).type = 'preset';
+      newPresets.push(v);
+    }
+    session.presets = newPresets as any;
+    await importDefaultPresets(session);
+    session.presetMode = 'preset';
+  }
+
+  for (const inpaint of Object.values(session.inpaints) as any) {
+    if (inpaint.image) {
+      const path = projectPath(
+        'inpaint_orgs',
+        session.name,
+        `${inpaint.name}.png`,
+      );
+      await backend.writeDataFile(path, inpaint.image);
+      inpaint.image = undefined;
+    }
+    if (inpaint.mask) {
+      const path = projectPath(
+        'inpaint_masks',
+        session.name,
+        `${inpaint.name}.png`,
+      );
+      await backend.writeDataFile(path, inpaint.mask);
+      inpaint.mask = undefined;
+    }
+    if ((inpaint as any).middlePrompt != null) {
+      inpaint.prompt = '';
+      try {
+        const image = dataUriToBase64(
+          (await imageService.fetchImage(getInpaintOrgPath(session, inpaint)))!,
+        );
+        const [prompt, , , , , ,] = await extractPromptDataFromBase64(image);
+        inpaint.prompt = prompt;
+      } catch {
+        inpaint.prompt = (inpaint as any).middlePrompt;
+      }
+      (inpaint as any).middlePrompt = undefined;
+    }
+    if (!inpaint.uc) {
+      inpaint.uc = '';
+      try {
+        const image = dataUriToBase64(
+          (await imageService.fetchImage(getInpaintOrgPath(session, inpaint)))!,
+        );
+        const [, , , , , uc] = await extractPromptDataFromBase64(image);
+        inpaint.uc = uc;
+      } catch {
+        inpaint.uc = defaultUC;
+      }
+    }
+  }
+
+  for (const scene of Object.values(session.scenes) as any) {
+    if (scene.landscape != null) {
+      if (scene.landscape) {
+        scene.resolution = 'landscape';
+      } else {
+        scene.resolution = 'portrait';
+      }
+      scene.landscape = undefined;
+    }
+    if ((scene as any).main) {
+      scene.mains = [(scene as any).main];
+      (scene as any).main = undefined;
+    }
+    scene.mains = scene.mains ?? [];
+  }
+
+  for (const inpaint of Object.values(session.inpaints) as any) {
+    if (inpaint.landscape != null) {
+      if (inpaint.landscape) {
+        inpaint.resolution = 'landscape';
+      } else {
+        inpaint.resolution = 'portrait';
+      }
+      inpaint.landscape = undefined;
+    }
+  }
+
+  for (const library of Object.values(session.library) as any) {
+    if (!library.multi) {
+      library.multi = {};
+    }
+  }
+
+  for (const scene of Object.values(session.scenes) as any) {
+    if (!scene.imageMap) {
+      scene.imageMap = [];
+      if (scene.game) {
+        scene.game = scene.game.map((x: any) => ({
+          rank: x.rank,
+          path: x.path.split('/').pop()!,
+        }));
+      }
+      if (scene.round) {
+        scene.round.players = scene.round.players.map((x: any) => ({
+          rank: x.rank,
+          path: x.path.split('/').pop()!,
+        }));
+      }
+    }
+  }
+
+  for (const inpaint of Object.values(session.inpaints) as any) {
+    if (!inpaint.imageMap) {
+      inpaint.imageMap = [];
+      if (inpaint.game) {
+        inpaint.game = inpaint.game.map((x: any) => ({
+          rank: x.rank,
+          path: x.path.split('/').pop()!,
+        }));
+      }
+      if (inpaint.round) {
+        inpaint.round.players = inpaint.round.players.map((x: any) => ({
+          rank: x.rank,
+          path: x.path.split('/').pop()!,
+        }));
+      }
+    }
+  }
+}
+
+export async function migrateSession(sourceSession: any): Promise<ISession> {
+  // Migration is committed by the caller only after this complete snapshot succeeds.
+  // Retain embedded source images for a retry if any later file operation fails.
+  const oldSession = JSON.parse(JSON.stringify(sourceSession));
+  await migrateSessionLegacy(oldSession);
+  const newSession: ISession = {
+    version: 1,
+    name: oldSession.name,
+    presets: {},
+    inpaints: {},
+    scenes: {},
+    library: {},
+    presetShareds: {},
+  };
+
+  // Migrate presets
+  for (const preset of oldSession.presets) {
+    const newPreset = migratePreset(preset);
+    if (newPreset.type === 'SDImageGen') {
+      if (!newSession.presets.SDImageGen) {
+        newSession.presets.SDImageGen = [];
+      }
+      newSession.presets.SDImageGen.push(newPreset);
+    } else {
+      if (!newSession.presets.SDImageGenEasy) {
+        newSession.presets.SDImageGenEasy = [];
+      }
+      newSession.presets.SDImageGenEasy.push(newPreset);
+    }
+  }
+
+  // Migrate scenes
+  for (const [key, scene] of Object.entries(oldSession.scenes)) {
+    newSession.scenes[key] = migrateScene(scene);
+  }
+
+  // Migrate inpaints
+  for (const [key, inpaint] of Object.entries(oldSession.inpaints)) {
+    newSession.inpaints[key] = await migrateInpaintScene(oldSession, inpaint);
+  }
+
+  // Migrate library
+  for (const [key, library] of Object.entries(oldSession.library)) {
+    newSession.library[key] = migratePieceLibrary(library);
+  }
+
+  // Migrate preset shareds
+  for (const [, shared] of Object.entries(oldSession.presetShareds)) {
+    const newShared = migratePresetShared(shared);
+    newSession.presetShareds[newShared.type] = newShared;
+  }
+
+  return newSession;
+}
+
+function migratePreset(preset: any): any {
+  const basePreset = {
+    name: preset.name,
+    cfgRescale: preset.cfgRescale ?? 0,
+    steps: preset.steps ?? 28,
+    promptGuidance: preset.promptGuidance ?? 5,
+    smea: !preset.smeaOff,
+    sampling: preset.sampling ?? 'k_euler_ancestral',
+    frontPrompt: preset.frontPrompt,
+    backPrompt: preset.backPrompt,
+    uc: preset.uc,
+    noiseSchedule: preset.noiseSchedule ?? 'karras',
+    profile: '',
+  };
+
+  if (preset.type === 'style') {
+    return {
+      ...basePreset,
+      type: 'SDImageGenEasy',
+      profile: preset.profile,
+    };
+  }
+
+  return {
+    ...basePreset,
+    type: 'SDImageGen',
+  };
+}
+
+function migrateRound(round: any): Round | undefined {
+  if (!round) {
+    return undefined;
+  }
+  if (round.players == null || round.players.some((x: any) => x == null)) {
+    return undefined;
+  }
+  return {
+    curPlayer: round.curPlayer,
+    players: round.players.map((player: any) => player.path),
+    winMask: round.winMask,
+  };
+}
+
+function migrateScene(scene: any): IScene {
+  return {
+    type: 'scene',
+    name: scene.name,
+    resolution: scene.resolution,
+    slots: scene.slots.map((slot: any) => slot.map(migratePromptPiece)),
+    game: scene.game,
+    meta: {},
+    round: migrateRound(scene.round),
+    imageMap: scene.imageMap,
+    mains: scene.mains,
+  };
+}
+
+async function migrateInpaintScene(
+  session: any,
+  inpaint: any,
+): Promise<IInpaintScene> {
+  const imagePath = projectPath(
+    'inpaint_orgs',
+    session.name,
+    `${inpaint.name}.png`,
+  );
+  const maskPath = projectPath(
+    'inpaint_masks',
+    session.name,
+    `${inpaint.name}.png`,
+  );
+  const createdImages: string[] = [];
+  const copyLegacyImage = async (path: string): Promise<string> => {
+    const data = await imageService.fetchImage(path);
+    // fetchImage returns null only when the source does not exist; read failures reject.
+    // Some old scenes never had an optional original image or mask.
+    if (data === null) return '';
+    if (!data)
+      throw new Error(`구버전 인페인트 이미지가 비어 있습니다: ${path}`);
+    const filename = await imageService.storeVibeImage(
+      session,
+      dataUriToBase64(data),
+    );
+    createdImages.push(filename);
+    return filename;
+  };
+  let image: string;
+  let mask: string;
+  try {
+    image = await copyLegacyImage(imagePath);
+    mask = await copyLegacyImage(maskPath);
+  } catch (error) {
+    for (const filename of createdImages) {
+      try {
+        await backend.deleteFile(
+          imageService.getVibeImagePath(session, filename),
+        );
+      } catch (cleanupError) {
+        console.warn(
+          '구버전 인페인트 변환 취소 정리 실패:',
+          filename,
+          cleanupError,
+        );
+      }
+    }
+    throw error;
+  }
+  return {
+    type: 'inpaint',
+    name: inpaint.name,
+    resolution: inpaint.resolution,
+    workflowType: 'SDInpaint',
+    preset: {
+      type: 'SDInpaint',
+      image,
+      mask,
+      strength: 0.7,
+      cfgRescale: 0,
+      steps: 28,
+      promptGuidance: 5,
+      smea: false,
+      dyn: false,
+      originalImage: inpaint.originalImage ?? true,
+      sampling: 'k_euler_ancestral',
+      prompt: inpaint.prompt,
+      uc: inpaint.uc,
+      noiseSchedule: 'karras',
+      vibes: [],
+      seed: undefined,
+    },
+    game: inpaint.game,
+    round: inpaint.round,
+    imageMap: inpaint.imageMap,
+    mains: [],
+    sceneRef: inpaint.sceneRef,
+  };
+}
+
+function migratePromptPiece(piece: any): IPromptPiece {
+  return {
+    prompt: piece.prompt,
+    id: piece.id ?? v4(),
+    enabled: piece.enabled,
+    // 구버전 데이터에는 없던 필드 — PromptPiece.fromJSON 의 정규화와 동일하게 빈 배열
+    characterPrompts: piece.characterPrompts ?? [],
+  };
+}
+
+function migratePresetShared(shared: any): any {
+  const baseShared = {
+    vibes: shared.vibes,
+    seed: shared.seed,
+  };
+
+  if (shared.type === 'style') {
+    return {
+      ...baseShared,
+      type: 'SDImageGenEasy',
+      characterPrompt: shared.characterPrompt,
+      backgroundPrompt: shared.backgroundPrompt,
+      uc: shared.uc,
+    };
+  }
+
+  return {
+    ...baseShared,
+    type: 'SDImageGen',
+  };
+}
+
+export function migratePieceLibrary(library: any): IPieceLibrary {
+  const multi = library.multi ?? {};
+  return {
+    version: 1,
+    name: library.description ?? library.name,
+    pieces: Object.entries(library.pieces).map(([k, x]) => ({
+      name: k,
+      prompt: x as string,
+      multi: multi[k],
+    })),
+  };
+}
+
+export function recoverSession(session: any) {
+  session.presetShareds = {};
+  if (Array.isArray(session.presets)) {
+    const newPresets: any = {};
+    for (const data of session.presets) {
+      if (Array.isArray(data) && data[0] && data[0].type) {
+        newPresets[data[0].type] = data;
+      }
+    }
+    session.presets = newPresets;
+  } else {
+    session.presets = {};
+  }
+  getAppState().pushDialog({
+    type: 'yes-only',
+    text: '구버전 SD 스튜디오로 프로젝트를 열어서 손상된 부분을 복구했습니다',
+  });
+}

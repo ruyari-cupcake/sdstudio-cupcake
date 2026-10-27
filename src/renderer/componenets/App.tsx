@@ -1,0 +1,1102 @@
+import './App.css';
+import './contexify.css';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { observer } from 'mobx-react-lite';
+import {
+  FaGlobe,
+  FaImages,
+  FaPenFancy,
+  FaPalette,
+  FaBolt,
+} from 'react-icons/fa';
+import { DndProvider } from 'react-dnd';
+import { HTML5Backend } from 'react-dnd-html5-backend';
+import { TouchBackend } from 'react-dnd-touch-backend';
+import { usePreview } from 'react-dnd-preview';
+import { configure } from 'mobx';
+import ErrorBoundary from './AppErrorBoundary';
+import AppUpdateDialog from './AppUpdateDialog';
+import ProjectDrawer, { ProjectDrawerHandle } from './ProjectDrawer';
+import ProjectSideBar, { ProjectStrip } from './ProjectSideBar';
+import ProjectBrowser from './ProjectBrowser';
+import {
+  ImageHistoryPanel,
+  ImageHistoryDrawer,
+  ImageHistoryHandle,
+} from './ImageHistory';
+import QuickModeTab from './QuickModeTab';
+import PreSetEditor from './PreSetEdtior';
+import QueueControl, { SceneCell } from './SceneQueueControl';
+// 씬 휴지통 목록은 TrashViews(2026-10-02 T1 — 최근 삭제 순·개수 머리 줄). SceneQueueControl 의 옛 SceneTrashView 는 미사용.
+import { SceneTrashView } from './TrashViews';
+import ArtistTagModal from './ArtistTagModal';
+import { QuickMenu } from './QuickMenu';
+import BottomBar from './BottomBar';
+import { GenControlFloating } from './GenControlWidget';
+import EditModeShell from './EditModeShell';
+import {
+  resolveLayout,
+  dockOrder,
+  DOCK_RANK,
+  defaultLayoutTemplateId,
+} from '../models/layoutTemplates';
+import {
+  MOBILE_V2_INTRO_TEXT,
+  revertMobileV2ToClassic,
+} from '../models/mobileV2Default';
+import { INSTALL_DIR_TEXT } from '../../shared/installDir';
+import TobBar from './TobBar';
+import AlertWindow from './AlertWindow';
+import { TabComponent } from './UtilComponents';
+import PieceEditor, { PieceCell } from './PieceEditor';
+import { CharacterPresetFloatEditor } from './CharacterPresetEditor';
+import SceneTemplateManager from './SceneTemplateManager';
+import { DriveBackupManagerHost } from './DriveBackupManager';
+import { ConfigImportPreviewHost } from './ConfigSyncSection';
+import PromptTooltip from './PromptTooltip';
+import ConfirmWindow from './ConfirmWindow';
+import ExpiredProjectsDialog from './ExpiredProjectsDialog';
+import MigrationGate from './MigrationGate';
+import SaveLocationGate from './SaveLocationGate';
+import {
+  FloatView,
+  FloatViewProvider,
+  FLOAT_VIEW_WIDE_ANCHOR_ID,
+} from './FloatView';
+import { ActionIcon } from './ActionIcon';
+import { GlobalPresetTab, GlobalPresetPickerOverlay } from './GlobalPresetTab';
+import ModalOverlay from './ModalOverlay';
+import { ProjectTrashView } from './SessionSelect';
+
+import { CellPreview } from './ResultViewer';
+import { SlotPiece } from './SceneEditor';
+import EmbeddedBrowser from './EmbeddedBrowser';
+import ArtistLibraryTab from './ArtistLibraryTab';
+import { StackFixed, StackGrow, VerticalStack } from './LayoutComponents';
+import ProgressWindow from './ProgressWindow';
+import ResizableSplitter from './ResizableSplitter';
+import {
+  taskQueueService,
+  backend,
+  sessionService,
+  localAIService,
+  imageService,
+  isMobile,
+} from '../models';
+import { appState } from '../models/AppService';
+import { openStoragePermissionSettings } from '../models/storagePermissionGate';
+
+import { buildDanbooruSearchUrl } from '../models/util';
+import { isImportImageMime } from '../models/imageFormats';
+import { buildThemeVars } from '../models/uiTheme';
+import { AppContextMenu } from './AppContextMenu';
+import MobileKeyboardChip from './MobileKeyboardChip';
+
+import { ExternalImageView } from './ExternalImageView';
+import FindReplaceDialog from './FindReplaceDialog';
+import ExportPresetManager from './ExportPresetManager';
+import DirectExportDialog from './DirectExportDialog';
+
+configure({
+  enforceActions: 'never',
+});
+
+function DnDPreview() {
+  const preview = usePreview();
+  if (!preview.display) {
+    return null;
+  }
+  const { itemType, item, style } = preview;
+  style.rotate = '2deg';
+  style.transformOrigin = 'center';
+  let res: any = null;
+  if (itemType === 'scene') {
+    const {
+      scene,
+      curSession,
+      getImage,
+      cellSize,
+      cardWidth,
+      selectedSceneNames,
+    } = item as any;
+    const sceneStyle = cardWidth
+      ? { ...style, width: `${cardWidth}px` }
+      : style;
+    const count = selectedSceneNames?.length || 0;
+    res = (
+      <div style={{ position: 'relative' }}>
+        <SceneCell
+          scene={scene}
+          curSession={curSession}
+          getImage={getImage}
+          cellSize={cellSize}
+          style={sceneStyle}
+        />
+        {count > 1 && (
+          <div
+            style={{
+              position: 'absolute',
+              top: -4,
+              right: -4,
+              backgroundColor: '#0ea5e9',
+              color: '#fff',
+              borderRadius: '9999px',
+              width: 20,
+              height: 20,
+              fontSize: 11,
+              fontWeight: 700,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+              zIndex: 10,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+            }}
+          >
+            {count}
+          </div>
+        )}
+      </div>
+    );
+  } else if (itemType === 'image') {
+    const { path, cellSize, imageSize } = item as any;
+    res = (
+      <CellPreview
+        path={path}
+        cellSize={cellSize}
+        imageSize={imageSize}
+        style={style}
+      />
+    );
+  } else if (itemType === 'piece') {
+    res = <PieceCell {...(item as any)} style={style} />;
+  } else if (itemType === 'slot') {
+    res = <SlotPiece {...(item as any)} style={style} />;
+  } else if (
+    typeof itemType === 'string' &&
+    itemType.startsWith('toolbar-btn/')
+  ) {
+    // 툴바 버튼 재배치 드래그 — 실제 버튼 노드 그대로(원래 너비 유지) 반투명 프리뷰
+    const { name, node, width } = item as any;
+    res = (
+      <div
+        className="pointer-events-none"
+        style={{ ...style, ...(width ? { width } : {}), opacity: 0.85 }}
+      >
+        {node ?? <div className="round-button back-sky shadow-xl">{name}</div>}
+      </div>
+    );
+  } else {
+    return null;
+  }
+  return res;
+}
+
+export const App = observer(() => {
+  const {
+    uiFont,
+    uiClassicFinish,
+    uiPillButtons,
+    bootReady,
+    configLoadFailure,
+    mobileV2IntroPending,
+    saveLocationInsideInstall,
+    curSession: activeSession,
+    dialogs: openDialogs,
+    messages: toastMessages,
+  } = appState;
+  useEffect(() => {
+    return () => {
+      taskQueueService.stop();
+    };
+  }, []);
+
+  // 단축키 이벤트 수신
+  useEffect(() => {
+    let active = true;
+    const handler = (e: Event) => {
+      const action = (e as CustomEvent).detail?.action;
+      switch (action) {
+        case 'toggle-left-panel':
+          appState.toggleLeftPanel();
+          break;
+        case 'toggle-project-favorite':
+          if (appState.curSession) {
+            const sessionName = appState.curSession.name;
+            sessionService
+              .toggleFavorite(sessionName)
+              .then(() => {
+                if (!active) return undefined;
+                const isFav = sessionService.isFavorite(sessionName);
+                appState.pushMessage(
+                  isFav
+                    ? '즐겨찾기에 추가되었습니다'
+                    : '즐겨찾기에서 제거되었습니다',
+                );
+
+                return undefined;
+              })
+              .catch((error) => {
+                if (active)
+                  appState.pushMessage(
+                    `즐겨찾기 변경 실패: ${error?.message ?? error}`,
+                    'error',
+                  );
+              });
+          }
+          break;
+        case 'open-piece-editor':
+          if (appState.curSession) {
+            appState.openPieceEditor();
+          }
+          break;
+        case 'find-replace':
+          if (appState.curSession) {
+            appState.openFindReplace();
+          }
+          break;
+        case 'open-project-drawer':
+          appState.toggleSideDrawer('project');
+          break;
+        case 'open-project-grid':
+          appState.projectBrowserOpen = !appState.projectBrowserOpen;
+          break;
+        case 'quick-menu':
+          appState.quickMenuOpen = !appState.quickMenuOpen;
+          break;
+        case 'toggle-history-panel':
+          if (isMobile) {
+            appState.toggleSideDrawer('history');
+          } else {
+            appState.toggleHistoryPanel();
+          }
+          break;
+        default:
+          break;
+      }
+    };
+    window.addEventListener('shortcut-action', handler);
+    return () => {
+      active = false;
+      window.removeEventListener('shortcut-action', handler);
+    };
+  }, []);
+
+  const [darkMode, setDarkMode] = useState(false);
+  const [trueDark, setTrueDark] = useState(false);
+  const [themeOverrides, setThemeOverrides] = useState<Record<string, string>>(
+    {},
+  );
+  useEffect(() => {
+    // 권한 확보와 설정 복구가 끝나기 전의 임시 기본값을 UI 에 반영하지 않는다.
+    // 데스크톱 설정 오류는 별도 안내 게이트에서 재시작을 기다린다.
+    if (!bootReady || configLoadFailure) return undefined;
+    let active = true;
+    const refreshDarkMode = async () => {
+      const conf = await backend.getConfig();
+      if (!active) return;
+      setDarkMode(!conf.whiteMode);
+      setTrueDark(conf.trueDark ?? false);
+      setThemeOverrides(buildThemeVars(conf.uiTheme, !!conf.whiteMode));
+      appState.classicSceneCard = conf.classicSceneCard ?? false;
+      appState.legacyProjectMode = conf.legacyProjectMode ?? false;
+      appState.legacySceneEditor = conf.legacySceneEditor ?? false;
+      appState.legacyWorkflowMode = conf.legacyWorkflowMode ?? false;
+      appState.sceneToolbarLegacyText = conf.sceneToolbarLegacyText ?? false;
+      appState.quickMenu = conf.quickMenu;
+      appState.quickMenuButton = conf.quickMenuButton ?? false;
+      // 조합 에디터 뷰: 미설정 시 데스크톱=카드·모바일=목록(모바일 편집 편의).
+      appState.uiCombinationView =
+        conf.uiCombinationView ?? (isMobile ? 'list' : 'card');
+      appState.storageWriteGuard = conf.storageWriteGuard ?? true;
+      appState.uiToolbar = conf.uiToolbar ?? {};
+      appState.uiPresetLayout = conf.uiPresetLayout ?? {};
+      appState.uiCompanionSlots = conf.uiCompanionSlots ?? {};
+      appState.uiLayoutTemplate =
+        conf.uiLayoutTemplate ?? defaultLayoutTemplateId(isMobile);
+      appState.uiMobileV2Parts = conf.uiMobileV2Parts;
+      appState.uiPresetIconRow = conf.uiPresetIconRow ?? false;
+      appState.genWidget = conf.genWidget ?? {};
+      appState.uiLayoutSlots = conf.uiLayoutSlots ?? {};
+      appState.uiFloatViewMode = conf.uiFloatViewMode ?? 'cover';
+      appState.uiFont = conf.uiFont ?? 'system';
+      appState.uiClassicFinish = conf.uiClassicFinish ?? false;
+      appState.uiPillButtons = conf.uiPillButtons ?? false;
+      appState.allowDuplicateProjectOpen =
+        conf.allowDuplicateProjectOpen ?? false;
+    };
+    const refreshConfig = () => {
+      refreshDarkMode().catch((error) => {
+        if (!active) return;
+        console.error('화면 설정 반영 실패:', error);
+        appState.pushMessage(
+          '화면 설정을 불러오지 못했습니다. 앱을 다시 시작해 주세요.',
+          'error',
+        );
+      });
+    };
+    refreshConfig();
+    sessionService.addEventListener('config-changed', refreshConfig);
+    return () => {
+      active = false;
+      sessionService.removeEventListener('config-changed', refreshConfig);
+    };
+  }, [bootReady, configLoadFailure]);
+  // 글꼴 옵션(환경설정 → 개인 설정) 적용 — 'pretendard'면 html 에 클래스를 얹어
+  // 번들 글꼴로 전환한다(App.css 의 html.font-pretendard, 기본=시스템 스택).
+  useEffect(() => {
+    document.documentElement.classList.toggle(
+      'font-pretendard',
+      appState.uiFont === 'pretendard',
+    );
+  }, [uiFont]);
+  // 클래식 마감 옵션(환경설정 → 개인 설정) 적용 — 켜면 html 에 클래스를 얹어
+  // 심미 개편 전 모양으로 복원한다(App.css 의 html.finish-classic 토큰 오버라이드).
+  useEffect(() => {
+    document.documentElement.classList.toggle(
+      'finish-classic',
+      appState.uiClassicFinish,
+    );
+  }, [uiClassicFinish]);
+  // 알약형 버튼 옵션(환경설정 → 커스텀) 적용 — 켜면 html 에 클래스를 얹어
+  // 아이콘만 버튼 반경 토큰 --r-btn-icon 을 알약으로 바꾼다(App.css 의 html.pill-buttons).
+  useEffect(() => {
+    document.documentElement.classList.toggle(
+      'pill-buttons',
+      appState.uiPillButtons,
+    );
+  }, [uiPillButtons]);
+  // 부팅 경고(저장 경로 폴백)는 SaveLocationGate 전면 게이트가 담당한다 —
+  // 사후 다이얼로그는 다른 게이트/창에 가려져 "프로젝트 전부 초기화"로 오해되던
+  // 문제로 격상(2026-07-25). 상태는 bootstrap 이 appState.saveLocationFallback 에 채운다.
+  // 모바일 기본 배치=V2 최초 안내(2026-09-27): bootstrap(applyMobileV2Default)이 기존 사용자를 V2 로 바꾼 뒤
+  // 세운 표식을 보고, 메인 UI 가 뜬 다음 한 번만 띄운다. 「클래식으로 되돌리기」는 템플릿만 되돌린다.
+  useEffect(() => {
+    if (!appState.bootReady || !appState.mobileV2IntroPending) return;
+    appState.mobileV2IntroPending = false;
+    appState.pushDialog({
+      type: 'select',
+      text: MOBILE_V2_INTRO_TEXT,
+      // 예전 [확인] 항목은 취소와 같은 동작이라 내장 취소(「닫기」 = V2 그대로 사용) 하나로 합쳤다(D3)
+      items: [{ text: '클래식으로 되돌리기', value: 'classic' }],
+      cancelText: '닫기',
+      callback: (value?: string) => {
+        if (value === 'classic') {
+          revertMobileV2ToClassic().catch((e) =>
+            console.error('클래식 되돌리기 실패:', e),
+          );
+        }
+      },
+    });
+  }, [bootReady, mobileV2IntroPending]);
+  // 저장 위치가 프로그램 설치 폴더 안(데스크톱, 2026-10-06): 업데이트 설치 때 삭제될 수 있어
+  // 메인 UI 가 뜬 뒤 한 번 안내한다. 경고만 — 경로는 바꾸지 않고 사용자가 환경설정에서 옮긴다.
+  useEffect(() => {
+    const inside = appState.saveLocationInsideInstall;
+    if (!appState.bootReady || !inside) return;
+    appState.saveLocationInsideInstall = null;
+    appState.pushDialog({
+      type: 'yes-only',
+      text: INSTALL_DIR_TEXT.bootWarning(inside.path, inside.installDir),
+    });
+  }, [bootReady, saveLocationInsideInstall]);
+  useEffect(() => {
+    const removeDonwloadProgressListener = backend.onDownloadProgress(
+      (progress: any) => {
+        localAIService.notifyDownloadProgress(progress.percent);
+      },
+    );
+    const removeZipProgressListener = backend.onZipProgress((progress: any) => {
+      // exportProgress가 이미 클리어된 후 늦게 도착하는 이벤트 무시
+      if (appState.exportProgress) {
+        appState.exportProgress = {
+          text: '압축파일 생성 중..',
+          done: progress.done,
+          total: progress.total,
+        };
+      }
+    });
+    const removeImageChangedListener = backend.onImageChanged(
+      async (path: string) => {
+        imageService.invalidateCache(path);
+      },
+    );
+    const handleIPCheckFail = () => {
+      appState.pushDialog({
+        type: 'yes-only',
+        text: '네트워크 변경을 감지하고 작업을 중단했습니다. 잦은 네트워크 변경은 계정 공유로 취급되어 밴의 위험이 있습니다. 이를 무시하고 싶으면 환경설정에서 "IP 체크 끄기"를 켜주세요.',
+      });
+    };
+    taskQueueService.addEventListener('ip-check-fail', handleIPCheckFail);
+    return () => {
+      removeDonwloadProgressListener();
+      removeImageChangedListener();
+      removeZipProgressListener();
+      taskQueueService.removeEventListener('ip-check-fail', handleIPCheckFail);
+    };
+  }, [activeSession]);
+
+  const [dragOverlay, setDragOverlay] = useState<string | null>(null);
+  const dragCounter = useRef(0);
+  useEffect(() => {
+    const getDropDescription = (dataTransfer: DataTransfer): string | null => {
+      const { items } = dataTransfer;
+      if (!items || items.length === 0) return null;
+      const item = items[0];
+      if (item.kind !== 'file') return null;
+      const { type } = item;
+      if (isImportImageMime(type)) {
+        return '이미지에서 프롬프트 메타데이터를 추출합니다';
+      }
+      if (type === 'application/json') {
+        return '프로젝트 또는 프롬프트조각을 불러옵니다';
+      }
+      // tar 백업(프로젝트/폴더). 드래그 중에는 보안상 파일명(dataTransfer.files)을 읽을 수 없고,
+      // tar 의 MIME 도 환경마다 application/x-tar 또는 빈 문자열로 다르게 보고된다.
+      // → MIME 타입 기준으로 안내(드롭 시 handleTarImport 가 폴더/프로젝트 백업을 정확히 구분).
+      if (
+        type === 'application/x-tar' ||
+        type === 'application/x-gtar' ||
+        type === 'application/tar' ||
+        type === '' // 확장자/타입 미상 — tar 등 백업 파일 가능성
+      ) {
+        return '프로젝트 또는 폴더 백업을 불러옵니다';
+      }
+      return null;
+    };
+
+    const handleDragEnter = (event: any) => {
+      event.preventDefault();
+      dragCounter.current++;
+      if (dragCounter.current === 1) {
+        // 모달 오버레이가 열려 있으면 메타데이터 드래그 안내를 표시하지 않음
+        if (appState.modalOverlayCount > 0) return;
+        const desc = getDropDescription(event.dataTransfer);
+        if (desc) {
+          setDragOverlay(desc);
+        }
+      }
+    };
+
+    const handleDragOver = (event: any) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+    };
+
+    const handleDragLeave = (event: any) => {
+      event.preventDefault();
+      dragCounter.current--;
+      if (dragCounter.current <= 0) {
+        dragCounter.current = 0;
+        setDragOverlay(null);
+      }
+    };
+
+    const handleDrop = (event: any) => {
+      event.preventDefault();
+      event.stopPropagation();
+      dragCounter.current = 0;
+      setDragOverlay(null);
+      // 모달 오버레이가 열려 있으면 메타데이터 처리도 차단
+      if (appState.modalOverlayCount > 0) return;
+      const file = event.dataTransfer.files[0];
+      if (file) {
+        appState.handleFile(file);
+      }
+    };
+    window.addEventListener('dragenter', handleDragEnter);
+    window.addEventListener('dragover', handleDragOver);
+    window.addEventListener('dragleave', handleDragLeave);
+    window.addEventListener('drop', handleDrop);
+
+    return () => {
+      window.removeEventListener('dragenter', handleDragEnter);
+      window.removeEventListener('dragover', handleDragOver);
+      window.removeEventListener('dragleave', handleDragLeave);
+      window.removeEventListener('drop', handleDrop);
+    };
+  }, [activeSession, openDialogs, toastMessages]);
+
+  useEffect(() => {
+    window.curSession = appState.curSession;
+    if (appState.curSession) {
+      sessionService.reloadPieceLibraryDB(appState.curSession);
+      imageService.refreshBatch(appState.curSession);
+      appState.cleanupOrphanedPresetApplication();
+    }
+    return () => {
+      window.curSession = undefined;
+    };
+  }, [activeSession]);
+
+  // 글로벌 프리셋 손상 복구 알림
+  useEffect(() => {
+    const handler = (e: any) => {
+      const backupName = e.detail?.backupName;
+      appState.pushDialog({
+        type: 'yes-only',
+        text: `글로벌 프리셋 파일이 손상되어 빈 상태로 초기화되었습니다.${
+          backupName ? `\n\n백업: ${backupName}` : ''
+        }`,
+      });
+    };
+    window.globalPresetService?.addEventListener('corrupted', handler);
+    return () => {
+      window.globalPresetService?.removeEventListener('corrupted', handler);
+    };
+  }, []);
+
+  // onClick: 퀵 메뉴 export 계열의 탭 문맥 추적(appState.curMainTab, D3) —
+  // 단축키 탭 전환(tab-N)도 TabComponent 가 onClick 을 호출하므로 함께 갱신된다.
+  const tabs = [
+    {
+      label: '이미지생성',
+      content: (isActive: boolean) => (
+        <QueueControl type="scene" isActive={isActive} showPannel />
+      ),
+      emoji: <FaImages />,
+      onClick: () => {
+        appState.curMainTab = 'scene';
+      },
+    },
+    {
+      label: '이미지변형',
+      content: (isActive: boolean) => (
+        <QueueControl type="inpaint" isActive={isActive} showPannel />
+      ),
+      emoji: <FaPenFancy />,
+      onClick: () => {
+        appState.curMainTab = 'inpaint';
+      },
+    },
+    {
+      label: '글로벌 프리셋',
+      content: <GlobalPresetTab />,
+      emoji: <ActionIcon id="global-presets" />,
+      banToggle: true,
+      onClick: () => {
+        appState.curMainTab = 'other';
+      },
+    },
+    {
+      label: '작가 라이브러리',
+      content: <ArtistLibraryTab />,
+      emoji: <FaPalette />,
+      banToggle: true,
+      onClick: () => {
+        appState.curMainTab = 'other';
+      },
+    },
+    {
+      // NAI풍 즉시 생성 화면. banToggle 미설정 → 모바일에서 공용 "프롬프트 열기" 사용
+      label: '퀵 생성',
+      // isActive: 모바일 V2 에서 활성일 때만 하단 바 자리를 [생성][해상도]로 쓴다
+      content: (isActive: boolean) => <QuickModeTab isActive={isActive} />,
+      emoji: <FaBolt />,
+      onClick: () => {
+        appState.curMainTab = 'other';
+      },
+    },
+    ...(!isMobile
+      ? [
+          {
+            label: '웹 검색',
+            content: <EmbeddedBrowser />,
+            emoji: <FaGlobe />,
+            banToggle: true,
+            onClick: () => {
+              appState.curMainTab = 'other';
+            },
+          },
+        ]
+      : []),
+  ];
+  // Main TabComponent owns default selection and pending history navigation together.
+
+  // 모바일 키보드 위 칩(Danbooru 검색·가중치 조정)은 MobileKeyboardChip 으로 분리(2026-09-26).
+  // 텍스트 드래그 → "Danbooru로 검색"
+  const goDanbooruSearch = useCallback(
+    (text: string) => {
+      const url = buildDanbooruSearchUrl(text);
+      if (!url) return;
+      if (isMobile) {
+        // 모바일: 기본 브라우저로 열기
+        backend.openWebPage(url);
+        return;
+      }
+      // PC: 앱 내 웹 검색 탭으로 전환 후 danbooru 검색 페이지로 이동
+      window.dispatchEvent(
+        new CustomEvent('danbooru-navigate', { detail: { url } }),
+      );
+      window.dispatchEvent(
+        new CustomEvent('shortcut-action', {
+          detail: { action: `tab-${tabs.length}` },
+        }),
+      );
+    },
+    [tabs.length],
+  );
+
+  useEffect(() => {
+    // PC: 메인 프로세스 컨텍스트 메뉴에서 IPC로 선택 텍스트 전달
+    const removeIpc = backend.onDanbooruSearch((text: string) =>
+      goDanbooruSearch(text),
+    );
+    // 앱 내부(작가 라이브러리 카드 등)에서 직접 요청하는 danbooru 검색
+    const handleRequest = (e: Event) => {
+      const text = (e as CustomEvent).detail?.text;
+      if (text) goDanbooruSearch(text);
+    };
+    window.addEventListener('danbooru-search-request', handleRequest);
+    return () => {
+      removeIpc();
+      window.removeEventListener('danbooru-search-request', handleRequest);
+    };
+  }, [goDanbooruSearch]);
+
+  // 레이아웃 템플릿 해석은 렌더당 1회 — observer 라 uiLayoutTemplate 변경 시 자동 재렌더된다.
+  // 모바일은 resolveLayout 내부에서 항상 classic('bottom') 강제.
+  const resolvedLayout = resolveLayout(
+    appState.uiLayoutTemplate,
+    isMobile,
+    appState.uiLayoutSlots,
+  );
+  const bottomBarPlacement = resolvedLayout.bottomBar;
+
+  // 슬롯 기반 좌/우 전환은 CSS order 유틸로만 처리한다(SPEC_GUIDE §6-2 계약).
+  // DOM 순서·부모·key 는 절대 바꾸지 않아 콘텐츠 상태 유실(재마운트)을 막는다.
+  //  - 중앙 콘텐츠: 항상 order-2 고정
+  //  - 왼쪽(기본): 프리셋 order-1, 스플리터 order-1(동순위 → DOM 순서상 프리셋 뒤=사이),
+  //    결과 프리셋 | 스플리터 | 중앙.
+  //  - 오른쪽: 프리셋 order-4, 스플리터 order-3 → 중앙(2) | 스플리터(3) | 프리셋(4).
+  //    스플리터는 항상 프리셋의 "중앙 쪽" 모서리에 인접(스플리터·프리셋 형제 관계 유지).
+  //  - 히스토리 패널: 바깥 행에서 별도 처리(아래 ImageHistoryPanel order 참고)
+  // 모바일에서는 프리셋 패널/스플리터가 md:hidden·md:flex 로 미렌더되므로 order 는 영향 없음.
+  const presetRight = resolvedLayout.presetSide === 'right';
+  // 프리셋 도크(패널+스플리터)는 바깥 flex 레벨의 형제로 배치되고, 좌/우는 이 래퍼의
+  // CSS order 로만 바뀐다(아래 배치부). 도크 내부는 스플리터가 항상 "중앙 쪽" 모서리에
+  // 오도록 방향을 뒤집는다(reversed 로 드래그 델타·접기 화살표도 반전).
+  const presetDock = appState.curSession ? (
+    <div
+      className={
+        // zone-card(아래 패널): 구역 카드화 마감(App.css) — 캔버스 배경은 도크 행이 담당
+        `flex-none hidden md:flex h-full ${
+          presetRight ? 'flex-row-reverse' : 'flex-row'
+        }`
+      }
+      style={{ order: dockOrder(resolvedLayout.presetSide, DOCK_RANK.preset) }}
+    >
+      {!appState.leftPanelCollapsed && (
+        <div
+          data-slot="preset"
+          // panel-vw-clamp(App.css): 좁은 창(<1024, W6 후속)에서만 뷰포트 비례
+          // 상한을 걸어 좌우 패널이 중앙을 완전히 삼키지 않게 한다. 저장된 폭은
+          // 그대로라 창을 넓히면 복원. (min-width 250 이 상한보다 우선)
+          style={{ width: appState.leftPanelWidth, minWidth: 250 }}
+          className="panel-vw-clamp zone-card flex-none overflow-hidden h-full"
+        >
+          <div className="h-full w-full overflow-hidden">
+            <PreSetEditor
+              key={appState.curSession.name}
+              middlePromptMode={false}
+            />
+          </div>
+        </div>
+      )}
+      {/* 접힌 동안엔 항상 존재하는 스플리터를 편집 배지 마커로 대신 쓴다
+          (펼친 상태에선 위 프리셋 div 가 마커라 여기엔 부여하지 않음 — 중복 방지). */}
+      <div
+        data-slot={appState.leftPanelCollapsed ? 'preset' : undefined}
+        className="flex-none flex"
+      >
+        <ResizableSplitter reversed={presetRight} />
+      </div>
+    </div>
+  ) : null;
+
+  // 중앙 탭 콘텐츠만 담는다(프리셋·스플리터는 presetDock 로 분리됨 — 리마운트 방지 위해
+  // key·부모 체인은 그대로 유지).
+  const mainStackContent = (
+    <StackGrow className="flex">
+      {appState.curSession && (
+        <StackGrow>
+          <TabComponent
+            key={appState.curSession.name}
+            navigationSession={appState.curSession.name}
+            tabs={tabs}
+            toggleView={
+              <PreSetEditor
+                key={`${appState.curSession.name}2`}
+                middlePromptMode={false}
+              />
+            }
+          />
+        </StackGrow>
+      )}
+    </StackGrow>
+  );
+
+  return (
+    <DndProvider
+      backend={isMobile ? TouchBackend : HTML5Backend}
+      options={{
+        enableTouchEvents: true,
+        enableMouseEvents: false,
+        delayTouchStart: 400,
+      }}
+    >
+      <div
+        data-app-theme-root
+        className={`flex flex-col relative h-screen w-screen ${
+          darkMode ? 'dark' : ''
+        }${trueDark && darkMode ? ' true-dark' : ''}`}
+        style={
+          {
+            backgroundColor: 'var(--c-surface)',
+            ...themeOverrides,
+          } as React.CSSProperties
+        }
+      >
+        <div className="z-[var(--z-dnd-preview)]">
+          <DnDPreview />
+        </div>
+        {isMobile && <MobileKeyboardChip onSearch={goDanbooruSearch} />}
+        <ErrorBoundary
+          onErr={(error, _errorInfo) => {
+            appState.pushMessage(`${error.message}`, 'error');
+          }}
+        >
+          {/* 부팅 게이트: bootstrapApp() 완료 전에는 메인 UI 를 마운트하지 않아
+              "서비스 준비 전 사용" 류 race 를 원천 차단한다 (완료 후 항상 열림) */}
+          {!appState.bootReady ? (
+            <div className="flex-1 h-full w-full flex flex-col items-center justify-center gap-3">
+              <div className="w-8 h-8 rounded-full border-2 border-[color:var(--c-line)] border-t-sky-500 animate-spin" />
+              <div className="text-sub text-sm whitespace-pre-line text-center px-6">
+                {appState.bootStatusMessage || 'SDStudio 시작 중…'}
+              </div>
+              {/* [안드로이드 11+] 모든 파일 접근 대기 — 권한 없이 진행하면 기존
+                  데이터가 숨어 "증발"처럼 보이므로 허용 전엔 부팅을 차단한다 */}
+              {appState.storagePermissionBlocked && (
+                <div className="flex flex-col items-center gap-3 px-6 max-w-md">
+                  <p className="text-xs text-muted text-center whitespace-pre-line">
+                    안드로이드 보안 정책상 &ldquo;모든 파일 접근&rdquo;을
+                    허용해야 기존 프로젝트·이미지를 읽을 수 있습니다.{'\n'}
+                    데이터는 사라지지 않았습니다 — 허용하면 그대로 표시됩니다.
+                  </p>
+                  <button
+                    type="button"
+                    className="px-4 py-2 rounded-lg text-sm font-medium btn-solid-sky"
+                    onClick={() => {
+                      openStoragePermissionSettings().catch(() => {});
+                    }}
+                  >
+                    설정 열기
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : (
+            <VerticalStack>
+              {!isMobile && (
+                <StackFixed>
+                  <TobBar />
+                </StackFixed>
+              )}
+              {/* zone-canvas: 구역 카드화(D) — 도크 행을 캔버스 배경+여백으로, 각 구역은
+                zone-card 로 라운딩 카드화(App.css, PC 새 마감 전용). 클래식/모바일 무변화. */}
+              <StackGrow className="zone-canvas flex scene-selection-surface">
+                {/* 도크 행: [히스토리 도크]와 [넓은 앵커(프로젝트/프리셋/중앙)]가 형제다.
+                  FloatView 가 덮는 범위는 창 배치 옵션(uiFloatViewMode)에 따른다 —
+                  'cover'(기본)는 넓은 앵커에 포털로 붙어 프로젝트/프리셋 패널 위까지
+                  덮고, 히스토리 도크는 앵커 밖(형제)이라 뷰어 옆에 그대로 남아 항상
+                  접근 가능(v4.14.0 동작). 'center'는 중앙 콘텐츠 블록만 덮는다.
+                  좌/우 배치는 각 래퍼의 CSS order(dockOrder)로만 바꾼다 —
+                  DOM 순서·부모·key 는 불변(재마운트 방지). 같은 쪽이면 가장자리부터
+                  프로젝트<프리셋 순으로 겹치고(rank 강제), 히스토리는 앵커 밖이라
+                  같은 쪽에 두면 항상 최외곽(가장자리 쪽)에 온다. */}
+                {/* 넓은 앵커 — 창 배치 'cover' 오버레이의 경계. order 0 (히스토리 도크의
+                  ±1 과 경쟁해 좌/우가 정해진다). */}
+                <div
+                  id={FLOAT_VIEW_WIDE_ANCHOR_ID}
+                  className="relative flex-1 min-w-0 h-full flex"
+                  style={{ order: 0 }}
+                >
+                  {/* 프로젝트 사이드 바(PC): 'sidebar' 템플릿에서만. 세션이 없어도 렌더. */}
+                  {!isMobile && resolvedLayout.projectSidebar && (
+                    <div
+                      data-slot="project"
+                      className="flex-none hidden md:flex h-full"
+                      style={{
+                        order: dockOrder(
+                          resolvedLayout.projectSide,
+                          DOCK_RANK.project,
+                        ),
+                      }}
+                    >
+                      <ProjectSideBar side={resolvedLayout.projectSide} />
+                    </div>
+                  )}
+                  {/* 프로젝트 얇은 스트립(PC): 'modern' 템플릿에서만 — 클릭=드로어 열기. */}
+                  {!isMobile && resolvedLayout.projectStrip && (
+                    <div
+                      data-slot="project"
+                      className="flex-none hidden md:flex h-full"
+                      style={{
+                        order: dockOrder(
+                          resolvedLayout.projectSide,
+                          DOCK_RANK.project,
+                        ),
+                      }}
+                    >
+                      <ProjectStrip side={resolvedLayout.projectSide} />
+                    </div>
+                  )}
+                  {/* 프리셋 도크(PC) — 패널+스플리터 */}
+                  {presetDock}
+                  {/* 중앙 콘텐츠 블록(콘텐츠+FloatView+오버레이 드로어들) — order 0 */}
+                  <div
+                    className="zone-card relative flex-1 min-w-0 h-full"
+                    style={{ order: 0 }}
+                  >
+                    <FloatViewProvider>
+                      <AppContextMenu />
+                      <ProjectDrawer />
+                      {isMobile && <ImageHistoryDrawer />}
+                      {isMobile && <ImageHistoryHandle />}
+                      {/* 모바일은 레이아웃과 무관하게 좌측 손잡이+가장자리 스와이프(히스토리 손잡이의 좌우 반전) */}
+                      {isMobile && <ProjectDrawerHandle />}
+                      {appState.projectBrowserOpen && (
+                        <ProjectBrowser
+                          onClose={() => {
+                            appState.projectBrowserOpen = false;
+                          }}
+                        />
+                      )}
+                      <div className="h-full w-full flex flex-col overflow-hidden">
+                        {isMobile && (
+                          <div data-no-scene-drag className="flex-none">
+                            <TobBar />
+                          </div>
+                        )}
+                        {/* 하단바(bottom)는 PC 에선 이 중앙 블록 밖(VerticalStack 최하단)에서
+                      전폭으로 렌더된다 — 좌/우 도크 펼침과 무관하게 항상 하단 전체를
+                      차지(클래식 복원). 모바일은 도크가 없어 전폭이 동일하므로 기존
+                      위치(FloatView 가 덮는 영역 안)를 유지한다. */}
+                        <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                          {mainStackContent}
+                          {isMobile && bottomBarPlacement !== 'none' && (
+                            <div data-no-scene-drag className="contents">
+                              <BottomBar
+                                placement={bottomBarPlacement}
+                                genControl={resolvedLayout.genControl}
+                                projectSidebar={resolvedLayout.projectSidebar}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      {appState.externalImage && (
+                        <FloatView
+                          onEscape={() => {
+                            appState.closeExternalImage();
+                          }}
+                          priority={1}
+                        >
+                          <ExternalImageView
+                            image={appState.externalImage}
+                            scene={appState.externalImageScene}
+                            onClose={() => {
+                              appState.closeExternalImage();
+                            }}
+                          />
+                        </FloatView>
+                      )}
+                    </FloatViewProvider>
+                  </div>
+                </div>
+                {/* 히스토리 도크 — 넓은 앵커 밖(행 직속 형제)이라 창 배치 'cover'의
+                  뷰어가 떠도 옆에 그대로 남아 항상 접근 가능. 좌/우는 dockOrder(rank 3,
+                  앵커의 order 0 과 경쟁해 ±1)로만. 래퍼 상시 존재라 패널 인스턴스
+                  재마운트 없음. hidden md:flex 라 모바일은 기존대로 미렌더. */}
+                <div
+                  data-slot="history"
+                  className="flex-none hidden md:flex h-full"
+                  style={{
+                    order: dockOrder(
+                      resolvedLayout.historySide,
+                      DOCK_RANK.history,
+                    ),
+                  }}
+                >
+                  <ImageHistoryPanel />
+                </div>
+              </StackGrow>
+              {/* PC 하단바: 도크 행(StackGrow)의 형제 — 좌/우 패널 상태와 무관하게
+                항상 창 전폭을 꽉 채운다. FloatView 는 어느 창 배치에서도 도크 행
+                밖을 덮지 않으므로 뷰어가 떠 있어도 하단바는 접근 가능. */}
+              {!isMobile && bottomBarPlacement !== 'none' && (
+                <BottomBar
+                  placement={bottomBarPlacement}
+                  genControl={resolvedLayout.genControl}
+                  projectSidebar={resolvedLayout.projectSidebar}
+                />
+              )}
+            </VerticalStack>
+          )}
+        </ErrorBoundary>
+        {/* 저장소 v2 마이그레이션 게이트 — 활성 시 부팅 스피너 포함 전체를 덮는다
+            (bootReady 이전 실행). 스펙: track1-b-migration-spec.md §4. */}
+        <MigrationGate />
+        {/* 저장 경로 폴백 가드 — 지정 저장 폴더 접근 불가 시 확인 전까지 메인을
+            가린다(폴백 세션은 마이그레이션이 보류되므로 MigrationGate 와 동시에
+            뜨지 않는다). */}
+        <SaveLocationGate />
+        {/* 분리형 생성 컨트롤 위젯 (PC 전용).
+            분리 상태이거나, 컴팩트 템플릿(하단바 없음)이면 항상 플로팅으로 표시.
+            단 자체 실행 컨트롤을 가진 오버레이(인페인트 편집기 등)가 떠 있으면
+            숨긴다 — 위젯(z-widget)이 FloatView(z-float-view)보다 위라 실행 버튼이
+            2개 노출되기 때문(BottomBar 의 genDetached 가드와 동일 이유). */}
+        {!isMobile &&
+          appState.genControlOverlayCount === 0 &&
+          (appState.genWidget.detached ||
+            bottomBarPlacement === 'none' ||
+            resolvedLayout.genControl === 'floating') && <GenControlFloating />}
+        {/* 편집 모드 셸(PC 전용). 진입점이 PC 전용이지만 만약을 위해 !isMobile 가드. */}
+        {!isMobile && appState.editMode && <EditModeShell />}
+        {/* 내보내기 진행 플로팅 위젯 (비차단형) */}
+        {appState.exportProgress && (
+          <div className="fixed bottom-16 right-4 z-[var(--z-widget)] bg-[var(--c-surface-2)] rounded-lg shadow-xl border line-color p-3 min-w-[220px]">
+            {appState.exportProgress.completed ? (
+              // 완료 상태(PC): 진행바 대신 완료 표시 + 확인 버튼. 15초 후 자동 소멸.
+              <div className="flex items-center gap-2">
+                <span className="flex-none text-green-500 text-lg">✓</span>
+                <span className="flex-1 text-sm font-medium text-default">
+                  {appState.exportProgress.text}
+                </span>
+                <button
+                  type="button"
+                  className="round-button back-gray flex-none text-sm px-3 h-8"
+                  onClick={() => appState.dismissExportComplete()}
+                >
+                  확인
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="text-sm font-medium text-default mb-1.5">
+                  💾 {appState.exportProgress.text}
+                </div>
+                <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-sky-500 rounded-full transition-all"
+                    style={{
+                      width: `${(appState.exportProgress.done / Math.max(appState.exportProgress.total, 1)) * 100}%`,
+                    }}
+                  />
+                </div>
+                <div className="text-xs text-muted mt-1">
+                  {appState.exportProgress.done}/{appState.exportProgress.total}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        <AlertWindow />
+        <ConfirmWindow />
+        <ExpiredProjectsDialog />
+        <GlobalPresetPickerOverlay />
+        {appState.progressDialog && (
+          <ProgressWindow dialog={appState.progressDialog} />
+        )}
+        <PromptTooltip />
+        <ModalOverlay
+          isOpen={appState.pieceEditorOpen}
+          onClose={() => appState.closePieceEditor()}
+          title="프롬프트조각"
+          width="max-w-3xl"
+        >
+          {appState.curSession && <PieceEditor />}
+        </ModalOverlay>
+        <FindReplaceDialog />
+        <ModalOverlay
+          isOpen={appState.projectTrashOpen}
+          onClose={() => appState.closeProjectTrash()}
+          title="🗑️ 프로젝트 휴지통"
+        >
+          <ProjectTrashView />
+        </ModalOverlay>
+        {/* 씬 휴지통·아티스트 태깅 — B군 승격(퀵 메뉴 P2) 전역 오버레이 호스트 */}
+        <ModalOverlay
+          isOpen={appState.sceneTrashOpen && !!appState.curSession}
+          onClose={() => {
+            appState.sceneTrashOpen = false;
+          }}
+          title="🗑️ 씬 휴지통"
+        >
+          {appState.curSession && (
+            <SceneTrashView projectName={appState.curSession.name} />
+          )}
+        </ModalOverlay>
+        {appState.artistTagOpen && (
+          <ArtistTagModal
+            isOpen={appState.artistTagOpen}
+            onClose={() => {
+              appState.artistTagOpen = false;
+            }}
+          />
+        )}
+        {/* 퀵 메뉴 — 플로팅 진입 버튼 + 오버레이 (트랙2 ① P3) */}
+        <QuickMenu />
+        {appState.characterPresetsOpen && appState.curSession && (
+          <CharacterPresetFloatEditor
+            onClose={() => appState.closeCharacterPresets()}
+            onApplyPreset={(preset, mode) =>
+              appState.applyCharacterPreset(preset, mode)
+            }
+          />
+        )}
+        {/* 씬 템플릿 관리 (씬 템플릿 개편 — 숨김 템플릿의 유일한 관리 지점) */}
+        {appState.sceneTemplateManagerOpen && (
+          <SceneTemplateManager
+            onClose={() => {
+              appState.sceneTemplateManagerOpen = false;
+            }}
+          />
+        )}
+        <ExportPresetManager />
+        <DirectExportDialog />
+        {/* Google 드라이브 백업 관리 창·환경설정 불러오기 미리보기(드라이브 API ③) — 다른 모달·드로어
+            위(--z-modal-top). 미리보기가 관리 창 위에 오도록 이 순서를 지킨다. */}
+        <DriveBackupManagerHost />
+        <ConfigImportPreviewHost />
+        <AppUpdateDialog />
+        {dragOverlay && (
+          <div
+            className="fixed inset-0 z-[var(--z-drag-overlay)] flex items-center justify-center pointer-events-none"
+            style={{ backgroundColor: 'rgba(0, 0, 0, 0.5)' }}
+          >
+            <div className="bg-[var(--c-surface-2)] rounded-2xl r-modal px-8 py-6 shadow-2xl border-2 border-dashed border-sky-400 dark:border-sky-500 flex flex-col items-center gap-3">
+              <svg
+                className="w-12 h-12 text-sky-500"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.5}
+                  d="M12 4v12m0 0l-4-4m4 4l4-4M4 18h16"
+                />
+              </svg>
+              <p className="text-lg font-semibold text-default">
+                여기에 드랍하세요
+              </p>
+              <p className="text-sm text-muted">{dragOverlay}</p>
+            </div>
+          </div>
+        )}
+      </div>
+    </DndProvider>
+  );
+});

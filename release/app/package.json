@@ -1,0 +1,27 @@
+{
+  "name": "sdstudio-cupcake",
+  "productName": "SDStudio Cupcake",
+  "version": "6.1.0-cupcake.1",
+  "description": "SDStudio · Cupcake 포크",
+  "license": "MIT",
+  "author": {
+    "name": "sunho",
+    "email": "ksunhokim123@gmail.com",
+    "url": "https://sunho.io"
+  },
+  "main": "./dist/main/main.js",
+  "scripts": {
+    "rebuild": "node -r ts-node/register ../../.erb/scripts/electron-rebuild.js",
+    "postinstall": "npm run rebuild && npm run link-modules",
+    "link-modules": "node -r ts-node/register ../../.erb/scripts/link-modules.ts"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "exiftool-vendored": "^27.0.0",
+    "gunzip-maybe": "^1.4.2",
+    "onnxruntime-node": "^1.26.0",
+    "sdsnative": "file:../../src/native",
+    "sharp": "0.35.5",
+    "tar-fs": "^3.0.6"
+  }
+}

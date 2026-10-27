@@ -1,0 +1,714 @@
+import * as React from 'react';
+import { useEffect, useState } from 'react';
+import { observer } from 'mobx-react-lite';
+import { useDrag, useDrop } from 'react-dnd';
+import {
+  FaCheck,
+  FaEdit,
+  FaFolder,
+  FaFont,
+  FaPen,
+  FaTrash,
+  FaUserAlt,
+} from 'react-icons/fa';
+import { ActionIcon } from './ActionIcon';
+import Tooltip from './Tooltip';
+import type { CharacterPreset } from '../models/types';
+import { imageService, globalCharacterPresetService } from '../models';
+import { appState } from '../models/AppService';
+import type { IGlobalCharacterPresetEntry } from '../models/GlobalCharacterPresetService';
+
+// CharacterPresetEditor.tsx 에서 분리된 카드/이미지 표시 계열.
+// 프리셋 편집기의 이미지 저장/표시 백엔드 (로컬=세션 디렉터리, 글로벌=글로벌 디렉터리)
+export interface PresetImageBackend {
+  storeVibe: (base64: string) => Promise<string>;
+  storeReference: (base64: string) => Promise<string>;
+  vibePath: (token: string) => string;
+  referencePath: (token: string) => string;
+}
+
+export const makeSessionImageBackend = (session: any): PresetImageBackend => ({
+  storeVibe: (b) => imageService.storeVibeImage(session, b),
+  storeReference: (b) => imageService.storeReferenceImage(session, b),
+  vibePath: (t) => imageService.getVibeImagePath(session, t),
+  referencePath: (t) => imageService.getReferenceImagePath(session, t),
+});
+
+export const globalImageBackend: PresetImageBackend = {
+  storeVibe: (b) => globalCharacterPresetService.storeVibeForEditor(b),
+  storeReference: (b) =>
+    globalCharacterPresetService.storeReferenceForEditor(b),
+  vibePath: (t) => globalCharacterPresetService.getImagePath(t),
+  referencePath: (t) => globalCharacterPresetService.getImagePath(t),
+};
+
+// ─── 바이브 이미지 컴포넌트 ────────────────────────────────────
+export function VibeImage({
+  path,
+  onClick,
+  className,
+}: {
+  path: string;
+  onClick?: (e?: React.MouseEvent) => void;
+  className: string;
+}) {
+  const [image, setImage] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    let revision = 0;
+    setImage(null);
+    const fetchImage = async () => {
+      const currentRevision = ++revision;
+      try {
+        const data = await imageService.fetchImageSmall(path, 400);
+        if (active && currentRevision === revision) setImage(data);
+      } catch (error) {
+        if (active && currentRevision === revision) {
+          setImage(null);
+          console.error('Could not load preset preview', error);
+        }
+      }
+    };
+    void fetchImage();
+    const handler = (event: any) => {
+      if (event.detail.path === path) void fetchImage();
+    };
+    imageService.addEventListener('image-cache-invalidated', handler);
+    return () => {
+      active = false;
+      imageService.removeEventListener('image-cache-invalidated', handler);
+    };
+  }, [path]);
+  const preview = image ? (
+    <img
+      className={className}
+      src={image}
+      alt="프리셋 이미지"
+      draggable={false}
+    />
+  ) : (
+    <span
+      className={`${className} flex items-center justify-center bg-[var(--c-surface)] border line-color`}
+    >
+      <span className="text-xs text-muted text-center px-1 select-none">
+        NO IMAGE
+      </span>
+    </span>
+  );
+  if (!onClick) return preview;
+  return (
+    <button
+      type="button"
+      className="inline-flex flex-none p-0 overflow-hidden"
+      aria-label="프리셋 이미지 선택"
+      onClick={onClick}
+    >
+      {preview}
+    </button>
+  );
+}
+
+// ─── 카드용 대표 이미지 (폴백 체인) ────────────────────────────
+const CardImage = observer(
+  ({ preset, className }: { preset: CharacterPreset; className: string }) => {
+    const { curSession } = appState;
+    const imagePath = (() => {
+      if (!curSession) return null;
+      // 1. 직접 설정한 대표 이미지
+      if (preset.representativeImage) {
+        return imageService.getVibeImagePath(
+          curSession,
+          preset.representativeImage,
+        );
+      }
+      // 2. 첫 번째 캐릭터 레퍼런스
+      if (preset.characterReferences.length > 0) {
+        return imageService.getReferenceImagePath(
+          curSession,
+          preset.characterReferences[0].path,
+        );
+      }
+      // 3. 첫 번째 바이브
+      if (preset.vibes.length > 0) {
+        return imageService.getVibeImagePath(curSession, preset.vibes[0].path);
+      }
+      return null;
+    })();
+
+    if (imagePath) {
+      return <VibeImage path={imagePath} className={className} />;
+    }
+
+    // 4. 플레이스홀더
+    return (
+      <div
+        className={`${
+          className
+        } flex flex-col items-center justify-center bg-[var(--c-surface)]`}
+      >
+        <FaUserAlt className="text-3xl text-faint mb-1" />
+        <span className="text-xs text-faint truncate max-w-full px-2">
+          {preset.name}
+        </span>
+      </div>
+    );
+  },
+);
+
+// ─── 프리셋 카드 ──────────────────────────────────────────────
+interface CharacterPresetCardProps {
+  preset: CharacterPreset;
+  index: number;
+  onEdit: () => void;
+  onDelete: () => void;
+  onApplyEasy: () => void;
+  onApplyCharacter: () => void;
+  onDuplicate: () => void;
+  onMove: (fromIndex: number, toIndex: number) => void;
+  onCopyToGlobal?: () => void;
+  isEasyMode: boolean;
+  hideActions?: boolean;
+  selectionMode?: boolean;
+  selected?: boolean;
+}
+
+export const CharacterPresetCard = observer(
+  ({
+    preset,
+    index,
+    onEdit,
+    onDelete,
+    onApplyEasy,
+    onApplyCharacter,
+    onDuplicate,
+    onMove,
+    onCopyToGlobal,
+    isEasyMode,
+    hideActions,
+    selectionMode = false,
+    selected = false,
+  }: CharacterPresetCardProps) => {
+    const ref = React.useRef<HTMLDivElement>(null);
+
+    const [{ isDragging }, drag] = useDrag(
+      () => ({
+        type: 'character-preset-card',
+        item: { index },
+        collect: (monitor) => ({
+          isDragging: monitor.isDragging(),
+        }),
+      }),
+      [index],
+    );
+
+    const [{ isOver }, drop] = useDrop(
+      () => ({
+        accept: 'character-preset-card',
+        drop: (item: { index: number }) => {
+          if (item.index !== index) {
+            onMove(item.index, index);
+            item.index = index;
+          }
+        },
+        collect: (monitor) => ({
+          isOver: monitor.isOver(),
+        }),
+      }),
+      [index, onMove],
+    );
+
+    drag(drop(ref));
+
+    return (
+      <div
+        ref={ref}
+        className={`group relative rounded-lg bg-[var(--c-surface-2)] border-2 overflow-hidden cursor-pointer transition-all hover:shadow-lg ${
+          isDragging ? 'opacity-30 ' : ''
+        }${isOver ? 'border-sky-400 ring-2 ring-sky-400 ' : 'line-color '}`}
+      >
+        {/* 이미지 영역 (탭/클릭 = 편집. 편집 버튼은 제거하고 카드 탭으로 통일) */}
+        <button
+          type="button"
+          className="relative block w-full overflow-hidden aspect-[3/4] text-left"
+          aria-label={
+            selectionMode ? `${preset.name} 선택` : `${preset.name} 편집`
+          }
+          aria-pressed={selectionMode ? selected : undefined}
+          onClick={onEdit}
+        >
+          <CardImage preset={preset} className="w-full h-full object-cover" />
+          {/* 호버 오버레이 (PC: 호버 시, 모바일: 상단만 상시) */}
+          <div className="absolute inset-0 bg-black/0 md:group-hover:bg-black/40 transition-colors duration-200 pointer-events-none" />
+          {/* 편집 힌트: 카드 탭/클릭 = 편집. 매우 흐릿한 편집 아이콘 (장식용, 순차 생성 모드 제외) */}
+          {!hideActions && (
+            <FaEdit
+              size={30}
+              className="absolute left-1/2 bottom-14 -translate-x-1/2 text-white/30 drop-shadow pointer-events-none z-10"
+            />
+          )}
+          {/* 그라디언트 텍스트 오버레이 */}
+          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent px-2.5 pt-6 pb-2">
+            <div className="text-sm text-white font-medium drop-shadow truncate">
+              {preset.name}
+            </div>
+            <div className="text-xs text-white/70 drop-shadow">
+              {appState.appliedCharacterPresetNames.includes(preset.name) && (
+                <span className="text-green-300 font-semibold mr-1">
+                  ✓ 적용됨
+                </span>
+              )}
+              {preset.vibes.length > 0 && `V:${preset.vibes.length}`}
+              {preset.vibes.length > 0 &&
+                preset.characterReferences.length > 0 &&
+                ' '}
+              {preset.characterReferences.length > 0 &&
+                `R:${preset.characterReferences.length}`}
+              {preset.vibes.length === 0 &&
+                preset.characterReferences.length === 0 &&
+                '이미지 없음'}
+            </div>
+          </div>
+        </button>
+        {/* 액션 버튼 (PC: 호버 시 표시, 모바일: 항상 표시, 순차 생성 모드: 숨김) */}
+        {!hideActions && (
+          <div className="absolute top-0 left-0 right-0 flex justify-center items-center gap-1 z-20 py-1.5 md:opacity-0 md:group-hover:opacity-100 transition-opacity duration-200">
+            {isEasyMode && (
+              <Tooltip content="이지모드 적용">
+                <button
+                  type="button"
+                  className="w-8 h-8 rounded-full btn-solid-sky flex items-center justify-center shadow-lg transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onApplyEasy();
+                  }}
+                >
+                  <FaFont size={12} />
+                </button>
+              </Tooltip>
+            )}
+            <Tooltip content="캐릭터 프롬프트 적용">
+              <button
+                type="button"
+                className="w-8 h-8 rounded-full btn-solid-yellow flex items-center justify-center shadow-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onApplyCharacter();
+                }}
+              >
+                <FaUserAlt size={12} />
+              </button>
+            </Tooltip>
+            <Tooltip content="복제">
+              <button
+                type="button"
+                className="w-8 h-8 rounded-full btn-solid-orange flex items-center justify-center shadow-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDuplicate();
+                }}
+              >
+                <ActionIcon id="duplicate" size={12} />
+              </button>
+            </Tooltip>
+            {onCopyToGlobal && (
+              <Tooltip content="글로벌로 복사">
+                <button
+                  type="button"
+                  className="w-8 h-8 rounded-full btn-solid-purple flex items-center justify-center shadow-lg transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCopyToGlobal();
+                  }}
+                >
+                  <ActionIcon id="copy-to-global" size={13} />
+                </button>
+              </Tooltip>
+            )}
+            <Tooltip content="삭제">
+              <button
+                type="button"
+                className="w-8 h-8 rounded-full btn-solid-red flex items-center justify-center shadow-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete();
+                }}
+              >
+                <FaTrash size={12} />
+              </button>
+            </Tooltip>
+          </div>
+        )}
+      </div>
+    );
+  },
+);
+
+// ─── 글로벌 폴더 필터 칩 (1단계 평면 폴더 — 배치 생성 P0) ──────
+//
+// [전체]+파생 폴더 목록+[미분류] 칩 행 — 캐릭터 프리셋 라이브러리와 일괄 생성
+// 위저드가 공유하는 단일 출처. 폴더가 하나도 없으면 렌더하지 않는다.
+// value: '__all__' | '__unfiled__' | 폴더명 (소멸 폴더 폴백은 호출측 소관).
+export const GlobalFolderFilterChips = observer(
+  ({
+    value,
+    onChange,
+    onRenameFolder,
+  }: {
+    value: string;
+    onChange: (v: string) => void;
+    // 지정 시 선택된 칩에 이름 변경 아이콘(모바일 대응)+우클릭 이름 변경 노출
+    onRenameFolder?: (folder: string) => void;
+  }) => {
+    const entries = globalCharacterPresetService.list();
+    const folders = globalCharacterPresetService.listFolders();
+    if (folders.length === 0) return null;
+    return (
+      <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+        <button
+          type="button"
+          className={`px-2.5 py-1 rounded-full text-xs whitespace-nowrap flex-none transition-colors ${
+            value === '__all__'
+              ? 'bg-purple-500 text-white'
+              : 'btn-neutral text-body'
+          }`}
+          onClick={() => onChange('__all__')}
+        >
+          전체 ({entries.length})
+        </button>
+        {folders.map((f) => {
+          const selected = value === f;
+          const count = entries.filter((e) => e.folder === f).length;
+          return (
+            <div
+              key={f}
+              className={`rounded-full text-xs whitespace-nowrap flex-none transition-colors flex items-center ${
+                selected ? 'bg-purple-500 text-white' : 'btn-neutral text-body'
+              }`}
+            >
+              <button
+                type="button"
+                className="px-2.5 py-1 flex items-center gap-1"
+                aria-pressed={selected}
+                onClick={() => onChange(f)}
+                onContextMenu={
+                  onRenameFolder
+                    ? (e) => {
+                        // 데스크톱: 우클릭으로 이름 변경
+                        e.preventDefault();
+                        onRenameFolder(f);
+                      }
+                    : undefined
+                }
+              >
+                <FaFolder size={10} />
+                {f} ({count})
+              </button>
+              {/* 선택된 칩에만 이름 변경 아이콘 노출 (롱프레스 불필요) */}
+              {selected && onRenameFolder && (
+                <button
+                  type="button"
+                  aria-label={`${f} 폴더 이름 변경`}
+                  className="mr-2 p-0.5 rounded hover:bg-white/20"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRenameFolder(f);
+                  }}
+                >
+                  <FaPen size={9} />
+                </button>
+              )}
+            </div>
+          );
+        })}
+        <button
+          type="button"
+          className={`px-2.5 py-1 rounded-full text-xs whitespace-nowrap flex-none transition-colors ${
+            value === '__unfiled__'
+              ? 'bg-purple-500 text-white'
+              : 'btn-neutral text-body'
+          }`}
+          onClick={() => onChange('__unfiled__')}
+        >
+          미분류 ({entries.filter((e) => !e.folder).length})
+        </button>
+      </div>
+    );
+  },
+);
+
+// ─── 글로벌 캐릭터 프리셋 카드 (보라색) ───────────────────────
+const GlobalCardImage = observer(
+  ({
+    entry,
+    className,
+  }: {
+    entry: IGlobalCharacterPresetEntry;
+    className: string;
+  }) => {
+    const [img, setImg] = useState<string | null>(null);
+    const { preset } = entry;
+    const file =
+      preset.representativeImage ||
+      preset.characterReferences?.[0]?.path ||
+      preset.vibes?.[0]?.path;
+    useEffect(() => {
+      let cancelled = false;
+      setImg(null);
+      (async () => {
+        if (!file) {
+          if (!cancelled) setImg(null);
+          return;
+        }
+        const data = await globalCharacterPresetService.fetchImageData(file);
+        if (!cancelled) setImg(data);
+      })().catch((error) => {
+        if (!cancelled) {
+          setImg(null);
+          console.error('Could not load global preset preview', error);
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [file]);
+    if (img) {
+      return (
+        <img
+          src={img}
+          alt={entry.name}
+          className={className}
+          draggable={false}
+        />
+      );
+    }
+    return (
+      <div
+        className={`${
+          className
+        } flex flex-col items-center justify-center bg-purple-50 dark:bg-purple-900/20`}
+      >
+        <FaUserAlt className="text-3xl text-purple-300 dark:text-purple-500 mb-1" />
+        <span className="text-xs text-purple-400 dark:text-purple-300 truncate max-w-full px-2">
+          {entry.name}
+        </span>
+      </div>
+    );
+  },
+);
+
+export const GlobalCharacterPresetCard = observer(
+  ({
+    entry,
+    index,
+    isEasyMode,
+    onApplyEasy,
+    onApplyCharacter,
+    onLoad,
+    onEdit,
+    onDuplicate,
+    onDelete,
+    onMove,
+    onMoveToFolder,
+    cyclingMode = false,
+    selected = false,
+    onToggleSelect,
+  }: {
+    entry: IGlobalCharacterPresetEntry;
+    index: number;
+    isEasyMode: boolean;
+    onApplyEasy: () => void;
+    onApplyCharacter: () => void;
+    onLoad: () => void;
+    onEdit: () => void;
+    onDuplicate: () => void;
+    onDelete: () => void;
+    onMove: (fromIndex: number, toIndex: number) => void;
+    // 폴더로 이동 (1단계 평면 폴더 — 배치 생성 P0)
+    onMoveToFolder?: () => void;
+    cyclingMode?: boolean;
+    selected?: boolean;
+    onToggleSelect?: () => void;
+  }) => {
+    const ref = React.useRef<HTMLDivElement>(null);
+    const [{ isDragging }, drag] = useDrag(
+      () => ({
+        type: 'global-character-preset-card',
+        item: { index },
+        collect: (monitor) => ({ isDragging: monitor.isDragging() }),
+      }),
+      [index],
+    );
+    const [{ isOver }, drop] = useDrop(
+      () => ({
+        accept: 'global-character-preset-card',
+        drop: (item: { index: number }) => {
+          if (item.index !== index) {
+            onMove(item.index, index);
+            item.index = index;
+          }
+        },
+        collect: (monitor) => ({ isOver: monitor.isOver() }),
+      }),
+      [index, onMove],
+    );
+    drag(drop(ref));
+
+    const p: any = entry.preset;
+    const vcount = p.vibes?.length || 0;
+    const rcount = p.characterReferences?.length || 0;
+    return (
+      <div
+        ref={ref}
+        className={`group relative rounded-lg bg-[var(--c-surface-2)] border-2 overflow-hidden transition-all hover:shadow-lg ${
+          isDragging ? 'opacity-30 ' : ''
+        }${
+          isOver
+            ? 'border-purple-400 ring-2 ring-purple-400 '
+            : 'border-purple-300 dark:border-purple-600 '
+        }`}
+      >
+        <div className="relative overflow-hidden aspect-[3/4]">
+          <button
+            type="button"
+            className="absolute inset-0 z-10 w-full h-full"
+            aria-label={
+              cyclingMode ? `${entry.name} 선택` : `${entry.name} 편집`
+            }
+            aria-pressed={cyclingMode ? selected : undefined}
+            onClick={() => {
+              if (cyclingMode) onToggleSelect?.();
+              else onEdit();
+            }}
+          />
+          <GlobalCardImage
+            entry={entry}
+            className="w-full h-full object-cover"
+          />
+          <div className="absolute inset-0 bg-black/0 md:group-hover:bg-black/40 transition-colors duration-200 pointer-events-none" />
+          {/* "글로벌" 코너 배지 제거 — 글로벌이 기본 화면이 되면서(주종 역전,
+            2026-07-16) 더 이상 구분 표기가 불필요. */}
+          {cyclingMode && (
+            <div
+              className="absolute top-2 right-2 z-30 pointer-events-none"
+              aria-hidden="true"
+            >
+              <div
+                className={`w-6 h-6 rounded border-2 flex items-center justify-center transition-colors ${
+                  selected
+                    ? 'bg-purple-500 border-purple-500 text-white'
+                    : 'bg-white/80 dark:bg-slate-800/80 line-color'
+                }`}
+              >
+                {selected && <FaCheck size={12} />}
+              </div>
+            </div>
+          )}
+          {/* 편집 힌트: 카드 탭/클릭 = 편집. 매우 흐릿한 편집 아이콘 (장식용, 순차 생성 모드 제외) */}
+          {!cyclingMode && (
+            <FaEdit
+              size={30}
+              className="absolute left-1/2 bottom-14 -translate-x-1/2 text-white/30 drop-shadow pointer-events-none z-10"
+            />
+          )}
+          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent px-2.5 pt-6 pb-2">
+            <div className="text-sm text-white font-medium drop-shadow truncate">
+              {entry.name}
+            </div>
+            <div className="text-xs text-white/70 drop-shadow truncate">
+              {appState.appliedCharacterPresetNames.includes(entry.name) && (
+                <span className="text-green-300 font-semibold mr-1">
+                  ✓ 적용됨
+                </span>
+              )}
+              {vcount > 0 && `V:${vcount}`}
+              {vcount > 0 && rcount > 0 && ' '}
+              {rcount > 0 && `R:${rcount}`}
+              {vcount === 0 && rcount === 0 && '이미지 없음'}
+              {entry.folder && ` · 📁${entry.folder}`}
+            </div>
+          </div>
+          <div
+            className={`absolute top-0 left-0 right-0 flex flex-wrap justify-center items-center gap-1 z-20 py-1.5 md:opacity-0 md:group-hover:opacity-100 transition-opacity duration-200 ${cyclingMode ? 'hidden' : ''}`}
+          >
+            {isEasyMode && (
+              <Tooltip content="프로젝트로 복사해 이지모드 적용">
+                <button
+                  type="button"
+                  className="w-8 h-8 rounded-full btn-solid-sky flex items-center justify-center shadow-lg transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onApplyEasy();
+                  }}
+                >
+                  <FaFont size={12} />
+                </button>
+              </Tooltip>
+            )}
+            <Tooltip content="프로젝트로 복사해 캐릭터 프롬프트 적용">
+              <button
+                type="button"
+                className="w-8 h-8 rounded-full btn-solid-yellow flex items-center justify-center shadow-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onApplyCharacter();
+                }}
+              >
+                <FaUserAlt size={12} />
+              </button>
+            </Tooltip>
+            <Tooltip content="프로젝트로 복사">
+              <button
+                type="button"
+                className="w-8 h-8 rounded-full btn-solid-purple flex items-center justify-center shadow-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onLoad();
+                }}
+              >
+                <ActionIcon id="copy-to-project" size={13} />
+              </button>
+            </Tooltip>
+            <Tooltip content="복제">
+              <button
+                type="button"
+                className="w-8 h-8 rounded-full btn-solid-orange flex items-center justify-center shadow-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDuplicate();
+                }}
+              >
+                <ActionIcon id="duplicate" size={12} />
+              </button>
+            </Tooltip>
+            {onMoveToFolder && (
+              <Tooltip content="폴더로 이동">
+                <button
+                  type="button"
+                  className="w-8 h-8 rounded-full btn-solid-indigo flex items-center justify-center shadow-lg transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMoveToFolder();
+                  }}
+                >
+                  <FaFolder size={12} />
+                </button>
+              </Tooltip>
+            )}
+            <Tooltip content="삭제">
+              <button
+                type="button"
+                className="w-8 h-8 rounded-full btn-solid-red flex items-center justify-center shadow-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete();
+                }}
+              >
+                <FaTrash size={12} />
+              </button>
+            </Tooltip>
+          </div>
+        </div>
+      </div>
+    );
+  },
+);

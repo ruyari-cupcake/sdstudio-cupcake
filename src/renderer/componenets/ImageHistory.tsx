@@ -1,0 +1,521 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { observer } from 'mobx-react-lite';
+import { useContextMenu } from 'react-contexify';
+import {
+  FaChevronLeft,
+  FaChevronRight,
+  FaSquare,
+  FaStar,
+  FaThLarge,
+  FaTimes,
+} from 'react-icons/fa';
+import { imageHistoryService, imageService, isMobile } from '../models';
+import type { GenerationHistoryEntry } from '../models/ImageHistoryService';
+import { appState } from '../models/AppService';
+import { resolveLayout } from '../models/layoutTemplates';
+import { backStackService } from '../models/BackStackService';
+import { ContextMenuType, type GenericScene } from '../models/types';
+import Tooltip from './Tooltip';
+import useTransitionPresence from './useTransitionPresence';
+import { toolbarDragUi } from './ToolbarDnd';
+import {
+  EDGE_SWIPE_ZONE,
+  shouldIgnoreEdgeSwipeAt,
+  canOpenDrawerBySwipe,
+} from '../models/edgeSwipe';
+
+// 최근 생성 이미지 히스토리 사이드바.
+// PC: 우측 밀어내기(push) 패널 — 펼치면 중앙 영역이 그만큼 줄어듦.
+// 모바일: 우측 오버레이 드로어 (ProjectDrawer의 우측 미러).
+
+const HistoryImageCell = observer(
+  ({
+    entry,
+    caption,
+    onClick,
+  }: {
+    entry: GenerationHistoryEntry;
+    caption: string;
+    onClick: () => void;
+  }) => {
+    const [image, setImage] = useState<string | undefined>(undefined);
+    // 출력 해상도 비율 반영용 (로드 전엔 1:1 자리표시) — 히스토리 엔트리에는
+    // 해상도 메타가 없어 이미지 실측(naturalWidth/Height)으로 얻는다
+    const [ratio, setRatio] = useState<number | undefined>(undefined);
+    // 즐겨찾기 표시용 scene (mobx 노드 — mains 변경 시 observer가 자동 갱신)
+    const [scene, setScene] = useState<GenericScene | undefined>(undefined);
+    const { show } = useContextMenu({ id: ContextMenuType.HistoryImage });
+
+    const imagePath = entry.path;
+    useEffect(() => {
+      let canceled = false;
+      setImage(undefined);
+      setRatio(undefined);
+      setScene(undefined);
+      (async () => {
+        try {
+          // 400px 썸네일: fastcache 사전 생성 크기라 추가 비용 없음 (200은 1열/고DPI에서 열화)
+          const base64 = await imageService.fetchImageSmall(imagePath, 400);
+          if (canceled) return;
+          if (!base64) {
+            // 파일이 사라진 항목은 히스토리에서 제거
+            imageHistoryService.remove(entry.id);
+            return;
+          }
+          setImage(base64);
+        } catch (error) {
+          if (!canceled) console.warn('히스토리 미리보기 읽기 실패:', error);
+        }
+      })();
+      imageHistoryService
+        .resolveQuiet(entry)
+        .then((r) => {
+          if (!canceled && r) setScene(r.scene);
+
+          return undefined;
+        })
+        .catch((error) => {
+          if (!canceled) console.warn('히스토리 씬 확인 실패:', error);
+        });
+      return () => {
+        canceled = true;
+      };
+    }, [entry, imagePath]);
+
+    const isFav = !!scene && scene.mains.includes(entry.filename);
+
+    return (
+      <button
+        type="button"
+        aria-label={`${caption} 즐겨찾기 전환`}
+        aria-pressed={isFav}
+        className="flex flex-col cursor-pointer select-none hover:brightness-95 active:brightness-90"
+        onClick={onClick}
+        onContextMenu={(e) => {
+          show({
+            event: e,
+            props: { ctx: { type: 'history_image', entry } },
+          });
+        }}
+      >
+        <div
+          className={`relative w-full rounded overflow-hidden bg-[var(--c-input-bg)] flex items-center justify-center${
+            isFav ? ' border-2 border-yellow-400' : ''
+          }`}
+          style={{ aspectRatio: ratio ?? 1 }}
+        >
+          {image && (
+            <img
+              src={image}
+              alt={caption}
+              draggable={false}
+              className="w-full h-full object-cover"
+              onLoad={(e) => {
+                const im = e.currentTarget;
+                if (im.naturalWidth > 0 && im.naturalHeight > 0) {
+                  setRatio(im.naturalWidth / im.naturalHeight);
+                }
+              }}
+            />
+          )}
+          {isFav && (
+            <div className="absolute left-0 top-0 z-10 text-yellow-400 m-1">
+              <FaStar size={12} />
+            </div>
+          )}
+        </div>
+        <div className="text-[10px] text-faint truncate text-center leading-tight mt-0.5 mb-1">
+          {caption}
+        </div>
+      </button>
+    );
+  },
+);
+
+// PC/모바일 공용 열 수 토글 버튼 (헤더용) — 클릭하면 1열↔2열 전환
+const HistoryColumnsToggle = observer(() => {
+  const cols = appState.historyColumns;
+  return (
+    <Tooltip content={cols === 2 ? '1열로 크게 보기' : '2열로 조밀하게 보기'}>
+      <button
+        type="button"
+        className="icon-button"
+        onClick={() => appState.toggleHistoryColumns()}
+      >
+        {cols === 2 ? <FaSquare size={13} /> : <FaThLarge size={13} />}
+      </button>
+    </Tooltip>
+  );
+});
+
+// PC/모바일 공용 목록 (1열/2열 그리드 토글, 최신순)
+const HistoryList = observer(() => {
+  const { entries } = imageHistoryService;
+  const cols = appState.historyColumns;
+
+  // 탭/클릭 = 즐겨찾기 토글 (씬 이동·그리드 열기는 우클릭/롱프레스 메뉴 전담)
+  const onClickEntry = (entry: GenerationHistoryEntry) => {
+    imageHistoryService.toggleFavorite(entry);
+  };
+
+  if (entries.length === 0) {
+    return (
+      <div className="flex-1 p-4 text-xs text-faint text-center">
+        아직 생성된 이미지가 없습니다
+      </div>
+    );
+  }
+  return (
+    <div
+      className={`flex-1 overflow-y-auto p-2 grid gap-1.5 content-start ${
+        cols === 2 ? 'grid-cols-2' : 'grid-cols-1'
+      }`}
+    >
+      {entries.map((entry) => (
+        <HistoryImageCell
+          key={entry.id}
+          entry={entry}
+          caption={
+            entry.sessionName !== appState.curSession?.name
+              ? `${entry.sessionName}/${entry.sceneName}`
+              : entry.sceneName
+          }
+          onClick={() => onClickEntry(entry)}
+        />
+      ))}
+    </div>
+  );
+});
+
+// PC 우측 밀어내기 패널 (+ 항상 보이는 접기/펼치기 스트립)
+export const ImageHistoryPanel = observer(() => {
+  const collapsed = appState.historyPanelCollapsed;
+  // 히스토리가 좌/우 어느 쪽에 도킹됐는지(레이아웃 슬롯). 우측(기본)은 기존 렌더 그대로,
+  // 좌측이면 접기 스트립·구분선·화살표를 전부 좌우 반전해 자연스럽게 보이도록 미러링한다.
+  const side =
+    resolveLayout(appState.uiLayoutTemplate, isMobile, appState.uiLayoutSlots)
+      .historySide === 'left'
+      ? 'left'
+      : 'right';
+  const mirror = side === 'left';
+  // 스트립(접기 손잡이)이 항상 "중앙 쪽" 모서리에 오도록 배치 방향을 뒤집는다.
+  //  우측 도킹: [스트립 | 패널]  좌측 도킹: [패널 | 스트립]
+  const rowDir = mirror ? 'flex-row-reverse' : 'flex-row';
+  // 구분선은 중앙을 향하는 쪽에 그린다(우측=왼쪽 테두리, 좌측=오른쪽 테두리).
+  const borderSide = mirror ? 'border-r' : 'border-l';
+
+  // 스트립 드래그로 패널 폭 조절 — 프리셋 스플리터(ResizableSplitter)와 동일한 방식.
+  // 우측 도킹은 왼쪽으로 끌수록 넓어지므로 델타를 반전한다(좌측 도킹은 그대로).
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(
+    () => () => {
+      resizeCleanupRef.current?.();
+    },
+    [collapsed, mirror],
+  );
+  const onStripMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0 || appState.historyPanelCollapsed) return;
+    resizeCleanupRef.current?.();
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startWidth = appState.historyPanelWidth;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    const onMouseMove = (event: MouseEvent) => {
+      const delta = (event.clientX - startX) * (mirror ? 1 : -1);
+      appState.setHistoryPanelWidth(
+        Math.max(
+          200,
+          Math.min(Math.floor(window.innerWidth * 0.5), startWidth + delta),
+        ),
+      );
+    };
+    const cleanup = () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', cleanup);
+      window.removeEventListener('blur', cleanup);
+      if (document.body.style.cursor === 'col-resize')
+        document.body.style.cursor = previousCursor;
+      if (document.body.style.userSelect === 'none')
+        document.body.style.userSelect = previousUserSelect;
+      if (resizeCleanupRef.current === cleanup) resizeCleanupRef.current = null;
+    };
+    resizeCleanupRef.current = cleanup;
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', cleanup);
+    window.addEventListener('blur', cleanup);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  };
+
+  return (
+    <div className={`flex-none hidden md:flex h-full ${rowDir}`}>
+      {/* zone-gutter/zone-card: 구역 카드화 마감(App.css) — 클래식이면 기존 보더 구분 그대로 */}
+      <div
+        className={`zone-gutter group flex-none w-5 flex flex-col items-center line-color ${
+          borderSide
+        } ${collapsed ? 'cursor-pointer' : 'cursor-col-resize'}`}
+      >
+        <Tooltip content={collapsed ? '히스토리 펼치기' : '히스토리 접기'}>
+          <button
+            type="button"
+            className="splitter-toggle-btn"
+            aria-label={collapsed ? '히스토리 펼치기' : '히스토리 접기'}
+            onClick={(e) => {
+              e.stopPropagation();
+              appState.toggleHistoryPanel();
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {/* 화살표는 "펼치면 열리는 방향"을 가리킨다. 좌측 도킹이면 방향도 반전. */}
+            {collapsed === mirror ? (
+              <FaChevronRight size={10} />
+            ) : (
+              <FaChevronLeft size={10} />
+            )}
+          </button>
+        </Tooltip>
+        {/* 드래그 손잡이 표시 — 프리셋 스플리터와 동일 언어(평시 투명, hover 시 sky) */}
+        {collapsed ? (
+          <button
+            type="button"
+            className="flex-1 w-full"
+            aria-label="히스토리 펼치기"
+            onClick={() => appState.toggleHistoryPanel()}
+          />
+        ) : (
+          /* eslint-disable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- This focusable WAI-ARIA window splitter exposes its width and handles arrow, Home, and End keys. */
+          <div
+            role="separator"
+            tabIndex={0}
+            aria-label="히스토리 패널 너비"
+            aria-orientation="vertical"
+            aria-valuemin={200}
+            aria-valuemax={Math.max(200, Math.floor(window.innerWidth * 0.5))}
+            aria-valuenow={appState.historyPanelWidth}
+            className="flex-1 w-full flex justify-center"
+            onMouseDown={onStripMouseDown}
+            onKeyDown={(event) => {
+              const maximum = Math.max(
+                200,
+                Math.floor(window.innerWidth * 0.5),
+              );
+              let next = appState.historyPanelWidth;
+              if (event.key === 'Home') next = 200;
+              else if (event.key === 'End') next = maximum;
+              else if (
+                event.key === 'ArrowLeft' ||
+                event.key === 'ArrowRight'
+              ) {
+                const delta = event.key === 'ArrowRight' ? 10 : -10;
+                next += delta * (mirror ? 1 : -1);
+              } else return;
+              event.preventDefault();
+              appState.setHistoryPanelWidth(
+                Math.max(200, Math.min(maximum, next)),
+              );
+            }}
+          >
+            <div className="zone-splitter-bar w-1 rounded-full transition-colors group-hover:bg-sky-400 dark:group-hover:bg-sky-500" />
+          </div>
+          /* eslint-enable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex */
+        )}
+      </div>
+      {!collapsed && (
+        <div
+          className={
+            // panel-vw-clamp(App.css): 좁은 창(<1024)에서만 폭 상한 — 프리셋 패널 주석 참고
+            `panel-vw-clamp zone-card flex flex-col h-full line-color bg-[var(--c-surface-2)] ${
+              borderSide
+            }`
+          }
+          style={{ width: appState.historyPanelWidth }}
+        >
+          <div className="flex-none px-3 py-2 border-b line-color flex items-center justify-between">
+            <span className="text-sm font-semibold gray-label">히스토리</span>
+            <HistoryColumnsToggle />
+          </div>
+          <HistoryList />
+        </div>
+      )}
+    </div>
+  );
+});
+
+// 모바일 우측 가장자리 손잡이 — 어떤 FloatView/모달 위에서도 항상 보이는 열기/닫기 토글.
+// 드로어가 열려 있어도 같은 자리에 남아(드로어 z 2100 < 손잡이 2200) 재터치로 닫는다.
+export const ImageHistoryHandle = observer(() => {
+  const open = appState.historyDrawerOpen;
+
+  // 우측 가장자리에서 좌로 스와이프하면 드로어 열기.
+  // passive 리스너(스크롤 방해 없음) + 수평 우세·임계값으로 세로 스크롤과 구분.
+  useEffect(() => {
+    let startX = 0;
+    let startY = 0;
+    let tracking = false;
+    const onStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) return;
+      // 프로젝트 드로어가 열려 있으면 반응하지 않는다(좌우 드로어 스와이프 겹침 방지)
+      if (
+        !canOpenDrawerBySwipe({
+          selfOpen: appState.historyDrawerOpen,
+          otherOpen: appState.projectDrawerOpen,
+        })
+      )
+        return;
+      // 우측 끝 툴바 버튼을 롱프레스로 잡아 정리(드래그)하는 중이면 스와이프로
+      // 오인해 드로어가 열리지 않도록 무시한다.
+      if (toolbarDragUi.armed !== null) return;
+      if (appState.mobileV2SheetOpen) return; // V2 하단 시트가 열려 있으면 물러난다
+      const t = e.touches[0];
+      if (t.clientX < window.innerWidth - EDGE_SWIPE_ZONE) return; // 가장자리 32px에서 시작한 터치만
+      // 가로 스크롤 툴바·이미지 좌우 넘기기처럼 같은 가로 제스처를 쓰는 영역에는 양보한다.
+      if (shouldIgnoreEdgeSwipeAt(e.target, t.clientX, t.clientY, 'right'))
+        return;
+      startX = t.clientX;
+      startY = t.clientY;
+      tracking = true;
+    };
+    const onMove = (e: TouchEvent) => {
+      if (!tracking || e.touches.length !== 1) return;
+      // 터치 시작 후(400ms 뒤) 툴바 드래그가 잡히면 여기서 추적을 중단한다.
+      if (toolbarDragUi.armed !== null) {
+        tracking = false;
+        return;
+      }
+      const t = e.touches[0];
+      const dx = t.clientX - startX;
+      const dy = t.clientY - startY;
+      if (dx < -40 && Math.abs(dx) > Math.abs(dy)) {
+        tracking = false;
+        if (!appState.projectDrawerOpen) appState.historyDrawerOpen = true;
+      }
+    };
+    const onEnd = () => {
+      tracking = false;
+    };
+    document.addEventListener('touchstart', onStart, { passive: true });
+    document.addEventListener('touchmove', onMove, { passive: true });
+    document.addEventListener('touchend', onEnd, { passive: true });
+    document.addEventListener('touchcancel', onEnd, { passive: true });
+    return () => {
+      document.removeEventListener('touchstart', onStart);
+      document.removeEventListener('touchmove', onMove);
+      document.removeEventListener('touchend', onEnd);
+      document.removeEventListener('touchcancel', onEnd);
+    };
+  }, []);
+
+  // V2 하단 시트가 열려 있으면 손잡이를 숨긴다(2026-09-22 실기기 피드백)
+  if (appState.mobileV2SheetOpen) return null;
+
+  return (
+    <button
+      type="button"
+      className="fixed right-0 top-1/2 -translate-y-1/2 md:hidden flex items-center justify-center w-5 h-14 rounded-l-md border border-r-0 line-color bg-[var(--c-surface-2)] opacity-70 active:opacity-100"
+      style={{ zIndex: 'var(--z-drawer-handle)' }}
+      aria-label={open ? '히스토리 닫기' : '히스토리 열기'}
+      onClick={() => appState.toggleSideDrawer('history')}
+    >
+      {open ? (
+        <FaChevronRight size={11} className="text-faint" />
+      ) : (
+        <FaChevronLeft size={11} className="text-faint" />
+      )}
+    </button>
+  );
+});
+
+// 모바일 우측 오버레이 드로어 (ProjectDrawer의 애니메이션 패턴 미러)
+export const ImageHistoryDrawer = observer(() => {
+  const open = appState.historyDrawerOpen;
+  const { render, shown, panelRef } = useTransitionPresence(open);
+
+  // 안드로이드 뒤로가기로 드로어 닫기
+  useEffect(() => {
+    if (!open) return undefined;
+    const handle = backStackService.push(() => {
+      appState.historyDrawerOpen = false;
+    });
+    return () => handle.remove();
+  }, [open]);
+
+  // 드로어 위에서 좌→우 스와이프하면 닫기 (수평 우세 + 40px 임계)
+  const swipe = React.useRef({ x: 0, y: 0, active: false });
+  const onTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    swipe.current = {
+      x: e.touches[0].clientX,
+      y: e.touches[0].clientY,
+      active: true,
+    };
+  };
+  const onTouchMove = (e: React.TouchEvent) => {
+    if (!swipe.current.active || e.touches.length !== 1) return;
+    const dx = e.touches[0].clientX - swipe.current.x;
+    const dy = e.touches[0].clientY - swipe.current.y;
+    if (dx > 40 && Math.abs(dx) > Math.abs(dy)) {
+      swipe.current.active = false;
+      appState.historyDrawerOpen = false;
+    }
+  };
+  const onTouchEnd = () => {
+    swipe.current.active = false;
+  };
+
+  if (!render) return null;
+  return (
+    <div
+      className="fixed inset-0 titlebar-no-drag"
+      style={{ zIndex: 'var(--z-drawer)' }}
+    >
+      {/* 닫기는 배경(dim) 클릭에만 연결 — 패널에서 stopPropagation 을 쓰면
+          내부 터치가 document 까지 버블되지 않아 contexify 컨텍스트 메뉴가
+          바깥 터치로 안 닫히는 버그가 생긴다 (모바일 롱프레스 메뉴) */}
+      <div
+        role="presentation"
+        className="absolute inset-0"
+        style={{
+          backgroundColor: 'rgba(0,0,0,0.35)',
+          opacity: shown ? 1 : 0,
+          transition: 'opacity 0.26s ease',
+        }}
+        onClick={() => {
+          appState.historyDrawerOpen = false;
+        }}
+      />
+      <div
+        ref={panelRef}
+        className="absolute right-0 top-0 h-full w-[80vw] max-w-[360px] bg-[var(--c-zone)] shadow-2xl border-l line-color flex flex-col"
+        style={{
+          transform: shown ? 'translateX(0)' : 'translateX(100%)',
+          transition: 'transform 0.26s cubic-bezier(0.4, 0, 0.2, 1)',
+          willChange: 'transform',
+        }}
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchEnd}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b line-color flex-none">
+          <h2 className="text-lg font-semibold text-default">히스토리</h2>
+          <div className="flex items-center gap-3">
+            <HistoryColumnsToggle />
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="닫기"
+              onClick={() => {
+                appState.historyDrawerOpen = false;
+              }}
+            >
+              <FaTimes size={18} />
+            </button>
+          </div>
+        </div>
+        <HistoryList />
+      </div>
+    </div>
+  );
+});

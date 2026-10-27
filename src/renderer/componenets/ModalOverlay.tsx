@@ -1,0 +1,138 @@
+import React, { type ReactNode, useEffect, useId, useRef } from 'react';
+import { FaTimes } from 'react-icons/fa';
+import { appState } from '../models/AppService';
+import { backStackService } from '../models/BackStackService';
+import { isMobile } from '../models';
+import { useGuardedClose } from './backdropClose';
+import useLatestRef from './useLatestRef';
+
+interface ModalOverlayProps {
+  isOpen: boolean;
+  onClose: () => void;
+  // 제목 옆 도움말 아이콘 등 인라인 요소 허용 (h2 안에 그대로 렌더)
+  title: ReactNode;
+  children: ReactNode;
+  width?: string;
+  // 마운트는 유지한 채 시각적으로만 숨김 — 내용물이 드래그 소스일 때
+  // 드래그 도중 언마운트하면 드래그가 끊기므로 이 경로를 쓴다.
+  hidden?: boolean;
+  // 전체 화면 변형(2026-09-26, 캐릭터 위치 지정 창): 모바일=화면 전체, PC=94vw×92vh. 내용 영역은 여백 없이
+  // 자식이 높이를 전부 쓴다(flex-1 min-h-0 overflow-hidden). 뒤로 가기·Escape·모달 카운터는 그대로.
+  fullscreen?: boolean;
+  // 층(z-index) 교체 — 기본 var(--z-modal). 다른 모달·드로어 위에 떠야 하는 전역 창
+  // (Google 드라이브 백업 창·환경설정 불러오기 미리보기)만 var(--z-modal-top) 을 쓴다.
+  zIndex?: string;
+  // 미저장 가드(2026-10-03 E2-3): 참을 돌려주면 ✕·바깥 클릭·Esc·뒤로 가기로 닫을 때
+  // 「저장하지 않은 변경이 있습니다. 버리고 닫을까요?」를 묻고 확인했을 때만 onClose. 없으면 예전과 같다.
+  dirty?: () => boolean;
+}
+
+function ModalOverlay({
+  isOpen,
+  onClose,
+  title,
+  children,
+  width = 'max-w-xl',
+  hidden,
+  fullscreen,
+  zIndex,
+  dirty,
+}: ModalOverlayProps) {
+  const mouseDownOnBackdrop = useRef(false);
+  const titleId = useId();
+
+  // ✕·바깥 클릭·Esc/뒤로 가기 세 경로를 이 닫기 요청 하나로 모은다(미저장 가드 — dirty 가 없으면 곧바로 onClose).
+  const requestClose = useGuardedClose(dirty, onClose);
+
+  // 안드로이드 뒤로가기로 이 모달을 닫는다. requestClose 는 dirty·onClose 를 늦게 읽고,
+  // 백스택 push/remove 는 isOpen 전환 시에만 실행해 스택 순서가 렌더로 흔들리지 않게 한다.
+  const onCloseRef = useLatestRef(requestClose);
+
+  // 같은 항목이 PC Esc 도 받는다(닫기 관문 — 맨 위 한 겹만, BackStackService). 예전의 자체 window
+  // 캡처 Esc 리스너는 아래·위 창과 동시에 닫히는 원인이라 없앴다(2026-10-03 U1·X2).
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const handle = backStackService.push(() => onCloseRef.current());
+    return () => handle.remove();
+  }, [isOpen, onCloseRef]);
+
+  // 모달 열림/닫힘 시 카운터 관리 (드래그 오버레이 억제용)
+  useEffect(() => {
+    if (isOpen) {
+      appState.incrementModalOverlay();
+      return () => appState.decrementModalOverlay();
+    }
+
+    return undefined;
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  return (
+    <div
+      role="presentation"
+      className={`fixed inset-0 flex items-center justify-center${
+        hidden ? ' opacity-0 pointer-events-none' : ''
+      }`}
+      style={{
+        zIndex: zIndex ?? 'var(--z-modal)',
+        backgroundColor: 'rgba(0, 0, 0, 0.3)',
+        backdropFilter: 'blur(8px)',
+        WebkitBackdropFilter: 'blur(8px)',
+      }}
+      onMouseDownCapture={(e) => {
+        // mousedown이 backdrop 자체에서 시작된 경우만 기록
+        mouseDownOnBackdrop.current = e.target === e.currentTarget;
+      }}
+      onClick={(e) => {
+        // mousedown도 backdrop에서 시작되고 click도 backdrop인 경우에만 닫기
+        // (드래그로 밖에 나갔다 놓는 경우 방지)
+        if (e.target === e.currentTarget && mouseDownOnBackdrop.current) {
+          requestClose();
+        }
+        mouseDownOnBackdrop.current = false;
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className={
+          fullscreen
+            ? isMobile
+              ? 'w-full h-full bg-[var(--c-zone)] flex flex-col overflow-hidden'
+              : 'w-[94vw] h-[92vh] bg-[var(--c-zone)] rounded-xl shadow-2xl flex flex-col overflow-hidden border line-color'
+            : `${width} w-[90vw] max-h-[85vh] bg-[var(--c-zone)] rounded-xl shadow-2xl flex flex-col overflow-hidden border line-color`
+        }
+        data-modal-fullscreen={fullscreen ? '' : undefined}
+      >
+        {/* 타이틀 바 */}
+        <div className="flex items-center justify-between px-5 py-3 border-b line-color flex-none">
+          <h2 id={titleId} className="text-base font-semibold text-default">
+            {title}
+          </h2>
+          <button
+            type="button"
+            className="p-1 rounded hover:bg-gray-200 dark:hover:bg-slate-600 text-muted transition-colors"
+            onClick={requestClose}
+            aria-label="닫기"
+          >
+            <FaTimes size={16} />
+          </button>
+        </div>
+        {/* 콘텐츠 */}
+        <div
+          className={
+            fullscreen
+              ? 'flex-1 min-h-0 overflow-hidden'
+              : 'flex-1 overflow-auto p-5'
+          }
+        >
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default ModalOverlay;

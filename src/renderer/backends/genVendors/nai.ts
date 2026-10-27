@@ -1,0 +1,816 @@
+import JSZip from 'jszip';
+import { Buffer } from 'buffer';
+import sodium from 'libsodium-wrappers-sumo';
+import {
+  Model,
+  type GenerationEffort,
+  Sampling,
+  type ImageGenInput,
+  type ImageGenService,
+  type ImageAugmentInput,
+  type ImageUpscaleInput,
+  ModelVersion,
+  type EncodeVibeImageInput,
+  type LoginValidity,
+  type OpusUsageStatus,
+} from '../imageGen';
+
+import { runNaiPaidRequest } from './naiErrors';
+import { estimateNaiUpscaleCost, NAI_UPSCALE_MODEL } from './naiUpscale';
+
+import getImageDimensions from '../imageDimensions';
+import type { Config } from '../../../main/config';
+import {
+  mergeQualityTags,
+  mergeUcPreset,
+  effectiveUcPreset,
+  qualityPresetHintId,
+  ucPresetApiIndex,
+  ucPresetHintId,
+} from './naiQualityPresets';
+import { resolveQualityPreset } from '../generationSettings';
+import {
+  getNaiModelSpec,
+  isV5ModelVersion,
+  normalizeNaiSampling,
+  resolveNaiModelId,
+} from './naiModelCapabilities';
+import { padDigitEdgedWeightGroups } from '../../models/promptWeightSpacing';
+import {
+  type NaiRequestOptions,
+  RecentRequestCache,
+  type RecentRequestOptions,
+  USER_DATA_CACHE_MS,
+  USER_DATA_TIMEOUT_MS,
+  withRequestTimeout,
+} from '../../models/requestTiming';
+
+export interface NovelAiFetcher {
+  /** Paid requests wait for their result or explicit cancellation; no implicit deadline. */
+  fetchArrayBuffer(
+    url: string,
+    body: any,
+    headers: any,
+    options?: NaiRequestOptions,
+  ): Promise<ArrayBuffer>;
+}
+
+// 옵션이 없으면 3인자로 호출한다(기존 호출 형태 유지).
+function fetchWithOptions(
+  fetcher: NovelAiFetcher,
+  url: string,
+  body: any,
+  headers: any,
+  options?: NaiRequestOptions,
+): Promise<ArrayBuffer> {
+  return options
+    ? fetcher.fetchArrayBuffer(url, body, headers, options)
+    : fetcher.fetchArrayBuffer(url, body, headers);
+}
+
+/** Accept the provider's direct PNG or ZIP envelope, never a manifest/directory. */
+async function decodeNaiPngResponse(
+  data: ArrayBuffer,
+  last = false,
+): Promise<string> {
+  const bytes = new Uint8Array(data);
+  const pngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+  if (pngSignature.every((byte, i) => bytes[i] === byte)) {
+    return Buffer.from(data).toString('base64');
+  }
+  const zip = await JSZip.loadAsync(data);
+  const images = Object.values(zip.files).filter(
+    (entry) => !entry.dir && /\.png$/i.test(entry.name),
+  );
+  if (!images.length)
+    throw new Error('NovelAI 응답에 요청한 PNG 이미지가 없습니다.');
+  return images[last ? images.length - 1 : 0].async('base64');
+}
+
+// `/user/data` 조회(잔량·할당량·토큰 검증) — 본문 읽기까지 30초 제한.
+function fetchUserData<T>(
+  url: string,
+  token: string,
+  read: (response: Response) => Promise<T>,
+): Promise<T> {
+  return withRequestTimeout(USER_DATA_TIMEOUT_MS, async (signal) => {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      signal,
+    });
+    return await read(response);
+  });
+}
+
+export class NovelAiImageGenService implements ImageGenService {
+  private configCache: { config: Config; timestamp: number } | null = null;
+
+  private readonly CONFIG_CACHE_TTL = 30000; // 30초 캐시
+
+  // `/user/data` 연속 조회 방지(2026-10-03 갈래 T2): 같은 토큰의 성공 응답을 10초 재사용하고
+  // 진행 중 조회는 합친다. 잔량(getRemainCredits)과 Opus 할당량(getOpusUsageStatus)은 같은
+  // 요청·같은 응답이라 한 캐시를 함께 쓴다. 토큰 검증(validateToken)은 사용자가 직접 누른
+  // 경로라 캐시를 쓰지 않는다(타임아웃만).
+  private readonly userDataCache = new RecentRequestCache<any>(
+    USER_DATA_CACHE_MS,
+  );
+
+  constructor(
+    fetcher: NovelAiFetcher,
+    private readonly loadConfig: () => Promise<Config>,
+  ) {
+    this.apiEndpoint = 'https://api.novelai.net';
+    this.apiEndpoint2 = 'https://image.novelai.net';
+    this.headers = {
+      'Content-Type': 'application/json',
+    };
+    this.fetcher = fetcher;
+  }
+
+  private async getCachedConfig() {
+    const now = Date.now();
+    if (
+      this.configCache &&
+      now - this.configCache.timestamp < this.CONFIG_CACHE_TTL
+    ) {
+      return this.configCache.config;
+    }
+    const config = await this.loadConfig();
+    this.configCache = { config, timestamp: now };
+    return config;
+  }
+
+  public invalidateConfigCache() {
+    this.configCache = null;
+  }
+
+  private static translateModel(
+    model: Model,
+    version: ModelVersion,
+    effort: GenerationEffort = 'high',
+  ): string {
+    return resolveNaiModelId(model, version, effort);
+  }
+
+  private static translateSampling(sampling: Sampling): string {
+    const samplingMap = {
+      k_euler_ancestral: 'k_euler_ancestral',
+      k_euler: 'k_euler',
+      k_dpmpp_2s_ancestral: 'k_dpmpp_2s_ancestral',
+      k_dpmpp_2m: 'k_dpmpp_2m',
+      k_dpmpp_sde: 'k_dpmpp_sde',
+      k_dpmpp_2m_sde: 'k_dpmpp_2m_sde',
+      ddim_v3: 'ddim_v3',
+    } as const;
+    return samplingMap[sampling];
+  }
+
+  private apiEndpoint: string;
+
+  private apiEndpoint2: string;
+
+  private headers: any;
+
+  private fetcher: NovelAiFetcher;
+
+  private static getRandomInt(min: number, max: number): number {
+    const minimum = Math.ceil(min);
+    const maximum = Math.floor(max);
+    return Math.floor(Math.random() * (maximum - minimum)) + minimum;
+  }
+
+  public async login(
+    email: string,
+    password: string,
+  ): Promise<{ accessToken: string }> {
+    try {
+      await sodium.ready;
+      const token = (0, sodium.crypto_pwhash)(
+        64,
+        new Uint8Array(Buffer.from(password)),
+        (0, sodium.crypto_generichash)(
+          sodium.crypto_pwhash_SALTBYTES,
+          `${password.slice(0, 6) + email}novelai_data_access_key`,
+        ),
+        2,
+        2e6,
+        sodium.crypto_pwhash_ALG_ARGON2ID13,
+        'base64',
+      ).slice(0, 64);
+      const url = this.apiEndpoint;
+      const reponse = await fetch(`${url}/user/login`, {
+        method: 'POST',
+        headers: this.headers,
+        body: JSON.stringify({
+          key: token,
+        }),
+      });
+      if (!reponse.ok) {
+        // 서버가 준 실제 사유를 함께 노출한다. NAI 측 오류/점검 등을 사용자가 바로 알 수 있다.
+        // 응답 본문이 JSON이면 message 필드만 뽑아 읽기 쉽게 보여준다.
+        let detail = '';
+        try {
+          const text = await reponse.text();
+          try {
+            detail = JSON.parse(text)?.message || text;
+          } catch {
+            detail = text;
+          }
+        } catch {
+          // The HTTP status remains authoritative when the error body is unreadable.
+        }
+        throw new Error(
+          `HTTP error:${reponse.status}${detail ? ` / ${detail}` : ''}`,
+        );
+      }
+      return await reponse.json();
+    } catch (error: any) {
+      throw new Error(`${error.message}`);
+    }
+  }
+
+  public async generateImage(authorization: string, params: ImageGenInput) {
+    const resolutionValue = params.resolution;
+    const config = params.generationSettings ?? (await this.getCachedConfig());
+
+    const modelVersionValue: ModelVersion =
+      config.modelVersion ?? ModelVersion.V4_5;
+    const effort: GenerationEffort =
+      config.effort === 'medium' ? 'medium' : 'high';
+    const modelValue = NovelAiImageGenService.translateModel(
+      params.model,
+      modelVersionValue,
+      effort,
+    );
+    const modelSpec = getNaiModelSpec(modelVersionValue, effort);
+    const isV5 = isV5ModelVersion(modelVersionValue);
+    const normalizedSampling = normalizeNaiSampling(
+      modelVersionValue,
+      params.sampling,
+      effort,
+    );
+    const samplingValue =
+      NovelAiImageGenService.translateSampling(normalizedSampling);
+    const qualityPreset = resolveQualityPreset(config);
+    const selectedUcPreset = modelSpec.capabilities.supportsNegativePrompt
+      ? effectiveUcPreset(modelVersionValue, config.ucPreset)
+      : 'heavy';
+    let ucPresetId: string = selectedUcPreset;
+    if (selectedUcPreset === 'humanFocus') ucPresetId = 'human';
+    else if (selectedUcPreset === 'furryFocus') ucPresetId = 'furry';
+    const transparentBackground =
+      isV5 &&
+      modelSpec.capabilities.supportsTransparentBackground &&
+      config.transparentBackground === true;
+
+    // Keep the provider's text presets in the prompt. params_version 4 also
+    // identifies them with qualityPresetId/ucPresetId in the multipart request.
+    // Medium uses its fixed Heavy UC; stored High UC text remains unchanged.
+    // NAI 자체 버그 회피(2026-10-02 N1): 숫자로 시작/끝나는 태그를 감싼 가중치 묶음 `1.5::0aaa0::` 은
+    // 태그 숫자가 가중치로 잘못 읽히므로 `1.5:: 0aaa0 ::` 로 공백을 넣어 보낸다. 모든 생성 계열(일반·인페인트·
+    // i2i·미러 등)이 지나는 전송 직전 한 곳 — 조각·랜덤·와일드카드·퀄리티 태그 병합이 모두 끝난 문자열. 멱등.
+    let promptQualityPreset = qualityPreset;
+    if (!isV5)
+      promptQualityPreset = config.disableQuality ? 'none' : 'standard';
+    const finalPrompt = padDigitEdgedWeightGroups(
+      mergeQualityTags(
+        params.prompt,
+        modelVersionValue,
+        promptQualityPreset,
+        transparentBackground,
+      ),
+    );
+    const finalUc = padDigitEdgedWeightGroups(
+      mergeUcPreset(
+        modelSpec.capabilities.supportsNegativePrompt ? params.uc : '',
+        modelVersionValue,
+        selectedUcPreset,
+      ),
+    );
+
+    // 시드 미지정 시 랜덤 — NAI 시드 공간은 32비트 전체(최대 4,294,967,295).
+    // 과거 상한 2,100,000,000 은 임의 제한이라 제거(2026-07-25).
+    // getRandomInt 는 max 미포함이라 2^32 을 넘겨 4,294,967,295 까지 나온다.
+    const seed =
+      params.seed ?? NovelAiImageGenService.getRandomInt(1, 0x100000000);
+    let action;
+    switch (params.model) {
+      case Model.Anime:
+        action = 'generate';
+        break;
+      case Model.Inpaint:
+        action = 'infill';
+        break;
+      case Model.I2I:
+        action = 'img2img';
+        break;
+      default:
+        throw new Error('지원하지 않는 이미지 생성 작업입니다.');
+    }
+    // add_original_image: 명시값(Focused=false)이 있으면 그것, 없으면 「비마스크 영역 편집 방지」 토글.
+    const addOriginalImage = params.addOriginalImage ?? !!params.originalImage;
+    const legacyParameters: any = {
+      params_version: 3,
+      width: resolutionValue.width,
+      height: resolutionValue.height,
+      noise_schedule: params.noiseSchedule,
+      controlnet_strength: 1,
+      dynamic_thresholding: false,
+      scale: params.promptGuidance,
+      sampler: samplingValue,
+      steps: params.steps,
+      noise: params.noise,
+      seed,
+      n_samples: 1,
+      ucPreset: ucPresetApiIndex(modelVersionValue, config.ucPreset),
+      negative_prompt: finalUc,
+      strength: params.imageStrength,
+      qualityToggle: !config.disableQuality,
+      characterPrompts: [],
+      use_coords: params.useCoords,
+      legacy: false,
+      legacy_v3_extend: false,
+      prefer_brownian: true,
+      autoSmea: false,
+      legacy_uc: params.legacyPromptConditioning,
+      inpaintImg2ImgStrength: params.imageStrength,
+      cfg_rescale: params.cfgRescale,
+      add_original_image: addOriginalImage,
+      normalize_reference_strength_multiple: params.normalizeStrength ?? false,
+      skip_cfg_above_sigma: null,
+      v4_prompt: {
+        caption: {
+          base_caption: finalPrompt,
+          char_captions: [],
+        },
+        use_coords: params.useCoords,
+        use_order: true,
+      },
+      v4_negative_prompt: {
+        caption: {
+          base_caption: finalUc,
+          char_captions: [],
+        },
+        legacy_uc: params.legacyPromptConditioning,
+      },
+    };
+    const v5Parameters: any = {
+      params_version: modelSpec.capabilities.paramsVersion,
+      width: resolutionValue.width,
+      height: resolutionValue.height,
+      noise_schedule: modelSpec.capabilities.forcedNoiseSchedule,
+      scale: Math.min(
+        params.promptGuidance,
+        modelSpec.capabilities.maxPromptGuidance ?? params.promptGuidance,
+      ),
+      sampler: samplingValue,
+      steps:
+        modelSpec.capabilities.fixedSteps ??
+        Math.min(params.steps, modelSpec.capabilities.maxSteps ?? params.steps),
+      noise: params.noise,
+      seed,
+      n_samples: 1,
+      ucPresetId,
+      qualityPresetId: qualityPreset,
+      image_format: 'png',
+      straight_alpha: true,
+      negative_prompt: finalUc,
+      strength: params.imageStrength,
+      characterPrompts: [],
+      use_coords: params.useCoords ?? false,
+      cfg_rescale: modelSpec.capabilities.supportsCfgRescale
+        ? params.cfgRescale
+        : 0,
+      skip_cfg_above_sigma: null,
+      prefer_brownian: samplingValue === 'k_euler_ancestral',
+      deliberate_euler_ancestral_bug: false,
+      tag_hint_qt: qualityPresetHintId(qualityPreset),
+      tag_hint_uc_preset: ucPresetHintId(modelVersionValue, selectedUcPreset),
+      tag_hint_transparent_background: transparentBackground,
+      v4_prompt: {
+        caption: {
+          base_caption: finalPrompt,
+          char_captions: [],
+        },
+        use_coords: params.useCoords ?? false,
+        use_order: true,
+      },
+      v4_negative_prompt: {
+        caption: {
+          base_caption: finalUc,
+          char_captions: [],
+        },
+      },
+    };
+    const body: any = {
+      input: finalPrompt,
+      model: modelValue,
+      action,
+      parameters: isV5 ? v5Parameters : legacyParameters,
+    };
+    if (isV5) body.use_new_shared_trial = true;
+    // V5 인페인트도 add_original_image 를 받는다(2026-10-04 실험 확인: true 면 마스크 밖이
+    // 원본과 비트 동일, 없으면 마스크 밖 전체가 미세하게 변함). 「비마스크 영역 편집 방지」 토글.
+    if (isV5 && action === 'infill') {
+      body.parameters.add_original_image = addOriginalImage;
+    }
+    // Apply the same capability and precedence rule at the final request boundary
+    // as the queue's preparation step. Invalid/unsupported references do not block Vibe.
+    const validCharacterReferences = modelSpec.capabilities
+      .supportsCharacterReference
+      ? params.characterReferences?.filter(
+          (ref) => ref.image && ref.image.length > 0,
+        )
+      : undefined;
+    if (
+      modelSpec.capabilities.supportsVibeTransfer &&
+      !validCharacterReferences?.length &&
+      params.vibes.length
+    ) {
+      const maxVibes = modelSpec.capabilities.maxVibeImages;
+      if (maxVibes !== undefined && params.vibes.length > maxVibes) {
+        throw Object.assign(
+          new Error(
+            `NovelAI Vibe Transfer는 최대 ${maxVibes}개까지 사용할 수 있습니다.`,
+          ),
+          { retryable: false },
+        );
+      }
+      body.parameters.reference_image_multiple = params.vibes.map(
+        (v) => v.image,
+      );
+      body.parameters.reference_strength_multiple = params.vibes.map(
+        (v) => v.strength,
+      );
+      if (params.normalizeStrength && params.vibes.length > 1) {
+        const sum = body.parameters.reference_strength_multiple.reduce(
+          (acc: number, val: number) => acc + val,
+          0,
+        );
+        if (sum !== 0) {
+          body.parameters.reference_strength_multiple =
+            body.parameters.reference_strength_multiple.map(
+              (val: number) => val / sum,
+            );
+        }
+      }
+    }
+    if (validCharacterReferences?.length) {
+      body.parameters.director_reference_images = [];
+      body.parameters.director_reference_descriptions = [];
+      body.parameters.director_reference_strength_values = [];
+      body.parameters.director_reference_secondary_strength_values = [];
+      body.parameters.director_reference_information_extracted = [];
+      for (const ref of validCharacterReferences) {
+        body.parameters.director_reference_images.push(ref.image);
+        body.parameters.director_reference_descriptions.push({
+          caption: {
+            base_caption: ref.referenceType || 'character',
+            char_captions: [],
+          },
+          legacy_uc: params.legacyPromptConditioning,
+        });
+        body.parameters.director_reference_strength_values.push(
+          ref.strength ?? 0.6,
+        );
+        body.parameters.director_reference_secondary_strength_values.push(
+          1 - (ref.fidelity ?? 1),
+        );
+        body.parameters.director_reference_information_extracted.push(ref.info);
+      }
+    }
+    if (params.image) {
+      body.parameters.image = params.image;
+    }
+    if (params.mask) {
+      body.parameters.mask = params.mask;
+    }
+    if (params.model === Model.Inpaint) {
+      body.parameters.img2img = {
+        strength: params.imageStrength,
+        begin_from_sigma: null,
+        noise: 0,
+        extra_noise_seed: seed,
+        color_correct: true,
+      };
+      if (normalizedSampling === Sampling.DDIM) {
+        body.parameters.sampler = NovelAiImageGenService.translateSampling(
+          Sampling.KEulerAncestral,
+        );
+      }
+    }
+    if (params.model === Model.I2I) {
+      body.parameters.img2img = {
+        strength: params.imageStrength,
+        begin_from_sigma: null,
+        noise: params.noise,
+        extra_noise_seed: seed,
+        color_correct: true,
+      };
+    }
+    if (normalizedSampling === Sampling.KEulerAncestral) {
+      body.parameters.deliberate_euler_ancestral_bug = isV5
+        ? false
+        : (params.deliberateEulerAncestralBug ?? false);
+    }
+    // Variety+ (skip_cfg_above_sigma) must be disabled when Precise/Character
+    // Reference is used. NAI 공식 사이트는 Char Ref 켜면 Variety+를 UI에서
+    // 자동 해제하므로 두 파라미터가 동시 전송되지 않음. SDStudio에서 두
+    // 파라미터를 동시에 보내면 서버가 깨진 결과물을 생성함.
+    // 참고: DNT-LAB/NAIA_novel_ai_entrypoint 의 _apply_character_reference
+    // (params.pop("skip_cfg_above_sigma", None))
+    const hasValidCharRef = (validCharacterReferences?.length ?? 0) > 0;
+    if (!isV5 && params.varietyPlus && !hasValidCharRef) {
+      let sigmaCoef: number;
+      switch (config.modelVersion) {
+        case ModelVersion.V4_5:
+        case ModelVersion.V4_5Curated:
+          sigmaCoef = 58;
+          break;
+        case ModelVersion.V4:
+        case ModelVersion.V4Curated:
+          sigmaCoef = 19;
+          break;
+        case undefined:
+        default:
+          sigmaCoef = 0;
+          break;
+      }
+      const defaultPixels = 832 * 1216;
+      const resPixels = resolutionValue.width * resolutionValue.height;
+      const pixelRatio = resPixels / defaultPixels;
+      body.parameters.skip_cfg_above_sigma = sigmaCoef * pixelRatio ** 0.5;
+    } else if (hasValidCharRef) {
+      // Belt-and-suspenders: 디폴트가 null이긴 하지만, 혹시 다른 경로에서
+      // 값이 주입되어도 여기서 확실히 제거.
+      body.parameters.skip_cfg_above_sigma = null;
+    }
+    if (params.characterPrompts?.length) {
+      const center = { x: 0.5, y: 0.5 };
+      const charaPos = (sourceIndex: number) =>
+        params.useCoords
+          ? (params.characterPositions?.[sourceIndex] ?? center)
+          : center;
+      const characterEntries = params.characterPrompts
+        .map((prompt, sourceIndex) => ({
+          // 캐릭터 프롬프트·캐릭터 부정 프롬프트도 같은 공백 보정(N1).
+          prompt: padDigitEdgedWeightGroups(prompt),
+          uc: modelSpec.capabilities.supportsNegativePrompt
+            ? padDigitEdgedWeightGroups(
+                params.characterUCs?.[sourceIndex] ?? '',
+              )
+            : '',
+          center: charaPos(sourceIndex),
+        }))
+        .filter((entry) => entry.prompt.trim().length > 0)
+        .slice(
+          0,
+          modelSpec.capabilities.maxCharacterPrompts ??
+            params.characterPrompts.length,
+        );
+      body.parameters.characterPrompts = characterEntries;
+      body.parameters.v4_prompt.caption.char_captions = characterEntries.map(
+        (entry) => ({
+          char_caption: entry.prompt,
+          centers: [entry.center],
+        }),
+      );
+      body.parameters.v4_negative_prompt.caption.char_captions =
+        characterEntries.map((entry) => ({
+          char_caption: entry.uc,
+          centers: [entry.center],
+        }));
+    }
+
+    const headers = {
+      Authorization: `Bearer ${authorization}`,
+      'Content-Type': 'application/json',
+    };
+    return await runNaiPaidRequest(params.request?.signal, async () => {
+      const arrayBuffer = await fetchWithOptions(
+        this.fetcher,
+        `${this.apiEndpoint2}/ai/generate-image`,
+        body,
+        headers,
+        params.request,
+      );
+      return await decodeNaiPngResponse(arrayBuffer);
+    });
+  }
+
+  // `/user/data` 원본 JSON(잔량·할당량 공용). 30초 제한·10초 캐시·동시 호출 합치기.
+  // options.force = 캐시를 건너뛰고 새로 읽는다(생성 직후 잔량 갱신 등).
+  private readUserData(
+    token: string,
+    options?: RecentRequestOptions,
+  ): Promise<any> {
+    // 2026-07 NovelAI 정책 변경: 서드파티 도구의 api.novelai.net 호출을 400 으로
+    // 거부("update to the image URL") → 사용자 정보도 image.novelai.net 으로 호출.
+    return this.userDataCache.get(
+      token,
+      () =>
+        fetchUserData(
+          `${this.apiEndpoint2}/user/data`,
+          token,
+          async (response) => {
+            if (!response.ok) {
+              throw new Error(`HTTP error:${response.status}`);
+            }
+            return await response.json();
+          },
+        ),
+      options,
+    );
+  }
+
+  async getRemainCredits(token: string, options?: RecentRequestOptions) {
+    const res = await this.readUserData(token, options);
+    const steps = res.subscription.trainingStepsLeft;
+    return steps.fixedTrainingStepsLeft + steps.purchasedTrainingSteps;
+  }
+
+  async getOpusUsageStatus(
+    token: string,
+    options?: RecentRequestOptions,
+  ): Promise<OpusUsageStatus> {
+    // Opus V5 회복형 할당량은 체험판 trial-status가 아니라 user/data의
+    // subscription.usage에 있다. getRemainCredits와 같은 사용자 데이터 원본을
+    // 사용해야 공식 웹의 Opus 잔량 표시와 일치한다.
+    const raw = await this.readUserData(token, options);
+    const subscription = raw?.subscription;
+    // A non-Opus account can still carry usage.percent=100. Check entitlement
+    // before reading usage; renewal/cancellation timestamps are not entitlement.
+    if (
+      typeof subscription?.active !== 'boolean' ||
+      !Number.isInteger(subscription?.tier) ||
+      subscription.tier < 0
+    ) {
+      throw new Error('Opus subscription data is unavailable');
+    }
+    if (!subscription.active || subscription.tier !== 3) {
+      return {
+        opusSubscribed: false,
+        percent: 0,
+        isNegative: false,
+        timeUntilNextPercent: 0,
+      };
+    }
+    const { usage } = subscription;
+    const percent = Number(usage?.percent);
+    const timeUntilNextPercent = Number(usage?.timeUntilNextPercent);
+    if (
+      !Number.isFinite(percent) ||
+      typeof usage?.isNegative !== 'boolean' ||
+      !Number.isFinite(timeUntilNextPercent)
+    ) {
+      // 형식이 바뀌거나 Opus 사용량이 없는 계정을 0% 소진으로 오인하지 않는다.
+      throw new Error('Opus usage data is unavailable');
+    }
+    return {
+      opusSubscribed: true,
+      // Preserve server-reported surplus; only the UI progress bar caps at 100.
+      percent: Math.max(0, Math.round(percent)),
+      isNegative: usage.isNegative,
+      timeUntilNextPercent: Math.max(0, timeUntilNextPercent),
+    };
+  }
+
+  // 토큰이 NovelAI에서 실제로 유효한지 검증한다.
+  // 401/403(인증 거부) → 'invalid', 200 → 'valid', 그 외(네트워크/서버 오류) → 'error'.
+  async validateToken(token: string): Promise<LoginValidity> {
+    if (!token || !token.trim()) return 'invalid';
+    try {
+      // getRemainCredits 와 동일 사유로 image.novelai.net 사용 (api.novelai.net 은
+      // 서드파티에 400 을 반환해 'error' 판정 → 로그인 상태가 영영 갱신되지 않았음)
+      return await fetchUserData(
+        `${this.apiEndpoint2}/user/data`,
+        token,
+        async (response): Promise<LoginValidity> => {
+          if (response.ok) return 'valid';
+          if (response.status === 401 || response.status === 403)
+            return 'invalid';
+          return 'error'; // 5xx 등 일시 오류 → 상태 유지
+        },
+      );
+    } catch {
+      return 'error'; // 네트워크 오류·30초 시간 초과 → 상태 유지
+    }
+  }
+
+  async upscaleImage(authorization: string, params: ImageUpscaleInput) {
+    const { width, height } = await getImageDimensions(params.image);
+    estimateNaiUpscaleCost(width, height); // UI를 거치지 않는 위임 요청도 전송 전 검증
+    return await runNaiPaidRequest(params.request?.signal, async () => {
+      const response = await fetchWithOptions(
+        this.fetcher,
+        `${this.apiEndpoint2}/ai/upscale`,
+        {
+          image: params.image,
+          model: NAI_UPSCALE_MODEL,
+          declared_blur_sigma: 0,
+        },
+        {
+          Authorization: `Bearer ${authorization}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/zip',
+        },
+        params.request,
+      );
+      const zip = await JSZip.loadAsync(response);
+      // 공식 웹과 동일한 PNG 출력만 선택한다. 메타데이터/디렉터리를 이미지로 저장하지 않는다.
+      const entries = Object.values(zip.files).filter(
+        (entry) => !entry.dir && /^image[^/]*\.png$/.test(entry.name),
+      );
+      if (entries.length !== 1) {
+        throw new Error(
+          '업스케일 응답에 정상적인 이미지 1장이 없습니다. 자동 재시도하지 않습니다.',
+        );
+      }
+      const bytes = await entries[0].async('uint8array');
+      const signature = [137, 80, 78, 71, 13, 10, 26, 10];
+      if (!signature.every((value, i) => bytes[i] === value)) {
+        throw new Error('업스케일 결과가 PNG 이미지가 아닙니다.');
+      }
+      // 서버 메타데이터와 알파 채널을 포함한 원본 바이트를 그대로 저장한다.
+      return Buffer.from(bytes).toString('base64');
+    });
+  }
+
+  async augmentImage(authorization: string, params: ImageAugmentInput) {
+    const { width, height } = await getImageDimensions(params.image);
+    const body: any = {
+      image: params.image,
+      prompt: params.prompt,
+      defry: params.weaken,
+      req_type: params.method,
+      width,
+      height,
+    };
+    if (params.method !== 'emotion' && params.method !== 'colorize') {
+      body.defry = undefined;
+      body.prompt = undefined;
+    }
+    if (params.method === 'emotion') {
+      body.prompt = `${params.emotion!};;${body.prompt}`;
+    }
+    const headers = {
+      Authorization: `Bearer ${authorization}`,
+      'Content-Type': 'application/json',
+    };
+
+    return await runNaiPaidRequest(params.request?.signal, async () => {
+      const arrayBuffer = await fetchWithOptions(
+        this.fetcher,
+        `${this.apiEndpoint2}/ai/augment-image`,
+        body,
+        headers,
+        params.request,
+      );
+      return await decodeNaiPngResponse(arrayBuffer, true);
+    });
+  }
+
+  async encodeVibeImage(authorization: string, params: EncodeVibeImageInput) {
+    const url = this.apiEndpoint2;
+    const version: ModelVersion =
+      params.modelVersion ??
+      (await this.getCachedConfig()).modelVersion ??
+      ModelVersion.V4_5;
+    if (!getNaiModelSpec(version).capabilities.supportsVibeTransfer) {
+      throw Object.assign(
+        new Error(
+          '선택한 NovelAI 모델은 Vibe Transfer를 지원하지 않습니다. 저장된 바이브는 보관됩니다.',
+        ),
+        { retryable: false },
+      );
+    }
+    const modelValue = NovelAiImageGenService.translateModel(
+      Model.Anime,
+      version,
+    );
+    const body = {
+      image: params.image,
+      model: modelValue,
+      information_extracted: params.info,
+    };
+    const headers = {
+      Authorization: `Bearer ${authorization}`,
+      'Content-Type': 'application/json',
+    };
+
+    return await runNaiPaidRequest(params.request?.signal, async () => {
+      const arrayBuffer = await fetchWithOptions(
+        this.fetcher,
+        `${url}/ai/encode-vibe`,
+        body,
+        headers,
+        params.request,
+      );
+      return Buffer.from(arrayBuffer).toString('base64');
+    });
+  }
+}

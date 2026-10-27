@@ -1,0 +1,2163 @@
+import { action, observable, runInAction } from 'mobx';
+import { v4 } from 'uuid';
+import type { MobileV2Parts } from './mobileV2';
+import {
+  exportPresetService,
+  batchProcessService,
+  backupService,
+  backend,
+  globalPieceService,
+  globalPresetService,
+  artistLibraryService,
+  imageService,
+  isMobile,
+  sessionService,
+  projectTemplateService,
+  trashService,
+  workFlowService,
+} from '.';
+import { setAppState } from './appStateRef';
+import { readImportFile } from './fileImportReader';
+import { getImportFilePath } from './importFilePath';
+import { resolveToastKind, type ToastKind } from './toastKind';
+import { confirmViaDialog } from './confirmKeys';
+import {
+  NAME_INPUT_TEXT,
+  nameErrorMessage,
+  projectNameRules,
+  promptName,
+} from './nameInput';
+import {
+  deleteConfirmText,
+  overlappingSceneNames,
+  pasteResultText,
+  projectDeleteResultText,
+  runTrashDelete,
+  sceneImportOverwriteText,
+} from './deleteFlowRules';
+import { PROJECT_RETENTION_DAYS } from './TrashService';
+import type { Config, UiToolbarConfig, UiLayoutSlots } from '../../main/config';
+import type {
+  GlobalPresetType,
+  IGlobalPresetEntry,
+} from './GlobalPresetService';
+
+import { isOutputImageFile, isImportImageMime } from './imageFormats';
+import { projectPath } from './projectPaths';
+import { V2_SHEET_CLOSE_EVENT } from './uiEvents';
+import { ARTIST_LIBRARY_TAB_ACTION } from './ArtistLibraryService';
+import type { Dialog, DialogItem } from '../componenets/ConfirmWindow';
+import { dataUriToBase64 } from './ImageService';
+import { importPreset } from './SessionService';
+import {
+  type CharacterPreset,
+  type CharacterPrompt,
+  ReferenceItem,
+  VibeItem,
+  type GenericScene,
+  type ISession,
+  isValidPieceLibrary,
+  isValidSession,
+  isValidNAISPreset,
+  extractNAISPieceNames,
+  convertNAISToSession,
+  Piece,
+  PieceLibrary,
+  PromptPiece,
+  Scene,
+  type Session,
+} from './types';
+
+import type { ProgressDialog } from '../componenets/ProgressWindow';
+import { migratePieceLibrary } from './legacy';
+import {
+  EMPTY_SCENE_SELECTION,
+  type SceneKind,
+  type SceneSelectionState,
+  addScenesToSelectionState,
+  isSceneSelected,
+  removeScenesFromSelectionState,
+  selectedCountForType,
+  toggleSceneInSelection,
+} from './sceneSelection';
+
+export interface ExportPreset {
+  /** 미지정인 구 프리셋은 기존 재최적화 확인을 유지한다. */
+  reoptimize?: 'ask' | 'skip' | 'all';
+  name: string;
+  menu: 'fav' | 'all';
+  format: 'normal' | 'prefix' | 'prefix_ask';
+  prefix: string;
+  opt: 'original' | 'lossy' | 'lossless' | 'avif';
+  imageSize: number;
+  /** 압축 화질(1~100). 미설정 시 기본값(webp 80·avif 50). lossy/avif 만 적용. */
+  quality?: number;
+  /** NAI 스테가노그래피(알파 워터마크) 보존. webp(lossy/lossless)만 유효. 느려짐. */
+  preserveStealth?: boolean;
+  separator: string;
+  // ── 신규 옵션 (모두 선택적 — 구형 프리셋은 그대로 동작, 마이그레이션 불필요) ──
+  /** 파일명 패턴: 'scene'(기본=현행) / 프로젝트명 / 폴더명+프로젝트명 접두 */
+  filenamePattern?: 'scene' | 'project.scene' | 'folder.project.scene';
+  /** 출력 형태: 'tar'(기본, 압축파일) / 'files'(개별 이미지 파일) */
+  outputMode?: 'tar' | 'zip' | 'files';
+  /** 캐릭터 프리셋 접두/접미사 적용 여부 (미설정 시 true = 적용) */
+  applyCharacterAffix?: boolean;
+  /** 켜면 씬 이름 특수문자를 묻지 않고 전부 구분자로 자동 변환 (기본 false) */
+  autoConvertSeparator?: boolean;
+  /** 데스크톱 전용: 내보내기 목표 폴더(절대경로). 빈값이면 글로벌 기본 폴더 사용 */
+  targetFolder?: string;
+  /** 데스크톱 전용: 목표 폴더 아래 프로젝트 폴더 경로로 하위 폴더 생성 */
+  useProjectRelativePath?: boolean;
+  /** ⚡ 빠른 export 버튼이 사용할 기본 프리셋 여부 */
+  isDefault?: boolean;
+}
+
+export interface SceneSelectorItem {
+  type: 'scene' | 'inpaint';
+  text: string;
+  callback: (scenes: GenericScene[]) => void;
+  scenes?: GenericScene[];
+}
+
+/** appState.confirmAsync 의 객체형 인자 — confirm(또는 yes-only) 창의 표시 옵션. */
+export type ConfirmAsyncOptions = Omit<
+  Dialog,
+  'type' | 'callback' | 'onCancel'
+> & {
+  type?: 'confirm' | 'yes-only';
+};
+
+export class AppState {
+  // 부팅 완료 여부 — bootstrapApp() 이 모든 준비(설정·세션 스캔·로컬 데이터 로드)를
+  // 마치면 true. App 이 이 값으로 메인 UI 마운트를 게이트해 "준비 전 사용" race 를
+  // 원천 차단한다. 저장소 준비 실패는 오류 게이트에서 재시작을 기다린다.
+  @observable accessor bootReady: boolean = false;
+
+  // 부팅 대기 화면의 보조 안내 문구 (예: 저장소 권한 대기). 빈 문자열 = 기본 문구.
+  @observable accessor bootStatusMessage: string = '';
+
+  // [안드로이드 11+] '모든 파일 접근' 허용 대기로 부팅이 차단된 상태 —
+  // 부팅 화면이 전용 안내("데이터는 안전합니다")와 [설정 열기] 버튼을 표시한다.
+  // storagePermissionGate 가 설정/해제. (권한 없이 진행하면 기존 파일이 FUSE 에
+  // 숨어 "전부 증발"처럼 보이고 저장 충돌 2차 피해까지 나므로 진행 금지)
+  @observable accessor storagePermissionBlocked: boolean = false;
+
+  // 저장소 권한 확보 후에도 설정을 읽지 못하면 사용자 데이터 초기화/저장을
+  // 시작하지 않는다. SaveLocationGate 에서 오류와 앱 재시작 재시도를 표시한다.
+  @observable accessor storageBootFailure: string | null = null;
+
+  @observable accessor curSession: Session | undefined = undefined;
+
+  // 토스트 메시지: 각 항목이 고유 id를 가져 개별 타이머/개별 닫기가 가능하다.
+  // kind = 색(오류 빨강·성공 초록·안내 중립) — pushMessage 의 kind 또는 문구 추론(models/toastKind.ts).
+  @observable accessor messages: {
+    id: number;
+    text: string;
+    kind: ToastKind;
+  }[] = [];
+
+  private messageIdCounter = 0;
+
+  @observable accessor dialogs: Dialog[] = [];
+
+  @observable accessor samples: number = 1;
+
+  @observable accessor progressDialog: ProgressDialog | undefined = undefined;
+
+  // 이미지 복구 진행 중 재진입 가드(중복 터치로 스캔이 동시에 두 번 도는 것 차단)
+  private recovering = false;
+
+  @observable accessor externalImage: string | undefined = undefined;
+
+  @observable.ref accessor externalImageScene: GenericScene | undefined =
+    undefined;
+
+  // 프로젝트 좌측 드로어 / 그리드 탐색기 모달 열림 상태 (앱 전역)
+  @observable accessor projectDrawerOpen: boolean = false;
+
+  @observable accessor projectBrowserOpen: boolean = false;
+
+  /** 현재 적용된 캐릭터 프리셋 이름 (shared에서 읽음 — 영속화됨).
+   *  다중 적용(W4) 이후엔 "마지막 적용" 표시용 잔존 — 목록은 appliedCharacterPresetNames 사용 */
+  get appliedCharacterPreset(): string | undefined {
+    const session = this.curSession;
+    if (!session) return undefined;
+    const workflowType = session.selectedWorkflow?.workflowType;
+    if (!workflowType) return undefined;
+    const shared = session.presetShareds.get(workflowType);
+    return shared?._appliedPresetName || undefined;
+  }
+
+  /** 현재 적용된 캐릭터 프리셋 이름 목록(W4 다중 적용).
+   *  별도 필드 없이 shared 항목들의 fromPreset 태그에서 유도(첫 등장 순서 유지) —
+   *  스키마 추가가 없어 구버전과 그대로 호환된다. */
+  get appliedCharacterPresetNames(): string[] {
+    const session = this.curSession;
+    if (!session) return [];
+    const workflowType = session.selectedWorkflow?.workflowType;
+    if (!workflowType) return [];
+    const shared = session.presetShareds.get(workflowType);
+    if (!shared) return [];
+    const names: string[] = [];
+    const collect = (items: any[] | undefined) => {
+      for (const item of items || []) {
+        if (item?.fromPreset && !names.includes(item.fromPreset)) {
+          names.push(item.fromPreset);
+        }
+      }
+    };
+    collect(shared.characterPrompts);
+    collect(shared.vibes);
+    collect(shared.characterReferences);
+    return names;
+  }
+
+  // 이미지 클립보드
+  @observable accessor imageClipboard: string[] = [];
+
+  // 씬 다중 선택 (Ctrl+클릭 or 드래그). 선택은 (종류, 이름) 쌍이다 —
+  // 일반/변형 씬은 이름이 겹칠 수 있으므로 selectedScenesType 과 함께 판정한다
+  // (models/sceneSelection.ts, SPEC_GUIDE 드래그 다중 선택 절).
+  @observable accessor selectedScenes: Set<string> = new Set();
+
+  @observable accessor selectedScenesType: SceneKind | null = null;
+
+  // 우클릭 컨텍스트 메뉴를 연 씬의 종류 — 메뉴 라벨의 선택 수 표시용
+  @observable accessor contextSceneType: SceneKind = 'scene';
+
+  // 모바일 전용: 씬 다중 선택 모드. 켜지면 씬 탭이 이미지 그리드 열기 대신
+  // 선택 토글로 동작한다. (PC 는 Ctrl+클릭/드래그/Ctrl+S 로 선택하므로 미사용)
+  @observable accessor sceneSelectionMode: boolean = false;
+
+  // 이미지 삭제 확인 건너뛰기 (세션 스코프)
+  @observable accessor skipImageDeleteConfirm: boolean = false;
+
+  private get sceneSelectionState(): SceneSelectionState {
+    return { names: this.selectedScenes, type: this.selectedScenesType };
+  }
+
+  @action
+  private applySceneSelection(next: SceneSelectionState) {
+    this.selectedScenes = next.names;
+    this.selectedScenesType = next.type;
+  }
+
+  @action
+  toggleSceneSelection(name: string, type: SceneKind) {
+    this.applySceneSelection(
+      toggleSceneInSelection(this.sceneSelectionState, name, type),
+    );
+  }
+
+  @action
+  addScenesToSelection(names: string[], type: SceneKind) {
+    this.applySceneSelection(
+      addScenesToSelectionState(this.sceneSelectionState, names, type),
+    );
+  }
+
+  @action
+  removeScenesFromSelection(names: string[], type: SceneKind) {
+    this.applySceneSelection(
+      removeScenesFromSelectionState(this.sceneSelectionState, names, type),
+    );
+  }
+
+  @action
+  clearSceneSelection() {
+    this.applySceneSelection(EMPTY_SCENE_SELECTION);
+  }
+
+  isSceneSelected(scene: { name: string; type: string }): boolean {
+    return isSceneSelected(this.sceneSelectionState, scene);
+  }
+
+  selectedSceneCount(type: SceneKind): number {
+    return selectedCountForType(this.sceneSelectionState, type);
+  }
+
+  // 만료 프로젝트 알림
+  // dir = 신 배치 휴지통 폴더(동명 구분용, 2026-10-02 S2)
+  @observable accessor pendingExpiredProjects: {
+    name: string;
+    deletedAt: number;
+    dir?: string;
+  }[] = [];
+
+  // 씬 카드 디자인 설정
+  @observable accessor classicSceneCard: boolean = false;
+
+  // 레거시 프로젝트 모드: true면 기존 드롭다운 선택 UI 유지(드로어/드롭다운/그리드 공존),
+  // false(기본)면 드롭다운을 제거하고 드로어 트리거로 전환
+  @observable accessor legacyProjectMode: boolean = false;
+
+  // 켜면 씬 에디터 첫 탭을 예전 프리셋 폼으로 표시(4탭 구조는 항상 유지). 기본 false = 첫 탭 단순화(중간 프롬프트+씬 네거티브)
+  @observable accessor legacySceneEditor: boolean = false;
+
+  // 레거시 작업모드(W3): true면 이지모드·이미지 수정 작업모드와 선택 드롭다운을 다시 표시.
+  // false(기본)면 작업모드를 SDImageGen 하나로 고정하고 드롭다운 숨김(데이터 비파괴 — 세션의 이지모드 프리셋은 보존).
+  @observable accessor legacyWorkflowMode: boolean = false;
+
+  // 씬 툴바 레거시 텍스트 버튼(config.sceneToolbarLegacyText 미러): true면 PC 씬 툴바를
+  // 예전 텍스트 버튼으로 표시. false(기본)면 아이콘+툴팁. 모바일 아이콘 축약과는 무관.
+  @observable accessor sceneToolbarLegacyText: boolean = false;
+
+  // 조합 에디터 뷰 모드(config.uiCombinationView 미러). 'card'=카드 격자 / 'list'=컴팩트 목록.
+  @observable accessor uiCombinationView: 'card' | 'list' = 'card';
+
+  // 툴바 버튼 배치 커스터마이징(config.uiToolbar 미러). 빈 객체 = 기본 등급.
+  // 배치 해석은 resolveToolbar(uiLayout.ts) 단일 출처.
+  @observable accessor uiToolbar: UiToolbarConfig = {};
+
+  // 프리셋 에디터 요소 순서 오버라이드(config.uiPresetLayout 미러, L1-3). 빈 객체 =
+  // 오버라이드 없음 = 정의 순서 그대로(기존 동작). 슬롯 키 계약·순서 해석은
+  // presetLayoutSlotKey/resolveStackInputs(presetLayout.ts) 단일 출처. 로드는 App.tsx.
+  // (쓰기 API 는 L1-4 소관 — 이번 단계는 읽기 배선만.)
+  @observable accessor uiPresetLayout: Record<string, string[]> = {};
+
+  // 동반 슬롯 미러(config.uiCompanionSlots, L3-1). 빈 객체 = 슬롯 없음 = 현행 렌더.
+  // 화이트리스트·해석은 resolveCompanionButtons(companionSlots.ts) 단일 출처. 로드는
+  // App.tsx. (쓰기 API 는 L3-3 ConfigScreen 소관 — 이번 단계는 읽기 배선만.)
+  @observable accessor uiCompanionSlots: Record<string, string[]> = {};
+
+  // 레이아웃 템플릿 id(config.uiLayoutTemplate 미러). 기본 'classic'.
+  // 배치 해석은 resolveLayout(layoutTemplates.ts) 단일 출처.
+  @observable accessor uiLayoutTemplate: string = 'classic';
+
+  // 모바일 V2 부위별 적용(config.uiMobileV2Parts 미러, 2026-09-27). undefined = 전부 켬. 판정은 mobileV2.ts isV2(part).
+  @observable accessor uiMobileV2Parts: Partial<MobileV2Parts> | undefined =
+    undefined;
+
+  // 모바일 V2 기본 전환 안내 창 대기(bootstrap 이 세우고 App 이 bootReady 뒤 한 번 띄운다, 2026-09-27).
+  @observable accessor mobileV2IntroPending: boolean = false;
+
+  // 프리셋 패널 버튼 하단 아이콘 행(config.uiPresetIconRow 미러). 기본 false = 현행
+  // 세로 넓은 버튼. 소비는 PreSetEdtior.tsx(PresetRootRender), 로드는 App.tsx.
+  @observable accessor uiPresetIconRow: boolean = false;
+
+  // 모바일 V2: 퀵 생성 탭이 하단 바 자리를 [생성][해상도]로 쓰는 동안 true(큐용 하단 바 숨김). models/mobileV2.ts
+  @observable accessor mobileV2QuickBar: boolean = false;
+
+  // 모바일 V2: 하단 시트 프롬프트가 열려 있는 동안 true. 드로어 손잡이·가장자리 스와이프가 물러난다(MobilePromptSheet).
+  @observable accessor mobileV2SheetOpen: boolean = false;
+
+  // 모바일 V2: 시트가 열린 채 소프트 키보드가 떠 있는 동안 true. 하단 바가 키보드 위로 밀려 올라와 시트와 키보드
+  // 사이에 끼어 보이지 않게 BottomBar 가 이 동안 숨는다(2026-09-23 실기기 피드백, MobilePromptSheet 가 갱신).
+  @observable accessor mobileV2SheetKeyboard: boolean = false;
+
+  // 작가 라이브러리에서 특정 작가 카드를 열어 달라는 요청(프롬프트 편집기의 「작가 라이브러리」 버튼, 2026-09-26).
+  // nonce 로 같은 작가를 연달아 요청해도 반응하게 한다. 소비는 ArtistLibraryTab.
+  @observable accessor artistLibraryFocus: {
+    id: string;
+    nonce: number;
+  } | null = null;
+
+  // PC 전용 플로팅 생성 컨트롤(config.genWidget 미러). 빈 객체 = 부착 상태(기본).
+  // detached 여부·위치는 GenControlWidget.tsx 가 조작·저장한다.
+  @observable accessor genWidget: NonNullable<Config['genWidget']> = {};
+
+  // 레이아웃 슬롯 개인화(config.uiLayoutSlots 미러). 빈 객체 = 템플릿 기본(기존 동작).
+  // 배치 해석은 resolveLayout(layoutTemplates.ts) 단일 출처. 부팅 시 로드는 App.tsx 담당.
+  @observable accessor uiLayoutSlots: UiLayoutSlots = {};
+
+  // 창 배치(config.uiFloatViewMode 미러) — FloatView(뷰어 등)가 덮는 영역.
+  // 'cover'(기본)=좌우 패널 위로 넓게 / 'center'=중앙 콘텐츠만. 소비는 FloatView.tsx.
+  @observable accessor uiFloatViewMode: 'cover' | 'center' = 'cover';
+
+  // 앱 글꼴(config.uiFont 미러) — 'system'(기본) / 'pretendard'.
+  // 적용은 App.tsx 가 html 에 font-system 클래스를 토글하는 방식(App.css 참조).
+  @observable accessor uiFont: 'pretendard' | 'system' = 'system';
+
+  // 클래식 마감(config.uiClassicFinish 미러) — true 면 심미 개편 전 모양으로 복원.
+  // 적용은 App.tsx 가 html 에 finish-classic 클래스를 토글하는 방식(App.css 참조).
+  @observable accessor uiClassicFinish = false;
+
+  // 알약형 버튼(config.uiPillButtons 미러) — true 면 모던 마감에서도 아이콘만 버튼 반경을 알약으로.
+  // 적용은 App.tsx 가 html 에 pill-buttons 클래스를 토글하는 방식(App.css 참조).
+  @observable accessor uiPillButtons = false;
+
+  // 편집 모드(PC 전용): 화면에서 UI 배치 직접 조작. EditModeShell 이 켜져 있는 동안
+  // 툴바 버튼은 클릭 대신 드래그 편집 대상이 된다.
+  @observable accessor editMode = false;
+
+  // 저장소 접근 불안정 시 자동 저장 일시정지(서킷 브레이커). true(기본)면 보호 활성.
+  // ConfigScreen 저장/부팅 시 config.storageWriteGuard 값으로 갱신된다.
+  @observable accessor storageWriteGuard: boolean = true;
+
+  // 같은 프로젝트 중복 열기 허용(config.allowDuplicateProjectOpen 미러). 기본 false.
+  // true 면 다른 창이 연 프로젝트를 열 때 "소유 창으로 이동 / 읽기 전용 미러로 열기"
+  // 를 선택할 수 있다(bootstrap 락 reaction 소비).
+  @observable accessor allowDuplicateProjectOpen: boolean = false;
+
+  // 자동완성 모드: false=커서 왼쪽만(기본), true=콤마 사이 전체 단어
+  @observable accessor fullWordAutoComplete: boolean = (() => {
+    return localStorage.getItem('sdstudio-full-word-autocomplete') === 'true';
+  })();
+
+  // 프롬프트조각 에디터 오버레이
+  @observable accessor pieceEditorOpen: boolean = false;
+
+  // 찾기 및 변환 다이얼로그
+  @observable accessor findReplaceOpen: boolean = false;
+
+  // 프로젝트 휴지통 오버레이 (전역 액션 — 어느 화면에서든 열림)
+  @observable accessor projectTrashOpen: boolean = false;
+
+  // 캐릭터 프리셋 관리 오버레이 (전역 액션 — 어느 화면에서든 열림)
+  @observable accessor characterPresetsOpen: boolean = false;
+
+  // 씬 템플릿 관리 오버레이 (씬 템플릿 개편 — 숨김 템플릿의 유일한 관리 지점)
+  @observable accessor sceneTemplateManagerOpen: boolean = false;
+
+  @observable accessor exportPresetManagerOpen: boolean = false;
+
+  @observable.ref accessor directExportRequest:
+    | import('./exportSettings').DirectExportRequest
+    | undefined = undefined;
+
+  lastExportType: 'scene' | 'inpaint' = 'scene';
+
+  lastExportSelected?: GenericScene[];
+
+  lastExportSession?: Session;
+
+  // 모달 오버레이 카운터 (열린 ModalOverlay 수 추적)
+  @observable accessor modalOverlayCount: number = 0;
+
+  // 내보내기 진행 상태 (비차단형 — ProgressWindow 대신 플로팅 위젯 사용)
+  @observable accessor exportProgress: ProgressDialog | undefined = undefined;
+
+  @action
+  incrementModalOverlay() {
+    this.modalOverlayCount++;
+  }
+
+  @action
+  decrementModalOverlay() {
+    this.modalOverlayCount = Math.max(0, this.modalOverlayCount - 1);
+  }
+
+  // 단축키 시스템용 상태
+  @observable accessor floatViewCount: number = 0;
+
+  @observable accessor resultViewerOpen: boolean = false;
+
+  @observable accessor imageGridFocusable: boolean = false;
+
+  @observable accessor configScreenOpen: boolean = false;
+
+  @observable accessor showSceneCheatsheet: boolean = true;
+
+  @observable accessor showTournamentCheatsheet: boolean = true;
+
+  @action
+  incrementFloatView() {
+    this.floatViewCount++;
+  }
+
+  @action
+  decrementFloatView() {
+    this.floatViewCount = Math.max(0, this.floatViewCount - 1);
+  }
+
+  // Historical field name: the requested root is unavailable, so boot and all
+  // user-data IO stay blocked until an explicit recovery and restart.
+  @observable accessor saveLocationFallback: {
+    attempted: string;
+    code: string;
+  } | null = null;
+
+  @observable accessor storageLocationChange: {
+    path: string;
+    phase: 'saving' | 'restarting';
+    error?: string;
+  } | null = null;
+
+  // 저장 위치가 프로그램 설치 폴더 안(데스크톱): 업데이트 설치 때 삭제될 수 있다. bootstrap 이
+  // 채우고 App.tsx 가 부팅 후 1회 안내한다(전면 차단 없음·경로 무변경). 안내하면 null 로 되돌린다.
+  @observable accessor saveLocationInsideInstall: {
+    path: string;
+    installDir: string;
+  } | null = null;
+
+  // config.json 이 존재하지만 읽기·파싱에 실패한 상태. 저장 경로 자체를 신뢰할 수
+  // 없으므로 프로젝트 스캔과 저장을 시작하지 않고 재시작 안내 게이트를 표시한다.
+  @observable accessor configLoadFailure: {
+    path: string;
+    code: string;
+  } | null = null;
+
+  // 자체 실행/중지 컨트롤을 가진 오버레이(인페인트 편집기 등) 개수.
+  // PC 는 하단바가 오버레이에 덮이지 않아 실행 버튼이 2개 노출되므로,
+  // 이 값이 0보다 크면 BottomBar 가 실행 컨트롤을 숨긴다.
+  @observable accessor genControlOverlayCount: number = 0;
+
+  @action
+  incrementGenControlOverlay() {
+    this.genControlOverlayCount++;
+  }
+
+  @action
+  decrementGenControlOverlay() {
+    this.genControlOverlayCount = Math.max(0, this.genControlOverlayCount - 1);
+  }
+
+  @action
+  openPieceEditor() {
+    this.pieceEditorOpen = true;
+  }
+
+  // 새 창 열기(멀티 윈도우 W6) — 데스크톱 전용(모바일 백엔드는 no-op). 각 창은
+  // 자기만의 curSession 을 갖는 완전한 렌더러 앱으로, 보조 창 규칙(캐스케이드,
+  // 창 상태 저장 없음)으로 열린다.
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Window creation is exposed through AppState even though the native backend owns its state.
+  openNewWindow() {
+    backend.openNewWindow().catch((e) => {
+      console.error('새 창 열기 실패:', e);
+    });
+  }
+
+  @action
+  closePieceEditor() {
+    this.pieceEditorOpen = false;
+  }
+
+  @action
+  openFindReplace() {
+    this.findReplaceOpen = true;
+  }
+
+  @action
+  closeFindReplace() {
+    this.findReplaceOpen = false;
+  }
+
+  // 아티스트 태깅(B군 승격, 퀵 메뉴 P2) — 세션 무관·PC 전용(진입점이 pcOnly).
+  // 모달 호스트는 App.tsx 전역 오버레이.
+  @observable accessor artistTagOpen: boolean = false;
+
+  @action
+  openArtistTag() {
+    this.artistTagOpen = true;
+  }
+
+  // 씬 휴지통(B군 승격, 퀵 메뉴 P2) — SceneTrashView 가 curSession.name 을 쓰므로 세션 가드.
+  @observable accessor sceneTrashOpen: boolean = false;
+
+  @action
+  openSceneTrash() {
+    if (!this.curSession) {
+      this.pushMessage('프로젝트를 먼저 선택해주세요');
+      return;
+    }
+    this.sceneTrashOpen = true;
+  }
+
+  // 퀵 메뉴(P3) — 오버레이 열림 상태 + 구성(config.quickMenu 미러, undefined=추천 기본).
+  @observable accessor quickMenuOpen: boolean = false;
+
+  @observable accessor quickMenu: string[] | undefined = undefined;
+
+  // ⚡ 플로팅 버튼 표시(config.quickMenuButton 미러) — 기본 false=숨김(옵트인).
+  @observable accessor quickMenuButton: boolean = false;
+
+  // 메인 탭 문맥('scene'|'inpaint'|'other') — 퀵 메뉴의 export 계열 액션이 활성 탭을
+  // 따라가기 위한 추적(D3). App.tsx 탭 onClick 이 갱신, 세션 전환 시 'scene' 리셋.
+  @observable accessor curMainTab: 'scene' | 'inpaint' | 'other' = 'scene';
+
+  // 캐릭터 프리셋 관리 열기 — 진입점(프로젝트 툴바 bar/sidebar 등)이 공유하는
+  // 전역 액션. 세션 가드·모바일 적용중 선택 다이얼로그까지 여기서 처리한다.
+  @action
+  openCharacterPresets() {
+    if (!this.curSession) {
+      this.pushMessage('프로젝트를 먼저 선택해주세요');
+      return;
+    }
+    // 모바일 + 프리셋 적용 중: 해제/관리 선택 (W4 다중 적용 — 프리셋별 개별 해제)
+    const appliedNames = this.appliedCharacterPresetNames;
+    if (isMobile && appliedNames.length > 0) {
+      this.pushDialog({
+        type: 'select',
+        text:
+          appliedNames.length === 1
+            ? `"${appliedNames[0]}" 프리셋이 적용 중입니다.`
+            : `캐릭터 프리셋 ${appliedNames.length}개가 적용 중입니다.`,
+        items: [
+          ...appliedNames.map((n) => ({
+            text: `"${n}" 해제`,
+            value: `clear:${n}`,
+          })),
+          ...(appliedNames.length > 1
+            ? [{ text: '모두 해제', value: 'clear-all' }]
+            : []),
+          { text: '프리셋 관리 열기', value: 'manage' },
+        ],
+        callback: (value?: string) => {
+          if (value?.startsWith('clear:')) {
+            this.removeAppliedCharacterPreset(value.slice('clear:'.length));
+          } else if (value === 'clear-all') {
+            this.clearAppliedCharacterPreset();
+          } else if (value === 'manage') {
+            this.characterPresetsOpen = true;
+          }
+        },
+      });
+      return;
+    }
+    this.characterPresetsOpen = true;
+  }
+
+  @action
+  closeCharacterPresets() {
+    this.characterPresetsOpen = false;
+  }
+
+  // 신규 프로젝트 생성 — 진입점(프로젝트 툴바 bar/sidebar 등)이 공유하는 전역 액션.
+  // 이름 입력 다이얼로그 + 템플릿 선택까지 여기서 처리한다 (SessionSelect 로컬에서 이관).
+  @action
+  addSession() {
+    (async () => {
+      // 이름 규칙·중복은 입력 창 안에서 검사(models/nameInput — 실패해도 창 유지)
+      const inputValue = await promptName({
+        title: '신규 프로젝트 이름을 입력해주세요',
+        ...projectNameRules(sessionService),
+      });
+      if (!inputValue) return;
+      const tplId = await projectTemplateService.pickForCreate();
+      if (tplId === undefined) return; // 사용자가 템플릿 선택을 취소
+      try {
+        if (tplId) {
+          await sessionService.createSessionFromProjectTemplate(
+            tplId,
+            inputValue,
+          );
+        } else {
+          await sessionService.add(inputValue);
+        }
+        const newSession = (await sessionService.get(inputValue))!;
+        this.curSession = newSession;
+      } catch (e: any) {
+        this.pushMessage(
+          nameErrorMessage(
+            e,
+            'project',
+            inputValue,
+            '프로젝트 생성에 실패했습니다.',
+          ),
+          'error',
+        );
+      }
+    })();
+  }
+
+  // 현재 프로젝트 삭제(휴지통으로 이동) — 전역 액션 (SessionSelect 로컬에서 이관).
+  @action
+  deleteSession() {
+    this.pushDialog({
+      type: 'confirm',
+      // 대상 이름을 보인다(드로어 삭제와 같은 문구 — 2026-10-03 E1)
+      ...deleteConfirmText({
+        kind: 'project',
+        name: this.curSession?.name,
+        outcome: { trashDays: PROJECT_RETENTION_DAYS },
+      }),
+      callback: async () => {
+        const name = this.curSession?.name;
+        if (!name) return;
+        // 예외·다른 창 잠금(조용히 반환 — 목록에 남음)은 실패로 안내하고 열린 프로젝트를 유지한다(X4).
+        const outcome = await runTrashDelete({
+          remove: () => sessionService.delete(name),
+          stillExists: () => sessionService.list().includes(name),
+        });
+        const result = projectDeleteResultText(outcome, PROJECT_RETENTION_DAYS);
+        if (result.ok && this.curSession?.name === name) {
+          this.curSession = undefined;
+        }
+        this.pushMessage(result.text);
+      },
+    });
+  }
+
+  // 프로젝트 휴지통 열기/닫기 — 전역 오버레이(App.tsx 호스트)를 여는 진입점.
+  @action
+  openProjectTrash() {
+    this.projectTrashOpen = true;
+  }
+
+  @action
+  closeProjectTrash() {
+    this.projectTrashOpen = false;
+  }
+
+  // 캐릭터 프리셋 적용 코어 — 임의 세션 대상(현재 세션 UI 적용과 배치 생성의
+  // 백그라운드 자식 세션이 공유). UI 메시지/열림 상태는 건드리지 않는다.
+  // 세션 목록에 추가(addCharacterPreset)만으로는 아무 효과가 없고, 이 적용을
+  // 거쳐야 캐릭터 프롬프트/바이브/레퍼런스가 shared 에 실려 실제 동작한다.
+  @action
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- This action mutates its explicit target session and remains part of the AppState instance API.
+  applyCharacterPresetToSession(
+    session: Session,
+    workflowType: string,
+    preset: CharacterPreset,
+    mode: 'easy' | 'character',
+  ): boolean {
+    // 이지모드 적용은 SDImageGenEasy 전용
+    if (mode === 'easy' && workflowType !== 'SDImageGenEasy') return false;
+
+    let shared = session.presetShareds.get(workflowType);
+    if (!shared) {
+      shared = workFlowService.buildShared(workflowType);
+      session.presetShareds.set(workflowType, shared);
+    }
+
+    runInAction(() => {
+      // 다중 적용(W4, character 모드): 같은 프리셋에서 온 항목만 갱신(재적용)하고
+      // 다른 프리셋 항목은 유지 = 추가형. 이지모드는 단일 필드 구조라 종전대로
+      // 프리셋 유래 항목 전체 교체(단일 적용 의미론 유지). 수동 항목은 늘 보존.
+      const keepFilter =
+        mode === 'easy'
+          ? (x: any) => !x.fromPreset
+          : (x: any) => x.fromPreset !== preset.name;
+      const prevVibes = (shared.vibes || []).filter(keepFilter);
+      const prevRefs = (shared.characterReferences || []).filter(keepFilter);
+
+      // 프리셋의 바이브/레퍼런스를 태그 붙여서 추가
+      const presetVibes = (preset.vibes || []).map((v: VibeItem) => {
+        const item = VibeItem.fromJSON(v.toJSON());
+        item.fromPreset = preset.name;
+        return item;
+      });
+      const presetRefs = (preset.characterReferences || []).map(
+        (r: ReferenceItem) => {
+          const item = ReferenceItem.fromJSON(r.toJSON());
+          item.fromPreset = preset.name;
+          return item;
+        },
+      );
+
+      shared.vibes = [...prevVibes, ...presetVibes];
+      shared.characterReferences = [...prevRefs, ...presetRefs];
+
+      if (mode === 'easy') {
+        shared.characterPrompt = preset.characterPrompt || '';
+        shared.backgroundPrompt = preset.backgroundPrompt || '';
+        shared.uc = preset.characterUC || '';
+      } else {
+        // 같은 프리셋의 기존 캐릭터 프롬프트만 갱신 (수동·타 프리셋 항목 유지)
+        const replacedPrompt = (shared.characterPrompts || []).find(
+          (cp: CharacterPrompt) => cp.fromPreset === preset.name,
+        );
+        const prevPrompts = (shared.characterPrompts || []).filter(
+          (cp: CharacterPrompt) => cp.fromPreset !== preset.name,
+        );
+        if (preset.characterPrompt || preset.characterUC) {
+          const newEntry: CharacterPrompt = {
+            id: replacedPrompt?.id || v4(),
+            prompt: preset.characterPrompt || '',
+            uc: preset.characterUC || '',
+            position: { x: 0.5, y: 0.5 },
+            enabled: true,
+            fromPreset: preset.name,
+            order: replacedPrompt?.order,
+          };
+          shared.characterPrompts = [...prevPrompts, newEntry];
+        } else {
+          shared.characterPrompts = prevPrompts;
+        }
+      }
+
+      // 적용 상태는 shared 에 영속 (_appliedPresetName = 마지막 적용, 표시/호환용)
+      shared._appliedPresetName = preset.name || '';
+    });
+    return true;
+  }
+
+  // 캐릭터 프리셋 개별 해제(W4): 해당 프리셋 태그가 붙은 캐릭터 프롬프트/바이브/
+  // 레퍼런스만 제거. 수동 항목·다른 프리셋 항목은 유지.
+  @action
+  removeAppliedCharacterPreset(name: string) {
+    if (!this.removeAppliedCharacterPresetCore(name)) return;
+    this.pushMessage(`"${name}" 프리셋이 해제되었습니다 (연결 항목 함께 제거)`);
+  }
+
+  // 일괄 해제(W4 후속): 팝오버 체크 선택 해제용 — 토스트는 1회로 묶는다.
+  @action
+  removeAppliedCharacterPresets(names: string[]) {
+    const removed = names.filter((n) =>
+      this.removeAppliedCharacterPresetCore(n),
+    );
+    if (removed.length === 0) return;
+    this.pushMessage(
+      removed.length === 1
+        ? `"${removed[0]}" 프리셋이 해제되었습니다 (연결 항목 함께 제거)`
+        : `프리셋 ${removed.length}개가 해제되었습니다 (연결 항목 함께 제거)`,
+    );
+  }
+
+  // 해제 코어 (토스트 없음) — 개별/일괄 해제가 공유
+  private removeAppliedCharacterPresetCore(name: string): boolean {
+    const session = this.curSession;
+    if (!session) return false;
+    const workflowType = session.selectedWorkflow?.workflowType;
+    if (!workflowType) return false;
+    const shared = session.presetShareds.get(workflowType);
+    if (!shared) return false;
+
+    shared.vibes = (shared.vibes || []).filter(
+      (v: any) => v.fromPreset !== name,
+    );
+    shared.characterReferences = (shared.characterReferences || []).filter(
+      (r: any) => r.fromPreset !== name,
+    );
+    if (shared.characterPrompts) {
+      shared.characterPrompts = shared.characterPrompts.filter(
+        (cp: any) => cp.fromPreset !== name,
+      );
+    }
+    // 마지막 적용 표시가 해제 대상이었다면 남은 프리셋 중 마지막으로 갱신
+    if (shared._appliedPresetName === name) {
+      const remaining = this.appliedCharacterPresetNames;
+      shared._appliedPresetName = remaining[remaining.length - 1] || '';
+    }
+    return true;
+  }
+
+  // 캐릭터 프리셋을 현재 세션에 적용 (SessionSelect 로컬 콜백에서 이관 — 로직 무변경)
+  @action
+  applyCharacterPreset(preset: CharacterPreset, mode: 'easy' | 'character') {
+    const { curSession } = this;
+    if (!curSession) return;
+
+    const workflowType = curSession.selectedWorkflow?.workflowType;
+    if (!workflowType) {
+      this.pushMessage('워크플로우를 먼저 선택해주세요');
+      return;
+    }
+
+    // Mode 1: 이지모드 적용 (SDImageGenEasy 전용)
+    if (mode === 'easy' && workflowType !== 'SDImageGenEasy') {
+      this.pushMessage(
+        '이지모드 적용은 "이미지 생성 (이지모드)" 워크플로우에서만 사용 가능합니다',
+      );
+      return;
+    }
+
+    if (
+      !this.applyCharacterPresetToSession(
+        curSession,
+        workflowType,
+        preset,
+        mode,
+      )
+    ) {
+      return;
+    }
+
+    this.characterPresetsOpen = false;
+    const modeLabel = mode === 'easy' ? '이지모드' : '캐릭터 프롬프트';
+    this.pushMessage(`"${preset.name}" 프리셋이 ${modeLabel}로 적용되었습니다`);
+  }
+
+  // 캐릭터 프리셋 일괄 적용(W4 후속): 프리셋 관리의 선택 모드에서 여러 개를
+  // 한 번에 캐릭터 프롬프트로 추가 적용. 토스트는 1회로 묶는다.
+  @action
+  applyCharacterPresets(presets: CharacterPreset[]) {
+    const { curSession } = this;
+    if (!curSession || presets.length === 0) return;
+    const workflowType = curSession.selectedWorkflow?.workflowType;
+    if (!workflowType) {
+      this.pushMessage('워크플로우를 먼저 선택해주세요');
+      return;
+    }
+    for (const p of presets) {
+      this.applyCharacterPresetToSession(
+        curSession,
+        workflowType,
+        p,
+        'character',
+      );
+    }
+    this.characterPresetsOpen = false;
+    this.pushMessage(
+      presets.length === 1
+        ? `"${presets[0].name}" 프리셋이 캐릭터 프롬프트로 적용되었습니다`
+        : `프리셋 ${presets.length}개가 캐릭터 프롬프트로 적용되었습니다`,
+    );
+  }
+
+  @action
+  openExportPresetManager() {
+    this.exportPresetManagerOpen = true;
+  }
+
+  @action
+  closeExportPresetManager() {
+    this.exportPresetManagerOpen = false;
+  }
+
+  // 좌측 패널 상태
+  @observable accessor leftPanelWidth: number = (() => {
+    const saved = localStorage.getItem('sdstudio-left-panel-width');
+    return saved
+      ? Math.max(250, Math.min(800, parseInt(saved, 10) || 400))
+      : 400;
+  })();
+
+  @observable accessor leftPanelCollapsed: boolean = (() => {
+    return localStorage.getItem('sdstudio-left-panel-collapsed') === 'true';
+  })();
+
+  @action
+  setLeftPanelWidth(w: number) {
+    this.leftPanelWidth = w;
+    localStorage.setItem('sdstudio-left-panel-width', String(w));
+  }
+
+  @action
+  toggleLeftPanel() {
+    this.leftPanelCollapsed = !this.leftPanelCollapsed;
+    localStorage.setItem(
+      'sdstudio-left-panel-collapsed',
+      String(this.leftPanelCollapsed),
+    );
+  }
+
+  // 우측 히스토리 패널 (PC push). 기본 접힘 — 기존 레이아웃 불변.
+  @observable accessor historyPanelCollapsed: boolean = (() => {
+    return localStorage.getItem('sdstudio-history-panel-collapsed') !== 'false';
+  })();
+
+  // 히스토리 패널 폭 — 접기 스트립 드래그로 조절(프리셋 패널 폭과 동일한 방식/저장).
+  @observable accessor historyPanelWidth: number = (() => {
+    const saved = localStorage.getItem('sdstudio-history-panel-width');
+    return saved
+      ? Math.max(200, Math.min(600, parseInt(saved, 10) || 240))
+      : 240;
+  })();
+
+  @action
+  setHistoryPanelWidth(w: number) {
+    this.historyPanelWidth = w;
+    localStorage.setItem('sdstudio-history-panel-width', String(w));
+  }
+
+  // 좌우 오버레이 드로어(프로젝트·히스토리)는 동시에 열리지 않는다 — 한쪽을 열면 반대쪽은 닫는다.
+  // 모바일 양쪽 손잡이를 연달아 누르면 두 드로어가 겹쳐 열리던 문제(2026-09-20). 스와이프 열기는
+  // 반대쪽이 열려 있으면 아예 무반응(edgeSwipe.canOpenDrawerBySwipe)이고, 손잡이·단축키는 전환이다.
+  @action
+  toggleSideDrawer(which: 'project' | 'history') {
+    if (which === 'project') {
+      const next = !this.projectDrawerOpen;
+      if (next) this.historyDrawerOpen = false;
+      this.projectDrawerOpen = next;
+    } else {
+      const next = !this.historyDrawerOpen;
+      if (next) this.projectDrawerOpen = false;
+      this.historyDrawerOpen = next;
+    }
+  }
+
+  @action
+  toggleHistoryPanel() {
+    this.historyPanelCollapsed = !this.historyPanelCollapsed;
+    localStorage.setItem(
+      'sdstudio-history-panel-collapsed',
+      String(this.historyPanelCollapsed),
+    );
+  }
+
+  // 히스토리 목록 열 수 (1열=크게 / 2열=조밀). PC 패널·모바일 드로어 공용.
+  @observable accessor historyColumns: 1 | 2 = (() => {
+    return localStorage.getItem('sdstudio-history-columns') === '1' ? 1 : 2;
+  })();
+
+  @action
+  toggleHistoryColumns() {
+    this.historyColumns = this.historyColumns === 2 ? 1 : 2;
+    localStorage.setItem(
+      'sdstudio-history-columns',
+      String(this.historyColumns),
+    );
+  }
+
+  // 모바일 우측 히스토리 드로어 (비영속)
+  @observable accessor historyDrawerOpen: boolean = false;
+
+  @action
+  addMessage(message: string, kind?: ToastKind): void {
+    this.messages.push({
+      id: ++this.messageIdCounter,
+      text: message,
+      kind: resolveToastKind(message, kind),
+    });
+    // 폭주 방지: 최대 8개만 유지(오래된 것부터 제거)
+    if (this.messages.length > 8) {
+      this.messages.splice(0, this.messages.length - 8);
+    }
+  }
+
+  @action
+  removeMessage(id: number): void {
+    const idx = this.messages.findIndex((m) => m.id === id);
+    if (idx >= 0) this.messages.splice(idx, 1);
+  }
+
+  @action
+  addDialog(dialog: Dialog): void {
+    this.dialogs.push(dialog);
+  }
+
+  @action
+  setSamples(samples: number): void {
+    this.samples = samples;
+  }
+
+  // kind 생략 시 문구로 추론(오류 우선 — models/toastKind.ts). 문구로 알 수 없는 오류(예외 메시지 그대로)는
+  // 'error' 를 명시한다(2026-10-03 U1·X7).
+  pushMessage(msg: string, kind?: ToastKind) {
+    this.addMessage(msg, kind);
+  }
+
+  pushDialog(dialog: Dialog) {
+    this.dialogs.push(dialog);
+  }
+
+  copyImagesToClipboard(paths: string[]) {
+    this.imageClipboard = [...paths];
+    this.pushMessage(`${paths.length}장의 이미지가 복사되었습니다.`);
+  }
+
+  async pasteImagesFromClipboard(session: Session, scene: GenericScene) {
+    if (this.imageClipboard.length === 0) {
+      this.pushMessage('복사된 이미지가 없습니다.');
+      return;
+    }
+    const targetDir = imageService.getOutputDir(session, scene);
+    let copied = 0;
+    let failed = 0;
+    for (const srcPath of this.imageClipboard) {
+      try {
+        // 원본 확장자 보존(webp/png) — 고정 .png 로 붙여넣으면 내용/확장자 불일치
+        const ext = srcPath.split('.').pop() || 'png';
+        const filename = `${Date.now().toString()}_${copied}.${ext}`;
+        await backend.copyFile(srcPath, `${targetDir}/${filename}`);
+        copied++;
+      } catch (e) {
+        failed++;
+        console.error('이미지 붙여넣기 실패:', srcPath, e);
+      }
+    }
+    await imageService.refresh(session, scene);
+    // 부분 실패도 한 줄로(성공 N · 실패 M, X13)
+    this.pushMessage(pasteResultText(copied, failed));
+  }
+
+  pushDialogAsync(dialog: Dialog) {
+    return new Promise<string | undefined>((resolve, _reject) => {
+      dialog.callback = (value?: string, _text?: string) => {
+        resolve(value);
+      };
+      dialog.onCancel = () => {
+        resolve(undefined);
+      };
+      this.dialogs.push(dialog);
+    });
+  }
+
+  /**
+   * 확인 창(confirm)을 띄워 [확인]=true / [취소]·Esc·뒤로 가기=false 로 돌려준다(2026-10-03 U1·X14).
+   * 확인/취소를 구분하는 확인은 이것 하나만 쓴다(손으로 만든 Promise·askConfirm 래퍼 금지 — specGuard).
+   * 두 가지 호출형: confirmAsync({ text, confirmText, danger, cancelText, ... }) 또는
+   * confirmAsync(text, confirmText?, { danger?, cancelText?, requireClick? }).
+   * 기본 [확인] 은 중립 파랑, danger: true 면 빨강, danger: 'permanent' 면 빨강+Enter 무시(2026-10-03 D1).
+   * requireClick: true 는 색과 별개로 Enter 무시(버튼 클릭·탭 필수 — 생성 도중 비동기로 뜨는 과금 확인).
+   */
+  confirmAsync(opts: ConfirmAsyncOptions): Promise<boolean>;
+
+  confirmAsync(
+    text: string,
+    confirmText?: string,
+    opts?: Pick<Dialog, 'danger' | 'cancelText' | 'requireClick'>,
+  ): Promise<boolean>;
+
+  confirmAsync(
+    textOrOpts: string | ConfirmAsyncOptions,
+    confirmText?: string,
+    opts?: Pick<Dialog, 'danger' | 'cancelText' | 'requireClick'>,
+  ): Promise<boolean> {
+    const full: ConfirmAsyncOptions =
+      typeof textOrOpts === 'string'
+        ? {
+            text: textOrOpts,
+            ...(confirmText !== undefined ? { confirmText } : {}),
+            ...opts,
+          }
+        : textOrOpts;
+    return confirmViaDialog<Dialog>((d) => this.pushDialog(d), full);
+  }
+
+  setProgressDialog(dialog: ProgressDialog | undefined) {
+    this.progressDialog = dialog;
+  }
+
+  // 내보내기 완료 표시. 모바일은 파일 열기/공유 시트가 완료를 알리므로 별도 표시하지
+  // 않는다(중복 방지). PC는 우하단 위젯을 "완료"로 전환하고 15초 뒤 자동 소멸시킨다.
+  private exportCompleteTimer: any = undefined;
+
+  showExportComplete(text: string = '내보내기 완료') {
+    if (isMobile) {
+      this.exportProgress = undefined;
+      return;
+    }
+    this.exportProgress = { text, done: 1, total: 1, completed: true };
+    if (this.exportCompleteTimer) clearTimeout(this.exportCompleteTimer);
+    this.exportCompleteTimer = setTimeout(() => {
+      // 그 사이 새 내보내기가 시작됐으면(진행 위젯이면) 건드리지 않는다.
+      if (this.exportProgress?.completed) this.exportProgress = undefined;
+      this.exportCompleteTimer = undefined;
+    }, 15000);
+  }
+
+  dismissExportComplete() {
+    if (this.exportCompleteTimer) {
+      clearTimeout(this.exportCompleteTimer);
+      this.exportCompleteTimer = undefined;
+    }
+    this.exportProgress = undefined;
+  }
+
+  /** Resolves after file reading, user choices and durable imports; returns only owned creations. */
+  async handleFile(file: File): Promise<string[]> {
+    const handleAddSession = async (json: any): Promise<string[]> => {
+      const importProject = async (): Promise<string[]> => {
+        const existing = await sessionService.get(json.name);
+        const name = existing
+          ? await promptName({
+              title: '프로젝트를 불러옵니다. 새 프로젝트 이름을 입력하세요.',
+              ...projectNameRules(sessionService),
+            })
+          : json.name;
+        if (!name) return [];
+        try {
+          await sessionService.importSessionShallow(json as ISession, name);
+        } catch (error) {
+          this.pushMessage(
+            nameErrorMessage(
+              error,
+              'project',
+              name,
+              '프로젝트를 불러오지 못했습니다.',
+            ),
+            'error',
+          );
+          return [];
+        }
+        try {
+          const imported = await sessionService.get(name);
+          if (imported) this.curSession = imported;
+          if (!existing)
+            this.pushDialog({
+              type: 'yes-only',
+              text: '프로젝트를 불러왔습니다',
+            });
+        } catch (error) {
+          console.error('불러온 프로젝트 화면 갱신 실패:', name, error);
+          this.pushMessage(
+            `"${name}" 프로젝트를 불러왔지만 화면 갱신에 실패했습니다. 프로젝트 목록에서 확인해 주세요.`,
+            'error',
+          );
+        }
+        return [name];
+      };
+      if (!this.curSession) return importProject();
+      const current = this.curSession;
+      const option = await this.pushDialogAsync({
+        type: 'select',
+        text: '프로젝트를 불러옵니다. 원하시는 방식을 선택해주세요.',
+        items: [
+          { text: '새 프로젝트로 불러오기', value: 'new-project' },
+          {
+            text: '현재 프로젝트에 씬만 불러오기 (⚠️! 씬이 덮어씌워짐)',
+            value: 'cur-project',
+          },
+        ],
+      });
+      if (option === 'new-project') return importProject();
+      if (option !== 'cur-project' || this.curSession !== current) return [];
+      const incoming: ISession = await sessionService.migrate(json);
+      if (this.curSession !== current) return [];
+      const overlapping = overlappingSceneNames(
+        Object.keys(incoming.scenes),
+        (name) => current.scenes.has(name),
+      );
+      if (overlapping.length > 0) {
+        const confirmed = await this.confirmAsync({
+          text: sceneImportOverwriteText(overlapping),
+          confirmText: '덮어쓰기',
+          danger: 'permanent',
+        });
+        if (!confirmed || this.curSession !== current) return [];
+      }
+      for (const key of Object.keys(incoming.scenes)) {
+        if (current.scenes.has(key)) {
+          current.scenes.get(key)!.slots = incoming.scenes[key].slots.map(
+            (slot: any) =>
+              slot.map((piece: any) => PromptPiece.fromJSON(piece)),
+          );
+          current.scenes.get(key)!.resolution = incoming.scenes[key].resolution;
+        } else {
+          current.scenes.set(key, Scene.fromJSON(incoming.scenes[key]));
+          current.scenes.get(key)!.mains = [];
+          current.scenes.get(key)!.game = undefined;
+        }
+      }
+      this.pushDialog({ type: 'yes-only', text: '씬을 불러왔습니다' });
+      return [];
+    };
+
+    const handleJSONContent = async (incomingJson: any): Promise<string[]> => {
+      let json = incomingJson;
+      if (isValidSession(json)) return handleAddSession(json);
+      if (isValidNAISPreset(json)) {
+        const pieceNames = extractNAISPieceNames(json.scenes);
+        let libraryName: string | undefined;
+        if (pieceNames.length > 0) {
+          const value = await promptName({
+            title: `NAIS 프리셋에서 조각이 감지되었습니다 (${pieceNames.join(
+              ', ',
+            )}). 사용할 프롬프트조각 라이브러리 이름을 입력해 주세요.`,
+            kind: 'pieceGroup',
+            allowEmpty: true,
+          });
+          if (value === undefined) return [];
+          libraryName = value || undefined;
+        }
+        const converted = convertNAISToSession(json, libraryName);
+        if (libraryName && pieceNames.length > 0) {
+          converted.library[libraryName] = {
+            version: 1,
+            name: libraryName,
+            pieces: pieceNames.map((name) => ({ name, prompt: '' })),
+          };
+        }
+        return handleAddSession(converted);
+      }
+      if (!isValidPieceLibrary(json)) return [];
+      if (!json.version) json = migratePieceLibrary(json);
+      const importToTarget = async (
+        targetLibrary: Map<string, PieceLibrary>,
+        scopeLabel: string,
+        targetSession?: Session,
+      ): Promise<void> => {
+        const afterImport = () => {
+          if (scopeLabel === '전역') globalPieceService.scheduleSave();
+          const session = targetSession ?? this.curSession;
+          if (session) sessionService.reloadPieceLibraryDB(session);
+        };
+        if (!targetLibrary.has(json.name)) {
+          targetLibrary.set(json.name, PieceLibrary.fromJSON(json));
+          afterImport();
+          this.pushDialog({
+            type: 'yes-only',
+            text: `조각모음을 ${scopeLabel}에 불러왔습니다`,
+          });
+          return;
+        }
+        const sourceLibrary = PieceLibrary.fromJSON(json);
+        const target = targetLibrary.get(json.name)!;
+        const sourceNames = new Set(
+          sourceLibrary.pieces.map((piece) => piece.name),
+        );
+        const targetNames = new Set(target.pieces.map((piece) => piece.name));
+        const overlap = [...sourceNames].filter((name) =>
+          targetNames.has(name),
+        );
+        const sourceOnly = [...sourceNames].filter(
+          (name) => !targetNames.has(name),
+        );
+        const targetOnly = [...targetNames].filter(
+          (name) => !sourceNames.has(name),
+        );
+        let detail = `${scopeLabel}에 "${json.name}" 조각그룹이 이미 존재합니다.\n\n`;
+        if (overlap.length)
+          detail += `겹치는 조각(${overlap.length}개): ${overlap.slice(0, 5).join(', ')}${overlap.length > 5 ? ' ...' : ''}\n`;
+        if (sourceOnly.length)
+          detail += `불러온 파일에만 있는 조각(${sourceOnly.length}개): ${sourceOnly.slice(0, 5).join(', ')}${sourceOnly.length > 5 ? ' ...' : ''}\n`;
+        if (targetOnly.length)
+          detail += `기존에만 있는 조각(${targetOnly.length}개): ${targetOnly.slice(0, 5).join(', ')}${targetOnly.length > 5 ? ' ...' : ''}\n`;
+        const items: DialogItem[] = [];
+        if (overlap.length) {
+          items.push({
+            text: '병합 (겹치는 조각 덮어쓰기)',
+            value: 'merge-overwrite',
+            danger: true,
+          });
+          items.push({
+            text: '병합 (겹치는 조각 건너뛰기)',
+            value: 'merge-skip',
+          });
+        } else
+          items.push({
+            text: '병합 (양쪽 조각 모두 유지)',
+            value: 'merge-skip',
+          });
+        items.push({
+          text: '통째로 덮어쓰기 (기존 조각 모두 교체)',
+          value: 'overwrite',
+          danger: true,
+        });
+        items.push({ text: '새 이름으로 불러오기', value: 'rename' });
+        const choice = await this.pushDialogAsync({
+          type: 'select',
+          text: detail,
+          items,
+        });
+        if (!choice || (targetSession && this.curSession !== targetSession))
+          return;
+        if (choice === 'merge-overwrite' || choice === 'merge-skip') {
+          let added = 0;
+          let overwritten = 0;
+          let skipped = 0;
+          for (const sourcePiece of sourceLibrary.pieces) {
+            const index = target.pieces.findIndex(
+              (piece) => piece.name === sourcePiece.name,
+            );
+            if (index < 0) {
+              target.pieces.push(Piece.fromJSON(sourcePiece.toJSON()));
+              added++;
+            } else if (choice === 'merge-overwrite') {
+              target.pieces[index] = Piece.fromJSON(sourcePiece.toJSON());
+              overwritten++;
+            } else skipped++;
+          }
+          afterImport();
+          const parts = [];
+          if (added) parts.push(`${added}개 추가`);
+          if (overwritten) parts.push(`${overwritten}개 덮어쓰기`);
+          if (skipped) parts.push(`${skipped}개 건너뜀`);
+          this.pushMessage(`"${json.name}" 병합 완료: ${parts.join(', ')}`);
+        } else if (choice === 'overwrite') {
+          targetLibrary.delete(json.name);
+          targetLibrary.set(json.name, sourceLibrary);
+          afterImport();
+          this.pushMessage(`"${json.name}" 조각그룹을 덮어썼습니다`);
+        } else if (choice === 'rename') {
+          const name = await promptName({
+            title: '새 조각그룹 이름을 입력하세요',
+            kind: 'pieceGroup',
+            existing: (value) => targetLibrary.has(value),
+          });
+          if (!name || (targetSession && this.curSession !== targetSession))
+            return;
+          if (targetLibrary.has(name)) {
+            this.pushMessage(
+              NAME_INPUT_TEXT.duplicate('pieceGroup', name),
+              'error',
+            );
+            return;
+          }
+          sourceLibrary.name = name;
+          targetLibrary.set(name, sourceLibrary);
+          afterImport();
+          this.pushMessage(`"${name}" 조각그룹을 ${scopeLabel}에 불러왔습니다`);
+        }
+      };
+      if (!this.curSession)
+        await importToTarget(globalPieceService.library, '전역');
+      else {
+        const current = this.curSession;
+        const scope = await this.pushDialogAsync({
+          type: 'select',
+          text: '조각그룹을 어디로 불러올까요?',
+          items: [
+            { text: '현재 프로젝트 (로컬)', value: 'local' },
+            { text: '전역 (모든 프로젝트)', value: 'global' },
+          ],
+        });
+        if (scope === 'local' && this.curSession === current) {
+          await importToTarget(current.library, '로컬', current);
+        } else if (scope === 'global')
+          await importToTarget(globalPieceService.library, '전역');
+      }
+      return [];
+    };
+
+    try {
+      if (file.name.endsWith('.tar')) {
+        const filePath = getImportFilePath(file);
+        if (!filePath) {
+          this.pushMessage('tar 파일 경로를 가져올 수 없습니다');
+          return [];
+        }
+        return await this.handleTarImport(filePath);
+      }
+      if (file.type === 'application/json') {
+        return await handleJSONContent(
+          JSON.parse(await readImportFile(file, 'text')),
+        );
+      }
+      if (isImportImageMime(file.type) && this.curSession) {
+        const data = await readImportFile(file, 'data-url');
+        await this.handlePngImport(dataUriToBase64(data));
+      }
+    } catch (error) {
+      console.error('파일 불러오기 실패:', error);
+      this.pushMessage(
+        `파일을 불러오지 못했습니다: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        'error',
+      );
+    }
+    return [];
+  }
+
+  // ── 백업/내보내기/가져오기: BackupService 로 분리됨 (UI 호환 위임) ──
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  projectBackupMenu() {
+    return backupService.projectBackupMenu();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  duplicateProject() {
+    return backupService.duplicateProject();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  deleteFolderWithProjects(folder: string) {
+    return backupService.deleteFolderWithProjects(folder);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  folderBackupMenu(folder: string) {
+    return backupService.folderBackupMenu(folder);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  fullBackupMenu() {
+    return backupService.fullBackupMenu();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  globalPresetBackupExport() {
+    return backupService.globalPresetBackupExport();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  globalPresetBackupImport() {
+    return backupService.globalPresetBackupImport();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  artistLibraryBackupExport() {
+    return backupService.artistLibraryBackupExport();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  artistLibraryBackupImport() {
+    return backupService.artistLibraryBackupImport();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  projectTemplateBackupExport() {
+    return backupService.projectTemplateBackupExport();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  projectTemplateBackupImport() {
+    return backupService.projectTemplateBackupImport();
+  }
+
+  // 프롬프트 편집기의 「작가 라이브러리」 버튼(2026-09-26): 이름으로 카드를 찾아 열고, 없으면 확인 뒤 새로 만든다.
+  // 탭 전환은 shortcut-action 'tab-4'(작가 라이브러리 탭). 모바일 V2 는 시트가 탭을 덮으므로 먼저 접는다.
+  async openArtistInLibrary(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    let artist = artistLibraryService.findArtistByName(trimmed);
+    if (!artist) {
+      const ok = await this.confirmAsync(
+        `작가 라이브러리에 「${trimmed}」이(가) 없습니다. 새 카드를 만들까요?`,
+      );
+      if (!ok) return;
+      artist = artistLibraryService.createArtist(trimmed);
+      if (!artist) {
+        this.pushMessage('작가 생성에 실패했습니다.');
+        return;
+      }
+    }
+    this.artistLibraryFocus = { id: artist.id, nonce: Date.now() };
+    window.dispatchEvent(new CustomEvent(V2_SHEET_CLOSE_EVENT));
+    window.dispatchEvent(
+      new CustomEvent('shortcut-action', {
+        detail: { action: ARTIST_LIBRARY_TAB_ACTION },
+      }),
+    );
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  handleTarImport(tarPath: string) {
+    return backupService.handleTarImport(tarPath);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  handlePngImport(base64: string) {
+    return backupService.handlePngImport(base64);
+  }
+
+  // ── 내보내기 프리셋/패키지: ExportPresetService 로 분리됨 (UI 호환 위임) ──
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  initExportPresets() {
+    return exportPresetService.initExportPresets();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  loadExportPresets() {
+    return exportPresetService.loadExportPresets();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  saveExportPresets(presets: ExportPreset[]) {
+    return exportPresetService.saveExportPresets(presets);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  detectSpecialCharsFromNames(
+    sceneNames: string[],
+    separator: string,
+    autoConvert = false,
+  ) {
+    return exportPresetService.detectSpecialCharsFromNames(
+      sceneNames,
+      separator,
+      autoConvert,
+    );
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  exportPackage(type: 'scene' | 'inpaint', selected?: GenericScene[]) {
+    return exportPresetService.exportPackage(type, selected);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  quickExportPackage(type: 'scene' | 'inpaint', selected?: GenericScene[]) {
+    return exportPresetService.quickExportPackage(type, selected);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  exportPreset(session: Session, preset: any) {
+    return exportPresetService.exportPreset(session, preset);
+  }
+
+  // ---------------- 이미지 → 글로벌 프리셋 / 작가 라이브러리 저장 ----------------
+
+  // 생성 이미지 우클릭 → "글로벌 프리셋으로 저장": 이름 입력 후 메타데이터 추출해 저장.
+  async saveImageAsGlobalPreset(path: string): Promise<void> {
+    try {
+      const dataUri = await backend.readDataFile(path);
+      if (!dataUri) {
+        this.pushMessage('이미지를 읽을 수 없습니다.');
+        return;
+      }
+      const base64 = dataUriToBase64(dataUri);
+      const name = await promptName({
+        title: '글로벌 프리셋 이름을 입력하세요',
+        kind: 'globalPreset',
+        existing: (n) => !!globalPresetService.getByName('SDImageGen', n),
+      });
+      if (!name) return;
+      const entry = await globalPresetService.addImageAsPreset(base64, name);
+      this.pushDialog({
+        type: 'yes-only',
+        text: `"${entry.name}" 글로벌 프리셋으로 복사했습니다.`,
+      });
+    } catch (e: any) {
+      this.pushMessage(`글로벌로 복사 실패: ${e.message || e}`);
+    }
+  }
+
+  // 생성 이미지 우클릭 → "작가 라이브러리에 저장": 새 작가 / 기존 작가 선택.
+  async saveImageToArtistLibrary(path: string): Promise<void> {
+    try {
+      const dataUri = await backend.readDataFile(path);
+      if (!dataUri) {
+        this.pushMessage('이미지를 읽을 수 없습니다.');
+        return;
+      }
+      const base64 = dataUriToBase64(dataUri);
+      const hasArtists = artistLibraryService.artists.length > 0;
+      const mode = await this.pushDialogAsync({
+        type: 'select',
+        text: '작가 라이브러리에 어떻게 저장할까요?',
+        items: [
+          { text: '새 작가로 추가', value: 'new' },
+          ...(hasArtists
+            ? [{ text: '기존 작가에 이미지 추가', value: 'existing' }]
+            : []),
+        ],
+      });
+      if (!mode) return;
+
+      let artistId: string | undefined;
+      let artistName = '';
+      if (mode === 'new') {
+        // 같은 이름(대소문자·공백 무시)이 있으면 그 카드에 합친다(기존 동작) — 중복을 거부하지 않는다
+        const name = await promptName({
+          title: '작가 이름을 입력하세요 (예: suko mugi)',
+          kind: 'artist',
+        });
+        if (!name) return;
+        const existing = artistLibraryService.findArtistByName(name);
+        const a = artistLibraryService.createArtist(name);
+        if (!a) {
+          this.pushMessage('작가 생성에 실패했습니다.');
+          return;
+        }
+        if (existing) {
+          this.pushMessage(
+            '동일한 작가가 있어 기존 카드에 이미지를 추가합니다.',
+          );
+        }
+        artistId = a.id;
+        artistName = a.name;
+      } else {
+        const id = await this.pushDialogAsync({
+          type: 'select',
+          text: '어느 작가에 이미지를 추가할까요?',
+          items: artistLibraryService.artists.map((a) => ({
+            text: `${a.name} (${a.images.length}장)`,
+            value: a.id,
+          })),
+        });
+        if (!id) return;
+        const a = artistLibraryService.getArtist(id);
+        if (!a) {
+          this.pushMessage('작가를 찾을 수 없습니다.');
+          return;
+        }
+        artistId = a.id;
+        artistName = a.name;
+      }
+      await artistLibraryService.addImage(artistId!, base64);
+      this.pushDialog({
+        type: 'yes-only',
+        text: `"${artistName}"에 이미지를 추가했습니다.`,
+      });
+    } catch (e: any) {
+      this.pushMessage(`작가 라이브러리 저장 실패: ${e.message || e}`);
+    }
+  }
+
+  // ---------------- 글로벌 프리셋 헬퍼 ----------------
+
+  async exportPresetToGlobal(session: Session, preset: any): Promise<void> {
+    try {
+      const entry = await globalPresetService.addFromSessionPreset(
+        session,
+        preset,
+      );
+      this.pushMessage(`글로벌로 복사: ${entry.name}`);
+    } catch (e: any) {
+      this.pushMessage(`글로벌로 복사 실패: ${e.message || e}`);
+    }
+  }
+
+  async importGlobalPresetIntoSession(
+    session: Session,
+    globalId: string,
+    targetType?: GlobalPresetType,
+  ): Promise<void> {
+    try {
+      const preset = await globalPresetService.instantiateIntoSession(
+        session,
+        globalId,
+        targetType,
+      );
+      if (preset) {
+        session.selectedWorkflow = {
+          workflowType: preset.type,
+          presetName: preset.name,
+        };
+        this.pushMessage(`프로젝트로 복사: ${preset.name}`);
+      }
+    } catch (e: any) {
+      this.pushMessage(`프로젝트로 복사 실패: ${e.message || e}`);
+    }
+  }
+
+  @observable accessor globalPresetPicker:
+    | { workflowType: GlobalPresetType; onSelect: (id: string) => void }
+    | undefined = undefined;
+
+  @action
+  openGlobalPresetPicker(workflowType: GlobalPresetType): void {
+    if (!this.curSession) {
+      this.pushMessage('세션을 먼저 선택해주세요.');
+      return;
+    }
+    const session = this.curSession;
+    this.globalPresetPicker = {
+      workflowType,
+      onSelect: async (id: string) => {
+        this.globalPresetPicker = undefined;
+        // 통합: 어떤 글로벌 프리셋이든 현재 모드(workflowType)로 변환해 적용
+        await this.importGlobalPresetIntoSession(session, id, workflowType);
+      },
+    };
+  }
+
+  @action
+  closeGlobalPresetPicker(): void {
+    this.globalPresetPicker = undefined;
+  }
+
+  async exportGlobalPresetToPng(entry: IGlobalPresetEntry): Promise<void> {
+    try {
+      const path = `exports/${entry.name}_${Date.now().toString()}.png`;
+      await globalPresetService.exportToPng(entry.id, path);
+      await backend.publishExport(path);
+    } catch (e: any) {
+      this.pushMessage(`내보내기 실패: ${e.message || e}`);
+    }
+  }
+
+  // ── 배치 처리: BatchProcessService 로 분리됨 (UI 호환 위임) ──
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  openBatchProcessMenu(
+    type: 'scene' | 'inpaint',
+    setSceneSelector: (item: SceneSelectorItem | undefined) => void,
+  ) {
+    return batchProcessService.openBatchProcessMenu(type, setSceneSelector);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  openChangeResolutionMenu(
+    type: 'scene' | 'inpaint',
+    setSceneSelector: (item: SceneSelectorItem | undefined) => void,
+  ) {
+    return batchProcessService.openChangeResolutionMenu(type, setSceneSelector);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  changeResolutionOfScenes(scenes: GenericScene[]) {
+    return batchProcessService.changeResolutionOfScenes(scenes);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  openConvertToWebpMenu(
+    type: 'scene' | 'inpaint',
+    setSceneSelector: (item: SceneSelectorItem | undefined) => void,
+  ) {
+    return batchProcessService.openConvertToWebpMenu(type, setSceneSelector);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the existing instance API while delegating this operation to its owning service.
+  openProjectWebpOptimize(name: string) {
+    return batchProcessService.openProjectWebpOptimize(name);
+  }
+
+  @action
+  async emptyProjectImageTrashWithConfirm() {
+    if (!this.curSession) return;
+    const { totalImages, scenesWithTrash } =
+      await trashService.countProjectImageTrash(this.curSession);
+    if (totalImages === 0) {
+      this.pushMessage('삭제된 이미지가 없습니다.');
+      return;
+    }
+    this.pushDialog({
+      type: 'confirm',
+      ...deleteConfirmText({
+        kind: 'image',
+        count: totalImages,
+        outcome: 'permanent',
+        extra: `이 프로젝트의 씬 ${scenesWithTrash}개에서 휴지통에 있는 이미지입니다.`,
+      }),
+      callback: async () => {
+        // 일괄 작업 잠금(2026-07-18): 저사양(특히 모바일)에서 청소 도중 다른 조작이
+        // 겹치면 렉/오류가 나므로 전체화면 progressDialog 로 입력을 차단한다.
+        // finally 해제 보장 — 잠금 고착 방지.
+        const lockText = '삭제된 이미지 청소 중...';
+        this.setProgressDialog({ text: lockText, done: 0, total: totalImages });
+        let result = { deleted: 0, failed: 0 };
+        try {
+          result = await trashService.emptyProjectImageTrash(
+            this.curSession!,
+            (d) =>
+              this.setProgressDialog({
+                text: lockText,
+                done: d,
+                total: totalImages,
+              }),
+          );
+        } finally {
+          this.setProgressDialog(undefined);
+        }
+        this.pushDialog({
+          type: 'yes-only',
+          text: `${result.deleted}개의 이미지가 영구 삭제되었습니다.${
+            result.failed > 0
+              ? `\n${result.failed}개는 삭제하지 못했습니다 — 잠시 후 다시 시도해주세요.`
+              : ''
+          }`,
+        });
+      },
+    });
+  }
+
+  @action
+  async recoverProjectImages() {
+    // 중복 터치 차단: 첫 await 이전에 동기적으로 가드를 세워, 스캔이 두 번 도는 것을 막는다.
+    if (this.recovering) return;
+    if (!this.curSession) return;
+    const session = this.curSession;
+    this.recovering = true;
+    // 전체화면 차단 오버레이(progressDialog)를 띄워 스캔/로딩 중 다른 입력을 막는다.
+    this.setProgressDialog({
+      text: '이미지 복구 준비 중...',
+      done: 0,
+      total: 1,
+    });
+
+    let resultText: string;
+    try {
+      // outs/<세션명>/ 디렉토리에서 씬 폴더 목록 조회
+      let sceneDirs: string[] = [];
+      try {
+        const entries = await backend.listFiles(
+          projectPath('outs', session.name),
+        );
+        // 디렉토리만 필터링 (확장자 없는 항목 = 디렉토리)
+        sceneDirs = entries.filter((e: string) => !e.includes('.'));
+      } catch {
+        // outs 디렉토리 자체가 없으면 복구할 것 없음
+      }
+
+      if (sceneDirs.length === 0) {
+        resultText = '파일시스템에서 복구할 이미지 폴더를 찾지 못했습니다.';
+      } else {
+        // 현재 세션에 없는 씬 폴더 찾기
+        let recoveredScenes = 0;
+        let recoveredImages = 0;
+
+        this.setProgressDialog({
+          text: '이미지 복구 중...',
+          done: 0,
+          total: sceneDirs.length,
+        });
+        for (let i = 0; i < sceneDirs.length; i++) {
+          const dirName = sceneDirs[i];
+          // 해당 폴더에 PNG 파일이 있는지 확인
+          let pngFiles: string[] = [];
+          try {
+            const files = await backend.listFiles(
+              projectPath('outs', session.name, dirName),
+            );
+            pngFiles = files.filter(isOutputImageFile);
+          } catch {
+            this.setProgressDialog({
+              text: '이미지 복구 중...',
+              done: i + 1,
+              total: sceneDirs.length,
+            });
+            continue;
+          }
+          if (pngFiles.length === 0) {
+            this.setProgressDialog({
+              text: '이미지 복구 중...',
+              done: i + 1,
+              total: sceneDirs.length,
+            });
+            continue;
+          }
+
+          if (!session.scenes.has(dirName)) {
+            // 씬이 JSON에서 사라진 경우: 빈 씬 생성
+            session.addScene(
+              Scene.fromJSON({
+                type: 'scene',
+                name: dirName,
+                resolution: 'portrait',
+                slots: [
+                  [
+                    {
+                      id: v4(),
+                      prompt: '',
+                      characterPrompts: [],
+                      enabled: true,
+                    },
+                  ],
+                ],
+                mains: [],
+                imageMap: [],
+                meta: {},
+              } as any),
+            );
+            recoveredScenes++;
+          }
+
+          // 씬의 imageMap이 비어있지만 파일은 있는 경우도 카운트
+          const scene = session.scenes.get(dirName);
+          if (scene && scene.imageMap.length === 0 && pngFiles.length > 0) {
+            recoveredImages += pngFiles.length;
+          }
+          this.setProgressDialog({
+            text: '이미지 복구 중...',
+            done: i + 1,
+            total: sceneDirs.length,
+          });
+        }
+
+        // refreshBatch로 모든 씬의 imageMap 갱신 (파일시스템에서 재발견)
+        this.setProgressDialog({
+          text: '이미지 재연결 중...',
+          done: sceneDirs.length,
+          total: sceneDirs.length,
+        });
+        await imageService.refreshBatch(session);
+
+        // 결과 메시지 구성
+        if (recoveredScenes === 0 && recoveredImages === 0) {
+          resultText = '모든 씬의 이미지가 정상입니다. 복구할 항목이 없습니다.';
+        } else {
+          const parts: string[] = [];
+          if (recoveredScenes > 0) parts.push(`${recoveredScenes}개 씬 복원`);
+          if (recoveredImages > 0)
+            parts.push(`${recoveredImages}개 이미지 재연결`);
+          resultText = `복구 완료: ${parts.join(', ')}`;
+        }
+      }
+    } catch {
+      resultText = '복구 중 오류가 발생했습니다.';
+    } finally {
+      // 오버레이를 먼저 닫고(입력 차단 해제) 가드를 푼다.
+      this.setProgressDialog(undefined);
+      this.recovering = false;
+    }
+
+    // 결과는 오버레이가 닫힌 뒤 표시한다.
+    this.pushDialog({ type: 'yes-only', text: resultText });
+  }
+
+  openExternalImage(image: string, scene?: GenericScene) {
+    this.externalImage = image;
+    this.externalImageScene = scene;
+  }
+
+  closeExternalImage() {
+    this.externalImage = undefined;
+    this.externalImageScene = undefined;
+  }
+
+  @action
+  setAppliedCharacterPreset(presetName: string | undefined) {
+    const session = this.curSession;
+    if (!session) return;
+    const workflowType = session.selectedWorkflow?.workflowType;
+    if (!workflowType) return;
+    const shared = session.presetShareds.get(workflowType);
+    if (shared) {
+      shared._appliedPresetName = presetName || '';
+    }
+  }
+
+  @action
+  clearAppliedCharacterPreset() {
+    if (!this.curSession) return;
+
+    const workflowType = this.curSession.selectedWorkflow?.workflowType;
+    if (!workflowType) return;
+
+    const shared = this.curSession.presetShareds.get(workflowType);
+    if (!shared) return;
+
+    // 프리셋에서 추가된 항목만 제거 (사용자 직접 추가 항목은 유지)
+    shared.vibes = (shared.vibes || []).filter((v: any) => !v.fromPreset);
+    shared.characterReferences = (shared.characterReferences || []).filter(
+      (r: any) => !r.fromPreset,
+    );
+    if (shared.characterPrompts) {
+      shared.characterPrompts = shared.characterPrompts.filter(
+        (cp: any) => !cp.fromPreset,
+      );
+    }
+
+    if (workflowType === 'SDImageGenEasy') {
+      shared.characterPrompt = '';
+      shared.backgroundPrompt = '';
+      shared.uc = '';
+    }
+
+    shared._appliedPresetName = '';
+    this.pushMessage('캐릭터 프리셋이 해제되었습니다');
+  }
+
+  /**
+   * 현재 적용된 캐릭터 프리셋 객체를 가져옵니다.
+   * @returns 현재 적용된 CharacterPreset 객체 또는 undefined
+   */
+  getAppliedCharacterPreset(): CharacterPreset | undefined {
+    if (!this.curSession || !this.appliedCharacterPreset) {
+      return undefined;
+    }
+    return this.curSession.getCharacterPreset(this.appliedCharacterPreset);
+  }
+
+  /**
+   * 프로젝트 로드 시 삭제된 캐릭터 프리셋이 적용 중인 상태를 정리
+   */
+  cleanupOrphanedPresetApplication() {
+    if (!this.curSession) return;
+
+    for (const [, shared] of this.curSession.presetShareds) {
+      if (!shared) continue;
+
+      // 삭제된 프리셋의 잔존 항목 정리 — 다중 적용(W4)이라 프리셋 이름 단위로만
+      // 제거하고, 존재하는 프리셋의 항목은 유지한다.
+      const tagNames = new Set<string>();
+      const collect = (items: any[] | undefined) => {
+        for (const item of items || []) {
+          if (item?.fromPreset) tagNames.add(item.fromPreset);
+        }
+      };
+      collect(shared.characterPrompts);
+      collect(shared.vibes);
+      collect(shared.characterReferences);
+      const orphaned = Array.from(tagNames).filter(
+        (n) => !this.curSession!.hasCharacterPreset(n),
+      );
+      if (orphaned.length > 0) {
+        const isOrphan = (x: any) =>
+          x.fromPreset && orphaned.includes(x.fromPreset);
+        shared.vibes = (shared.vibes || []).filter((v: any) => !isOrphan(v));
+        shared.characterReferences = (shared.characterReferences || []).filter(
+          (r: any) => !isOrphan(r),
+        );
+        if (shared.characterPrompts) {
+          shared.characterPrompts = shared.characterPrompts.filter(
+            (cp: any) => !isOrphan(cp),
+          );
+        }
+      }
+      if (
+        shared._appliedPresetName &&
+        !this.curSession.hasCharacterPreset(shared._appliedPresetName)
+      ) {
+        shared._appliedPresetName = '';
+      }
+
+      // 캐릭터 프롬프트 중복 제거 (이전 버전 오염 데이터 정리)
+      // 프리셋 출처가 다르면 같은 내용이라도 별개(다중 적용) — 키에 fromPreset 포함
+      if (shared.characterPrompts && shared.characterPrompts.length > 1) {
+        const seen = new Set<string>();
+        shared.characterPrompts = shared.characterPrompts.filter((cp: any) => {
+          const key = `${cp.prompt || ''}\0${cp.uc || ''}\0${
+            cp.fromPreset || ''
+          }`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      }
+    }
+  }
+
+  /**
+   * 여러 그림체 파일을 한번에 가져오기
+   */
+  async importMultiplePresets() {
+    if (!this.curSession) {
+      this.pushMessage('세션을 먼저 선택해주세요.');
+      return;
+    }
+
+    const files = await backend.selectFiles({
+      filters: [
+        { name: 'PNG 이미지', extensions: ['png'] },
+        { name: '모든 파일', extensions: ['*'] },
+      ],
+    });
+
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    this.setProgressDialog({
+      text: '그림체 불러오는 중...',
+      done: 0,
+      total: files.length,
+    });
+
+    const results = {
+      success: 0,
+      failed: 0,
+      failedNames: [] as string[],
+    };
+
+    for (let i = 0; i < files.length; i++) {
+      const filePath = files[i];
+      const fileName =
+        filePath.split('/').pop() || filePath.split('\\').pop() || filePath;
+
+      try {
+        // 파일 읽기
+        const base64 = await backend.readBinaryFile(filePath);
+
+        // 프리셋 가져오기
+        const preset = await importPreset(this.curSession!, base64);
+
+        if (preset) {
+          results.success++;
+        } else {
+          results.failed++;
+          results.failedNames.push(fileName);
+        }
+      } catch (e: any) {
+        console.error(`Failed to import preset from ${fileName}:`, e);
+        results.failed++;
+        results.failedNames.push(fileName);
+      }
+
+      this.setProgressDialog({
+        text: '그림체 불러오는 중...',
+        done: i + 1,
+        total: files.length,
+      });
+    }
+
+    this.setProgressDialog(undefined);
+
+    // 결과 메시지 표시
+    if (results.success > 0 && results.failed === 0) {
+      this.pushDialog({
+        type: 'yes-only',
+        text: `${results.success}개의 그림체를 성공적으로 불러왔습니다.`,
+      });
+    } else if (results.success > 0 && results.failed > 0) {
+      this.pushDialog({
+        type: 'yes-only',
+        text: `${results.success}개의 그림체를 불러왔습니다.\n${results.failed}개의 파일은 유효한 그림체 파일이 아닙니다:\n${results.failedNames.slice(0, 5).join('\n')}${results.failedNames.length > 5 ? '\n...' : ''}`,
+      });
+    } else {
+      this.pushDialog({
+        type: 'yes-only',
+        text: '선택한 파일들 중 유효한 그림체 파일이 없습니다.',
+      });
+    }
+
+    // 첫 번째로 성공한 그림체 선택
+    if (results.success > 0) {
+      const presets = this.curSession!.presets.get('SDImageGenEasy');
+      if (presets && presets.length > 0) {
+        const lastPreset = presets[presets.length - 1];
+        this.curSession!.selectedWorkflow = {
+          workflowType: lastPreset.type,
+          presetName: lastPreset.name,
+        };
+      }
+    }
+  }
+}
+
+export const appState = new AppState();
+// 순환 import 게이트에 자기 등록 — 서비스들은 getAppState() 로 접근한다
+setAppState(appState);

@@ -1,0 +1,3340 @@
+import * as React from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
+
+import {
+  FaPlus,
+  FaTrash,
+  FaTimes,
+  FaUserAlt,
+  FaSlidersH,
+  FaToggleOn,
+  FaToggleOff,
+  FaChevronDown,
+  FaChevronRight,
+  FaArrowUp,
+  FaArrowDown,
+  FaLock,
+  FaCheck,
+} from 'react-icons/fa';
+import { useDrag, useDrop } from 'react-dnd';
+import { v4 } from 'uuid';
+import { useContextMenu } from 'react-contexify';
+import { observer } from 'mobx-react-lite';
+import activateButtonFromKeyboard from './keyboardButton';
+import { isValidNaiSeed } from '../models/sceneSeedGroups';
+import {
+  openWatchedImage,
+  releaseImageWatches,
+} from '../models/externalImageEditor';
+import { FileUploadBase64, DropdownSelect } from './UtilComponents';
+import {
+  NoiseSchedule,
+  Sampling,
+  type GenerationEffort,
+  type GenerationQualityPreset,
+  ModelVersion,
+} from '../backends/imageGen';
+import PromptEditTextArea, {
+  PromptAccessorySlotContext,
+} from './PromptEditTextArea';
+import {
+  PresetCompactContext,
+  PresetFocusContext,
+  WFI_KEY_ATTR,
+} from './MobilePromptSheet';
+import { V2_SHEET_HALF_KEYS } from '../models/mobileV2';
+import { FloatView } from './FloatView';
+import {
+  CharacterPositionOverlay,
+  type PositionMarker,
+} from './CharacterPositionOverlay';
+import {
+  type PositionBackground,
+  resolvePositionBackground,
+} from '../models/characterPositionBackground';
+import { BigPromptEditor } from './BigPromptEditor';
+import {
+  type CharacterPrompt,
+  type CharacterPosition,
+  ContextMenuType,
+  PromptPiece,
+  Scene,
+} from '../models/types';
+import {
+  sessionService,
+  imageService,
+  backend,
+  taskQueueService,
+  workFlowService,
+  isMobile,
+} from '../models';
+
+import { appState } from '../models/AppService';
+import { promptName, validateName } from '../models/nameInput';
+import { deleteConfirmText } from '../models/deleteFlowRules';
+import {
+  type WFIElement,
+  type WFIExtraPromptInput,
+  type WFIGroup,
+  type WFIIfIn,
+  type WFIInlineInput,
+  type WFIMainSamplingNotice,
+  type WFIMiddlePlaceholderInput,
+  type WFIPush,
+  type WFISceneOnly,
+  type WFIShowImage,
+  type WFIStack,
+  wfiElementKey,
+} from '../models/workflows/WorkFlow';
+import {
+  presetLayoutSlotKey,
+  resolveStackInputs,
+  presetRowLabel,
+} from '../models/presetLayout';
+import { resolveCompanionButtons } from '../models/companionSlots';
+import {
+  mainSamplingSummary,
+  readMainSampling,
+} from '../models/variantSampling';
+import { renderCompanionButtons } from './PortableToolbarButtons';
+import { CompanionHostRow } from './CompanionDnd';
+import {
+  DraggablePresetRow,
+  resetPresetOrder,
+  isPresetAnchorKey,
+} from './PresetLayoutDnd';
+import { StackFixed, StackGrow, VerticalStack } from './LayoutComponents';
+import Tooltip from './Tooltip';
+import ModalOverlay from './ModalOverlay';
+import { ActionIcon } from './ActionIcon';
+import {
+  getOrderedBaseCharacterPrompts,
+  reorderBaseCharacterPrompts,
+} from '../models/sceneCharacterPrompts';
+import {
+  QUALITY_PRESET_LABELS,
+  QUALITY_PRESET_OPTIONS,
+  type UcPresetKey,
+  effectiveUcPreset,
+  qualityPresetTextFor,
+  ucPresetOptionsFor,
+  ucPresetTextFor,
+} from '../backends/genVendors/naiQualityPresets';
+import { resolveQualityPreset } from '../backends/generationSettings';
+import {
+  getNaiModelSpec,
+  isV5ModelVersion,
+  V5_SAMPLERS,
+} from '../backends/genVendors/naiModelCapabilities';
+import { VibeEditor, VibeButton, VibeImage } from './VibeEditor';
+import {
+  CharacterReferenceEditor,
+  CharacterReferenceButton,
+} from './CharacterReferenceEditor';
+import { WFElementContext, PresetIconRowContext } from './wfElementContext';
+import { NaiEffortControl, NaiEffortContext } from './NaiEffortControl';
+import { ResolutionPicker, resolutionValueToSize } from './ResolutionPicker';
+import HelpIcon from './HelpIcon';
+import {
+  activatePresetSamplingFamily,
+  samplingFamilyForModel,
+  setPresetSamplingField,
+  switchSessionSamplingFamily,
+} from '../models/modelSamplingProfiles';
+
+// 프롬프트 문법 도움말 (2026-07-18) — 상위 프롬프트 라벨 옆 (?) 아이콘.
+// 문법은 상위/하위/네거티브 공통이라 첫 프롬프트에만 1회 노출한다.
+// 근거: PromptService(조각 <그룹.조각>, ##주석## 제거, {a|b} 인라인 랜덤 expandInlineRandom, 줄바꿈=쉼표 — 5.3.0 9bd4bea),
+// highlightPrompt(가중치), PromptEditTextArea(자동완성 트리거, Ctrl+↑↓ 가중치 0.05), artistTags(artist: 접두, 2026-09-25).
+// 2026-09-27 사용자 지적으로 5.3.0 이후 문법을 추가.
+const PROMPT_SYNTAX_HELP = `프롬프트 문법
+• <그룹.조각> : 프롬프트 조각 삽입 (로컬 우선, 없으면 전역)
+• {강조} / [약화] : 중첩할수록 강해짐
+• 1.5::내용:: : 명시 가중치 (음수 가능, .6 처럼 0 생략 가능, 쉼표로 여러 태그 묶기 가능)
+• {a|b|c} : 생성마다 하나를 무작위로 고름 (| 가 없는 중괄호는 강조 그대로, 중첩 가능)
+• artist:이름 : 작가 태그 접두 (툴바 버튼으로 구획마다 붙이기·떼기 전환)
+• ##메모## : 주석 (생성 시 제외, 저장은 유지, 모바일은 키보드 위 칩 # 로 감싸기·풀기)
+• 줄바꿈 : 쉼표와 같은 구분자로 취급
+• 자동완성 : 입력 중 태그 추천, < 입력 시 조각 검색
+• 가중치 조절 : PC 는 커서 구획에서 Ctrl+↑/↓ (0.05 단위), 모바일은 키보드 위 칩`;
+
+const TRANSPARENT_BACKGROUND_HELP =
+  '프롬프트 앞에 transparent background를 추가하고 투명 PNG를 요청합니다.';
+
+const ImageSelect = observer(({ input }: { input: WFIInlineInput }) => {
+  const watchedImages = useRef(new Map<string, Promise<void>>());
+  useEffect(() => {
+    const leases = watchedImages.current;
+    return () => {
+      void releaseImageWatches(leases, backend);
+    };
+  }, []);
+  const { curSession } = appState;
+  const { preset, shared, meta, onImageUploaded } =
+    useContext(WFElementContext)!;
+  const getField = () => {
+    if (input.fieldType === 'preset') return preset[input.field];
+    if (input.fieldType === 'shared') return shared[input.field];
+    return meta![input.field];
+  };
+  const setField = (val: any) => {
+    if (input.fieldType === 'preset') preset[input.field] = val;
+    else if (input.fieldType === 'shared') shared[input.field] = val;
+    else meta![input.field] = val;
+  };
+  return (
+    <div className="inline-flex md:flex gap-3 items-center flex-none text-eplsis overflow-hidden gap-3 mb-1 mt-2 md:mt-3">
+      <span className="gray-label">{input.label}: </span>
+      <div className="w-24 md:w-48">
+        <FileUploadBase64
+          onFileSelect={async (file: string) => {
+            if (!getField()) {
+              const path = await imageService.storeVibeImage(curSession!, file);
+              setField(path);
+            } else {
+              await imageService.writeVibeImage(curSession!, getField(), file);
+            }
+            // 씬 문맥은 모른다 — 편집 창(InPaintEditor)이 받아 씬 해상도를 맞춘다(R-res ⓑ).
+            onImageUploaded?.(input.field, file);
+          }}
+        />
+      </div>
+      {!isMobile && (
+        <button
+          type="button"
+          className="round-button back-sky"
+          onClick={async () => {
+            if (!getField()) return;
+            const path = imageService.getVibeImagePath(curSession!, getField());
+            try {
+              await openWatchedImage(watchedImages.current, path, backend);
+            } catch (error) {
+              appState.pushMessage(
+                `이미지 편집기를 열지 못했습니다: ${String(error)}`,
+              );
+            }
+          }}
+        >
+          {input.label} 편집
+        </button>
+      )}
+    </div>
+  );
+});
+
+// ─── 프롬프트 영역 접기 상태 (2026-07-18) ───
+// 세션/프리셋과 무관한 전역 UI 상태라 localStorage 에 둔다(설정 파일 비오염).
+// 키 = 프롬프트 필드명(frontPrompt/backPrompt/uc/extraPrompt 등, 워크플로우 공용).
+// 기본값은 호출부의 defaultFolded (추가 프롬프트만 접힘, 나머지 펼침).
+const PROMPT_FOLD_LS_KEY = 'sdstudio-prompt-fold';
+function loadPromptFold(): Record<string, boolean> {
+  try {
+    return JSON.parse(localStorage.getItem(PROMPT_FOLD_LS_KEY) || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+function getPromptFold(key: string, def: boolean): boolean {
+  const m = loadPromptFold();
+  return typeof m[key] === 'boolean' ? m[key] : def;
+}
+function setPromptFold(key: string, folded: boolean) {
+  const m = loadPromptFold();
+  m[key] = folded;
+  try {
+    localStorage.setItem(PROMPT_FOLD_LS_KEY, JSON.stringify(m));
+  } catch {
+    // Folding is a local display preference; storage denial must not prevent editing.
+  }
+}
+
+function EditorField({
+  label,
+  full,
+  children,
+  bold,
+  hint,
+  foldKey,
+  defaultFolded,
+  foldedBadge,
+}: {
+  label: string;
+  children: React.ReactNode;
+  full: boolean;
+  bold?: boolean;
+  // (?) 도움말 아이콘 문구 — 라벨 오른쪽에 표시 (프롬프트 문법 안내 등)
+  hint?: string;
+  // 접기 지원: foldKey 지정 시 라벨 클릭으로 접기/펼치기 (localStorage 영속)
+  foldKey?: string;
+  defaultFolded?: boolean;
+  // 접힘 상태에서 내용이 있을 때 라벨 옆에 표시할 배지 (보이지 않는 프롬프트 방지)
+  foldedBadge?: string;
+}) {
+  const [folded, setFolded] = useState(() =>
+    foldKey ? getPromptFold(foldKey, !!defaultFolded) : false,
+  );
+  // 편집기 부속 버튼(작가 라이브러리 열기) 자리 — 라벨 줄 오른쪽 끝. 편집기 안 우상단에 두면 첫 줄 프롬프트를
+  // 가려 수정을 방해한다(2026-09-26 사용자 실기기 지적). PromptEditTextArea 가 컨텍스트로 노드를 보낸다.
+  const [accessory, setAccessory] = useState<React.ReactNode>(null);
+  const toggle = () => {
+    if (!foldKey) return;
+    setPromptFold(foldKey, !folded);
+    setFolded(!folded);
+  };
+  return (
+    <>
+      <div className="pt-2 md:pt-3 pb-1 gray-label flex items-center min-w-0">
+        {foldKey ? (
+          <button
+            type="button"
+            aria-expanded={!folded}
+            className="cursor-pointer select-none"
+            onClick={toggle}
+          >
+            <span className="inline-block mr-1 text-faint align-middle">
+              {folded ? (
+                <FaChevronRight size={9} />
+              ) : (
+                <FaChevronDown size={9} />
+              )}
+            </span>
+            {bold ? <b>{label}</b> : label}
+          </button>
+        ) : (
+          <span>{bold ? <b>{label}</b> : label}</span>
+        )}
+        {hint && (
+          <span className="ml-1.5">
+            <HelpIcon content={hint} />
+          </span>
+        )}
+        {folded && foldedBadge && (
+          <span className="ml-1.5 text-xs text-sky-500 dark:text-sky-400">
+            {foldedBadge}
+          </span>
+        )}
+        {accessory && (
+          <span
+            data-editor-field-accessory
+            className="ml-auto pl-2 flex-none flex items-center"
+          >
+            {accessory}
+          </span>
+        )}
+      </div>
+      {!folded && (
+        <div className={full ? 'flex-1 min-h-0' : 'flex-none mt-3'}>
+          <PromptAccessorySlotContext.Provider value={setAccessory}>
+            {children}
+          </PromptAccessorySlotContext.Provider>
+        </div>
+      )}
+    </>
+  );
+}
+
+function InlineEditorField({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="field-row pt-2 md:pt-3 flex gap-2 items-center">
+      <span className="flex-none gray-label">{label}:</span>
+      {children}
+    </div>
+  );
+}
+
+interface InnerEditorProps {
+  type: string;
+  shared: any;
+  preset: any;
+}
+
+const InnerEditor: React.FC<InnerEditorProps> = ({ type, shared, preset }) => {
+  const nameId = React.useId();
+  const { curSession } = appState;
+  const prompt = React.useRef<string>('');
+  const presets = curSession!.presets.get(type)!;
+  const getPrompt = () => prompt.current;
+  const setPrompt = (txt: string) => {
+    prompt.current = txt;
+  };
+  const [name, setName] = useState(preset.name);
+  const queueprompt = async (
+    middle: string,
+    callback: (path: string) => void,
+  ) => {
+    let scene = curSession!.getScene('scene', 'style_test') as
+      | Scene
+      | undefined;
+    if (!scene) {
+      scene = new Scene();
+      scene.name = 'style_test';
+      curSession!.addScene(scene);
+    }
+    scene.resolution = 'portrait';
+    scene.slots = [
+      [
+        PromptPiece.fromJSON({
+          enabled: true,
+          prompt: middle,
+          characterPrompts: [],
+          id: v4(),
+        }),
+      ],
+    ];
+    const dummyShared = workFlowService.buildShared(type);
+    const prompts = await workFlowService.createPrompts(
+      type,
+      curSession!,
+      scene,
+      preset,
+      dummyShared,
+    );
+    const characterPrompts = await workFlowService.createCharacterPrompts(
+      type,
+      curSession!,
+      scene,
+      preset,
+      dummyShared,
+    );
+    await workFlowService.pushJob(
+      type,
+      curSession!,
+      scene,
+      prompts[0],
+      characterPrompts[0],
+      preset,
+      dummyShared,
+      1,
+      undefined,
+      callback,
+      true,
+    );
+    taskQueueService.run();
+  };
+  const setMainImage = async (path: string) => {
+    const newPath = `${imageService.getVibesDir(curSession!)}/${v4()}.png`;
+    await backend.copyFile(path, newPath);
+    preset.profile = newPath.split('/').pop()!;
+  };
+  return (
+    <div className="flex flex-col h-full">
+      <div className="grow-0 pt-1 px-2 flex gap-2 items-center text-nowrap flex-wrap mb-1 md:mb-0">
+        <div className="flex items-center gap-2">
+          <label className="gray-label" htmlFor={nameId}>
+            그림체 이름:
+          </label>
+          <input
+            id={nameId}
+            className="gray-input"
+            type="text"
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+            }}
+          />
+        </div>
+        <button
+          type="button"
+          className="round-button back-sky"
+          onClick={async () => {
+            // 앞뒤 공백 제거·빈 값 거부·같은 이름이면 아무것도 하지 않음·다른 그림체와 겹치면 거부(D2 인라인 규칙)
+            const trimmed = name.trim();
+            if (trimmed === preset.name) {
+              setName(trimmed);
+              return;
+            }
+            const problem = validateName(trimmed, {
+              kind: 'style',
+              current: preset.name,
+              existing: (n) =>
+                presets.some((x) => x !== preset && x.name === n),
+            });
+            if (problem) {
+              appState.pushMessage(problem, 'error');
+              return;
+            }
+            setName(trimmed);
+            if (curSession!.selectedWorkflow?.presetName === preset.name) {
+              preset.name = trimmed;
+              curSession!.selectedWorkflow = {
+                workflowType: type,
+                presetName: trimmed,
+              };
+            } else {
+              preset.name = trimmed;
+            }
+          }}
+        >
+          이름변경
+        </button>
+      </div>
+      <div className="flex-1 overflow-hidden p-2">
+        <BigPromptEditor
+          key="bigprompt"
+          general={false}
+          presetEditor={
+            <InnerPresetEditor
+              type={type}
+              preset={preset}
+              shared={shared}
+              getPrompt={getPrompt}
+              setPrompt={setPrompt}
+            />
+          }
+          getMiddlePrompt={getPrompt}
+          setMiddlePrompt={setPrompt}
+          queuePrompt={queueprompt}
+          setMainImage={setMainImage}
+          initialImagePath={undefined}
+        />
+      </div>
+    </div>
+  );
+};
+
+// 드래그 가능한 프리셋 카드
+const DraggablePresetCard = observer(
+  ({
+    presetItem,
+    index,
+    isSelected,
+    type,
+    curSession,
+    onSelect,
+    onContextMenu,
+  }: {
+    presetItem: any;
+    index: number;
+    isSelected: boolean;
+    type: string;
+    curSession: any;
+    onSelect: () => void;
+    onContextMenu: (e: React.MouseEvent) => void;
+  }) => {
+    const ref = React.useRef<HTMLDivElement>(null);
+
+    const [{ isDragging }, drag] = useDrag(
+      () => ({
+        type: 'preset-card',
+        item: { index },
+        collect: (monitor) => ({
+          isDragging: monitor.isDragging(),
+        }),
+      }),
+      [index],
+    );
+
+    const [{ isOver }, drop] = useDrop(
+      () => ({
+        accept: 'preset-card',
+        drop: (item: { index: number }) => {
+          if (item.index !== index) {
+            curSession.movePreset(type, item.index, index);
+            item.index = index;
+          }
+        },
+        collect: (monitor) => ({
+          isOver: monitor.isOver(),
+        }),
+      }),
+      [index, type, curSession],
+    );
+
+    drag(drop(ref));
+
+    return (
+      <div
+        ref={ref}
+        role="button"
+        tabIndex={0}
+        onKeyDown={activateButtonFromKeyboard}
+        aria-pressed={isSelected}
+        aria-label={presetItem.name}
+        className={`h-full relative flex-none hover:brightness-95 active:brightness-90 cursor-pointer transition-opacity ${
+          isSelected ? 'border-2 border-sky-500' : 'border-2 line-color'
+        }${
+          isDragging ? ' opacity-30' : ''
+        }${isOver ? ' ring-2 ring-sky-400' : ''}`}
+        onContextMenu={onContextMenu}
+        onClick={onSelect}
+      >
+        {presetItem.profile && (
+          <VibeImage
+            path={`${imageService.getVibesDir(curSession)}/${presetItem.profile
+              .split('/')
+              .pop()!}`}
+            className="w-auto h-full"
+          />
+        )}
+        {!presetItem.profile && <div className="w-40 h-full" />}
+        <div
+          className="absolute bottom-0 right-0 bg-gray-700 opacity-80 text-sm text-white p-1 rounded-xl m-2 truncate select-none"
+          style={{ maxWidth: '90%' }}
+        >
+          {presetItem.name}
+        </div>
+      </div>
+    );
+  },
+);
+
+const ProfilePreSetSelect = observer(() => {
+  const { curSession } = appState;
+  const { preset, type, shared, middlePromptMode } =
+    useContext(WFElementContext)!;
+  const presets = curSession!.presets.get(type)!;
+  const [selected, setSelected] = useState<any | undefined>(undefined);
+  const { show } = useContextMenu({
+    id: ContextMenuType.Style,
+  });
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onStyleEdit = (e: any) => {
+      if (e.detail.container !== containerRef.current) return;
+      setSelected(e.detail.preset);
+    };
+    sessionService.addEventListener('style-edit', onStyleEdit);
+    return () => {
+      sessionService.removeEventListener('style-edit', onStyleEdit);
+    };
+  });
+
+  return (
+    <div
+      ref={containerRef}
+      className={`mt-2 md:mt-3 overflow-hidden min-h-0 ${
+        middlePromptMode ? 'h-1/5' : 'h-1/3'
+      }`}
+    >
+      {selected && (
+        <FloatView
+          priority={1}
+          onEscape={() => {
+            setSelected(undefined);
+          }}
+        >
+          <InnerEditor type={type} shared={shared} preset={selected} />
+        </FloatView>
+      )}
+      <div className="h-full w-full flex overflow-auto gap-2">
+        {presets.map((x, i) => (
+          <DraggablePresetCard
+            key={x.name}
+            presetItem={x}
+            index={i}
+            isSelected={x === preset}
+            type={type}
+            curSession={curSession!}
+            onSelect={() => {
+              curSession!.selectedWorkflow = {
+                workflowType: type,
+                presetName: x.name,
+              };
+            }}
+            onContextMenu={(e) => {
+              show({
+                event: e,
+                props: {
+                  ctx: {
+                    type: 'style',
+                    preset: x,
+                    session: curSession!,
+                    container: containerRef.current!,
+                  },
+                },
+              });
+            }}
+          />
+        ))}
+        <div className="h-full relative flex-none flex flex-col gap-2">
+          <Tooltip content="새 그림체 추가">
+            <div
+              role="button"
+              tabIndex={0}
+              onKeyDown={activateButtonFromKeyboard}
+              className="flex-1 w-10 flex m-4 items-center justify-center rounded-xl clickable back-lllgray"
+              onClick={async () => {
+                const name = await promptName({
+                  title: '그림체 이름을 입력하세요',
+                  kind: 'style',
+                  existing: (n) => presets.some((x) => x.name === n),
+                });
+                if (!name) return;
+                const newPreset = workFlowService.buildPreset(type);
+                newPreset.name = name;
+                presets.push(newPreset);
+              }}
+            >
+              <FaPlus />
+            </div>
+          </Tooltip>
+          <Tooltip content="여러 그림체 파일 불러오기">
+            <div
+              role="button"
+              tabIndex={0}
+              onKeyDown={activateButtonFromKeyboard}
+              className="flex-1 w-10 flex m-4 items-center justify-center rounded-xl clickable back-lllgray"
+              onClick={async () => {
+                await appState.importMultiplePresets();
+              }}
+            >
+              <ActionIcon id="import" />
+            </div>
+          </Tooltip>
+          <Tooltip content="글로벌 프리셋을 프로젝트로 복사">
+            <div
+              role="button"
+              tabIndex={0}
+              onKeyDown={activateButtonFromKeyboard}
+              className="flex-1 w-10 flex m-4 items-center justify-center rounded-xl clickable back-lllgray"
+              onClick={() => {
+                appState.openGlobalPresetPicker('SDImageGenEasy');
+              }}
+            >
+              <ActionIcon id="copy-to-project" />
+            </div>
+          </Tooltip>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+function IntSliderInput({
+  label,
+  value,
+  onChange,
+  disabled,
+  step,
+  min,
+  max,
+}: {
+  label: string;
+  value: number;
+  onChange: (val: number) => void;
+  disabled: boolean;
+  step: number;
+  min: number;
+  max: number;
+}) {
+  return (
+    <div className="flex w-full items-center md:flex-row flex-col mt-2 md:mt-3 gap-2">
+      <div className="whitespace-nowrap flex-none mr-auto md:mr-0 gray-label">
+        {label}:
+      </div>
+      <div className="flex flex-1 md:w-auto w-full gap-1">
+        <input
+          className="flex-1"
+          type="range"
+          step={step}
+          min={min}
+          max={max}
+          value={value}
+          onChange={(e) => {
+            onChange(parseFloat(e.target.value));
+          }}
+          disabled={disabled}
+        />
+        <div className="w-11 flex-none text-lg text-center back-lllgray">
+          {value}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const PreSetBulkManageModal = observer(
+  ({
+    workflowType,
+    onClose,
+  }: {
+    workflowType: string;
+    onClose: () => void;
+  }) => {
+    const curSession = appState.curSession!;
+    const presets = curSession.presets.get(workflowType)!;
+    const [selected, setSelected] = useState<Set<string>>(new Set());
+    const [filter, setFilter] = useState('');
+
+    // Read observable names during every observer render; replacing a name does
+    // not replace the preset array or change its length.
+    const filtered = !filter.trim()
+      ? presets
+      : presets.filter((preset) =>
+          preset.name.toLowerCase().includes(filter.toLowerCase()),
+        );
+
+    const toggle = (name: string) => {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        if (next.has(name)) next.delete(name);
+        else next.add(name);
+        return next;
+      });
+    };
+
+    const allSelected =
+      filtered.length > 0 && filtered.every((p) => selected.has(p.name));
+
+    const toggleAll = () => {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        if (allSelected) filtered.forEach((p) => next.delete(p.name));
+        else filtered.forEach((p) => next.add(p.name));
+        return next;
+      });
+    };
+
+    const doDelete = () => {
+      if (selected.size === 0) return;
+      if (selected.size >= presets.length) {
+        appState.pushMessage('최소 1개의 사전 세팅은 남겨야 합니다');
+        return;
+      }
+      appState.pushDialog({
+        type: 'confirm',
+        ...deleteConfirmText({
+          kind: 'preset',
+          count: selected.size,
+          outcome: 'permanent',
+        }),
+        callback: () => {
+          const names = Array.from(selected);
+          const curName = curSession.selectedWorkflow?.presetName;
+          for (const name of names) {
+            curSession.removePreset(workflowType, name);
+          }
+          // 현재 선택 중인 사전 세팅이 삭제되었으면 첫 항목으로 재설정
+          if (curName && names.includes(curName)) {
+            const remaining = curSession.presets.get(workflowType)!;
+            curSession.selectedWorkflow = {
+              workflowType,
+              presetName: remaining.length > 0 ? remaining[0].name : undefined,
+            };
+          }
+          setSelected(new Set());
+        },
+      });
+    };
+
+    return (
+      <ModalOverlay
+        isOpen
+        onClose={onClose}
+        title="사전 세팅 일괄 삭제"
+        width="max-w-lg"
+      >
+        <div className="flex flex-col gap-3">
+          <input
+            type="text"
+            placeholder="이름으로 검색..."
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            className="w-full px-3 py-1.5 rounded border line-color bg-[var(--c-input-bg)] text-default text-sm focus:outline-none focus:ring-2 focus:ring-sky-400"
+          />
+          <div className="flex items-center justify-between">
+            <button
+              type="button"
+              onClick={toggleAll}
+              className="text-xs btn-link"
+            >
+              {allSelected ? '전체 해제' : '전체 선택'}
+              {filter.trim() && ` (${filtered.length}개)`}
+            </button>
+            <span className="text-xs text-muted">전체 {presets.length}개</span>
+          </div>
+          <div className="max-h-72 overflow-y-auto border line-color rounded-lg p-2 space-y-0.5">
+            {filtered.map((p) => (
+              <label
+                key={p.name}
+                className="flex items-center gap-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-slate-700/50 rounded px-1 py-0.5"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(p.name)}
+                  onChange={() => toggle(p.name)}
+                  className="rounded line-color"
+                />
+                <span className="text-sm text-gray-700 dark:text-gray-300 truncate">
+                  {p.name}
+                  {curSession.selectedWorkflow?.presetName === p.name && (
+                    <span className="ml-2 text-xs text-sky-500">
+                      (현재 선택)
+                    </span>
+                  )}
+                </span>
+              </label>
+            ))}
+            {filtered.length === 0 && (
+              <div className="text-xs text-faint py-1">
+                일치하는 사전 세팅이 없습니다
+              </div>
+            )}
+          </div>
+          <div className="flex items-center justify-between pt-2 border-t line-color">
+            <span className="text-sm text-gray-700 dark:text-gray-300">
+              <span className="text-red-500 font-bold">{selected.size}</span>개
+              선택됨
+            </span>
+            <button
+              type="button"
+              onClick={doDelete}
+              disabled={selected.size === 0}
+              className="px-4 py-2 rounded-lg btn-solid-red disabled:bg-gray-300 dark:disabled:bg-gray-600 text-sm font-medium transition-colors"
+            >
+              선택 삭제
+            </button>
+          </div>
+        </div>
+      </ModalOverlay>
+    );
+  },
+);
+
+// 사전세팅선택 목록 행 버튼(SPEC_GUIDE §6 「사전세팅선택」): 무배경 .icon-button(--c-icon-text 중립)·
+// 시각 모바일 28·PC 24px·hover/active 옅은 배경. touch-hit 는 positioned 필요 → relative.
+const PRESET_ROW_BTN =
+  'relative touch-hit icon-button icon-only flex-none inline-flex items-center justify-center ' +
+  'w-7 h-7 md:w-6 md:h-6 transition-colors hover:bg-black/5 active:bg-black/10 ' +
+  'dark:hover:bg-white/10 dark:active:bg-white/20';
+const PRESET_ROW_ICON = 'w-4 h-4 md:w-3.5 md:h-3.5';
+
+const PreSetSelect = observer(({ workflowType }: { workflowType: string }) => {
+  const curSession = appState.curSession!;
+  const [isOpen, setIsOpen] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const presets = curSession.presets.get(workflowType)!;
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const close = (e: PointerEvent) => {
+      if (!containerRef.current?.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    window.addEventListener('pointerdown', close);
+    return () => {
+      window.removeEventListener('pointerdown', close);
+    };
+  }, [isOpen]);
+  // 목록을 열 때마다 현재 선택 항목을 목록 가운데로 맞춘다(목록이 길면 맨 위부터 내려 찾기 힘듦).
+  // scrollIntoView 는 조상(페이지·시트)까지 스크롤하므로 쓰지 않고 목록(ul) 자신의 scrollTop 만 바꾼다.
+  // ul 이 absolute 라 li.offsetTop 은 ul 기준. 선택 항목이 없으면 새로 마운트된 ul 이라 맨 위 그대로.
+  // 포커스는 건드리지 않는다.
+  const listRef = React.useRef<HTMLUListElement>(null);
+  React.useLayoutEffect(() => {
+    if (!isOpen) return;
+    const list = listRef.current;
+    if (!list) return;
+    const selected = list.querySelector<HTMLElement>('[aria-selected="true"]');
+    if (!selected) return;
+    list.scrollTop = Math.max(
+      0,
+      selected.offsetTop - (list.clientHeight - selected.offsetHeight) / 2,
+    );
+  }, [isOpen]);
+
+  const selectPreset = (presetName: string) => {
+    // 메뉴 닫기를 전역 click 버블링에 맡기지 않고 선택 시점에 확정한다.
+    // 같은 프리셋을 다시 눌러도 메뉴는 즉시 닫혀 클릭 반응을 분명히 보여준다.
+    setIsOpen(false);
+    if (curSession.selectedWorkflow?.presetName === presetName) return;
+    curSession.selectedWorkflow = {
+      workflowType,
+      presetName,
+    };
+  };
+  // 동반 슬롯 (④ 호스트 확대): 사전세팅선택 행 옆에 portable 버튼을 붙인다.
+  // 빈 배열이면 슬롯 없음 = 현행 렌더 100% 동일. 드롭다운은 이미 flex-1 min-w-0
+  // truncate 라 아이콘 버튼 자리를 자연스럽게 내준다. 편집모드 밖은
+  // CompanionHostRow 가 fragment 라 렌더 무변화.
+  const companionIds = resolveCompanionButtons(
+    'preset-select',
+    appState.uiCompanionSlots,
+  );
+  // variant 'project': 이 행의 이웃 버튼(+·글로벌 복사·🗑)이 무배경 icon-button 이라 동반 버튼도
+  // 무배경으로 적응(배경형 companion 스타일은 이 행에서 이질적 — 실기 보정).
+  const companions =
+    companionIds.length > 0
+      ? renderCompanionButtons(companionIds, 'preset-select', 'project')
+      : [];
+  return (
+    <CompanionHostRow hostKey="preset-select">
+      <div
+        ref={containerRef}
+        className="field-row flex gap-2 mt-2 md:mt-3 items-center relative"
+      >
+        {/* 동반 버튼이 붙으면 라벨을 숨겨 자리를 내준다(실기 보정) */}
+        {companions.length === 0 && (
+          <div className="flex-none gray-label">사전세팅선택:</div>
+        )}
+        {/* flex-1 min-w-0 + truncate: 이름이 길어도 행 폭을 밀어내지 않고 말줄임 —
+          우측 +·글로벌 복사·🗑 버튼이 밖으로 밀려 못 누르게 되던 문제 방지.
+          min-w-0 필수: .round-button 의 min-width 를 덮는다(2026-10-04 B1 부터 .round-button 은
+          @layer components 라 유틸이 이긴다 — 예전의 ! 우회 불필요).
+          span 쪽 min-w-0 도 필수(플렉스 아이템 기본 min-width:auto 로는 truncate 미발동). */}
+        <button
+          type="button"
+          aria-haspopup="listbox"
+          aria-expanded={isOpen}
+          className="round-button back-gray h-8 flex-1 min-w-0 overflow-hidden"
+          onClick={() => setIsOpen((open) => !open)}
+        >
+          <span className="min-w-0 truncate">
+            {curSession.selectedWorkflow?.presetName}
+          </span>
+        </button>
+        <button
+          type="button"
+          className="icon-button flex-none"
+          onClick={async () => {
+            const name = await promptName({
+              title: '사전 세팅 이름을 입력하세요',
+              kind: 'preset',
+              existing: (n) => presets.some((x) => x.name === n),
+            });
+            if (!name) return;
+            const newPreset = workFlowService.buildPreset(workflowType);
+            newPreset.name = name;
+            curSession.addPreset(newPreset);
+            curSession.selectedWorkflow = {
+              workflowType,
+              presetName: name,
+            };
+          }}
+          aria-label="새 사전 세팅"
+        >
+          <FaPlus />
+        </button>
+        {workflowType === 'SDImageGen' && (
+          <Tooltip content="글로벌 프리셋을 프로젝트로 복사">
+            <button
+              type="button"
+              className="icon-button flex-none"
+              onClick={() => {
+                appState.openGlobalPresetPicker('SDImageGen');
+              }}
+            >
+              <ActionIcon id="copy-to-project" />
+            </button>
+          </Tooltip>
+        )}
+        <Tooltip content="사전 세팅 일괄 삭제">
+          <button
+            type="button"
+            className="icon-button flex-none"
+            onClick={() => setBulkOpen(true)}
+          >
+            <ActionIcon id="delete" />
+          </button>
+        </Tooltip>
+        {companions}
+        {bulkOpen && (
+          <PreSetBulkManageModal
+            workflowType={workflowType}
+            onClose={() => setBulkOpen(false)}
+          />
+        )}
+        {isOpen && (
+          <ul
+            ref={listRef}
+            role="listbox"
+            className="left-0 top-10 absolute max-h-60 z-20 w-full mt-1 bg-white border-2 line-color rounded-md r-popover shadow-lg overflow-auto dark:bg-slate-700"
+          >
+            {presets.map((option) => (
+              <li
+                key={option.name}
+                role="option"
+                aria-selected={
+                  curSession.selectedWorkflow?.presetName === option.name
+                }
+                tabIndex={0}
+                onClick={() => selectPreset(option.name)}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    selectPreset(option.name);
+                  }
+                }}
+                className={`text-default flex items-center justify-between gap-2 px-2 py-1 clickable ${
+                  curSession.selectedWorkflow?.presetName === option.name
+                    ? 'bg-[var(--c-input-bg)]'
+                    : 'bg-[var(--c-surface)]'
+                }`}
+              >
+                <span className="flex flex-1 min-w-0 items-center gap-1.5 text-left">
+                  {curSession.selectedWorkflow?.presetName === option.name && (
+                    <FaCheck className="flex-none text-sky-500" aria-hidden />
+                  )}
+                  {/* flex-1 min-w-0 truncate: 긴 이름이 우측 수정/삭제 아이콘을 밀어내지 않게 */}
+                  <span className="flex-1 min-w-0 truncate">{option.name}</span>
+                </span>
+                {/* 행 버튼(2026-10-04 피드백 — 두껍고 알록달록): 무배경 중립 아이콘, 시각 PC 24·모바일 28px,
+                  모바일은 touch-hit 로 판정 확장(간격 8px — SPEC §2 이웃 판정 겹침 회피), 삭제만 빨간 아이콘. */}
+                <div className="flex flex-none items-center gap-2 md:gap-1">
+                  <button
+                    type="button"
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      // 현재 이름을 채워 연다 — 바꾸지 않고 확인하면 아무것도 하지 않는다(D2)
+                      const newName = await promptName({
+                        title: '새 사전 세팅 이름을 입력하세요',
+                        kind: 'preset',
+                        current: option.name,
+                        existing: (n) =>
+                          presets.some((x) => x !== option && x.name === n),
+                      });
+                      if (!newName) return;
+                      if (
+                        curSession.selectedWorkflow?.presetName === option.name
+                      ) {
+                        option.name = newName;
+                        curSession.selectedWorkflow = {
+                          workflowType,
+                          presetName: newName,
+                        };
+                      } else {
+                        option.name = newName;
+                      }
+                    }}
+                    className={PRESET_ROW_BTN}
+                    aria-label="이름 변경"
+                  >
+                    <ActionIcon id="rename" className={PRESET_ROW_ICON} />
+                  </button>
+                  <Tooltip content="그림체 복제">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const newPreset = workFlowService.presetFromJSON(
+                          option.toJSON(),
+                        );
+                        const existingNames = new Set(
+                          presets.map((item) => item.name),
+                        );
+                        let num = 1;
+                        while (
+                          existingNames.has(`${option.name} copy ${num}`)
+                        ) {
+                          num += 1;
+                        }
+                        const newName = `${option.name} copy ${num.toString()}`;
+                        newPreset.name = newName;
+                        curSession!.addPreset(newPreset);
+                      }}
+                      className={PRESET_ROW_BTN}
+                    >
+                      <ActionIcon id="duplicate" className={PRESET_ROW_ICON} />
+                    </button>
+                  </Tooltip>
+                  <Tooltip content="그림체 내보내기">
+                    <button
+                      type="button"
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        await appState.exportPreset(curSession, option);
+                      }}
+                      className={PRESET_ROW_BTN}
+                    >
+                      <ActionIcon id="export" className={PRESET_ROW_ICON} />
+                    </button>
+                  </Tooltip>
+                  {(workflowType === 'SDImageGen' ||
+                    workflowType === 'SDImageGenEasy') && (
+                    <Tooltip content="글로벌로 복사">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          appState.exportPresetToGlobal(curSession, option);
+                        }}
+                        className={PRESET_ROW_BTN}
+                      >
+                        <ActionIcon
+                          id="copy-to-global"
+                          className={PRESET_ROW_ICON}
+                        />
+                      </button>
+                    </Tooltip>
+                  )}
+                  <Tooltip content="그림체 삭제">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (presets.length === 1) {
+                          appState.pushMessage(
+                            '마지막 사전 세팅은 삭제할 수 없습니다',
+                          );
+                          return;
+                        }
+                        appState.pushDialog({
+                          type: 'confirm',
+                          // 휴지통이 없다 — 이름을 보이고 영구 삭제(Enter 무시). 버튼 툴팁(「그림체 삭제」)과 같은 라벨
+                          ...deleteConfirmText({
+                            kind: 'style',
+                            name: option.name,
+                            outcome: 'permanent',
+                          }),
+                          callback: () => {
+                            curSession!.removePreset(workflowType, option.name);
+                            curSession!.selectedWorkflow = {
+                              workflowType,
+                              presetName: undefined,
+                            };
+                          },
+                        });
+                      }}
+                      className={PRESET_ROW_BTN}
+                    >
+                      <ActionIcon
+                        id="delete"
+                        className={`${PRESET_ROW_ICON} text-red-500 dark:text-red-400`}
+                      />
+                    </button>
+                  </Tooltip>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </CompanionHostRow>
+  );
+});
+
+interface NullIntInputProps {
+  label: string;
+  value: number | null;
+  disabled: boolean;
+  onChange: (val: number | undefined) => void;
+}
+
+function NullIntInput({ label, value, onChange, disabled }: NullIntInputProps) {
+  return (
+    <input
+      className="w-full gray-input"
+      disabled={disabled}
+      aria-label={label}
+      inputMode="numeric"
+      value={value == null ? '' : value.toString()}
+      onChange={(event) => {
+        const text = event.target.value.trim();
+        const seed = Number(text);
+        onChange(text !== '' && isValidNaiSeed(seed) ? seed : undefined);
+      }}
+    />
+  );
+}
+
+interface WFElementProps {
+  element: WFIElement;
+}
+
+interface IWFGroupContext {
+  curGroup?: string;
+}
+
+const WFGroupContext = React.createContext<IWFGroupContext | null>(null);
+const anonymousElementKeys = new WeakMap<WFIElement, string>();
+function workflowElementKey(element: WFIElement): string {
+  const namedKey = wfiElementKey(element);
+  if (namedKey) return namedKey;
+  let key = anonymousElementKeys.get(element);
+  if (!key) {
+    key = v4();
+    anonymousElementKeys.set(element, key);
+  }
+  return key;
+}
+
+const WFRenderElement = observer(renderWorkflowElement);
+
+const WFRSceneOnly = observer(({ element }: WFElementProps) => {
+  const { meta, editVibe, showGroup } = useContext(WFElementContext)!;
+  const { curGroup } = useContext(WFGroupContext)!;
+  const input = element as WFISceneOnly;
+  if ((editVibe !== undefined && editVibe !== null) || curGroup !== showGroup) {
+    return null;
+  }
+  if (!meta) {
+    return null;
+  }
+  return <WFRenderElement element={input.element} />;
+});
+
+const WFRIfIn = observer(({ element }: WFElementProps) => {
+  const { shared, preset, meta, showGroup, editVibe } =
+    useContext(WFElementContext)!;
+  const { curGroup } = useContext(WFGroupContext)!;
+  const input = element as WFIIfIn;
+  const getField = () => {
+    if (input.fieldType === 'preset') return preset[input.field];
+    if (input.fieldType === 'shared') return shared[input.field];
+    return meta![input.field];
+  };
+  if ((editVibe !== undefined && editVibe !== null) || curGroup !== showGroup) {
+    return null;
+  }
+  if (!input.values.includes(getField())) {
+    return null;
+  }
+  return <WFRenderElement element={input.element} />;
+});
+
+const WFRShowImage = observer(({ element }: WFElementProps) => {
+  const { curSession } = appState;
+  const { meta, preset, shared, editVibe, showGroup } =
+    useContext(WFElementContext)!;
+  const { curGroup } = useContext(WFGroupContext)!;
+  const input = element as WFIShowImage;
+  const getField = () => {
+    if (input.fieldType === 'preset') return preset[input.field];
+    if (input.fieldType === 'shared') return shared[input.field];
+    return meta![input.field];
+  };
+  if ((editVibe !== undefined && editVibe !== null) || curGroup !== showGroup) {
+    return null;
+  }
+  return (
+    <div className="mt-2 md:mt-3">
+      {getField() && (
+        <VibeImage
+          path={imageService.getVibeImagePath(curSession!, getField())}
+          className="flex-none w-40 h-40 object-cover"
+        />
+      )}
+    </div>
+  );
+});
+
+// 변형 씬 편집 칸의 「샘플링·모델 설정은 메인 사전 세팅을 따릅니다」 안내 줄(2026-10-11, SPEC §7-5).
+// 생성은 메인 사전 세팅 값을 쓰므로(variantSampling) 이 칸에는 입력을 두지 않고, 현재 메인 값 요약만 읽기 전용으로 보인다.
+// observer — 메인 사전 세팅(선택 사전 세팅·값)이 바뀌면 바로 갱신. 메인을 못 읽으면 요약은 생략한다.
+const WFRMainSamplingNotice = observer(({ element }: WFElementProps) => {
+  const { editVibe, showGroup } = useContext(WFElementContext)!;
+  const input = element as WFIMainSamplingNotice;
+  if (showGroup || editVibe) {
+    return null;
+  }
+  const read = readMainSampling(appState.curSession);
+  const summary = read.ok ? mainSamplingSummary(read.main.preset) : undefined;
+  return (
+    <div className="flex-none mt-2 md:mt-3" data-main-sampling-notice="">
+      <div className="gray-label text-sm">{input.label}</div>
+      {summary && (
+        <div className="text-xs text-sub mt-0.5" data-main-sampling-summary="">
+          {summary}
+        </div>
+      )}
+    </div>
+  );
+});
+
+const WFRMiddlePlaceholder = observer(({ element }: WFElementProps) => {
+  const { editVibe, showGroup, getMiddlePrompt, onMiddlePromptChange } =
+    useContext(WFElementContext)!;
+  const input = element as WFIMiddlePlaceholderInput;
+  if (!getMiddlePrompt || !onMiddlePromptChange) {
+    return null;
+  }
+  if (showGroup || editVibe) {
+    return null;
+  }
+  return (
+    <EditorField label={input.label} full bold>
+      <PromptEditTextArea
+        value={getMiddlePrompt!()}
+        disabled={false}
+        onChange={onMiddlePromptChange!}
+      />
+    </EditorField>
+  );
+});
+
+// 추가 프롬프트 (2026-07-18) — 상위/중위 사이의 스크래치 프롬프트.
+// Session.extraPrompt 에 바인딩: 프로젝트(세션 JSON)에 귀속되어 유지되지만,
+// 프리셋·글로벌 프리셋 저장 구조에는 들어가지 않는다. 기본 접힘 + 내용 배지.
+const WFRExtraPrompt = observer(({ element }: WFElementProps) => {
+  const { editVibe, showGroup } = useContext(WFElementContext)!;
+  const { curSession } = appState;
+  const input = element as WFIExtraPromptInput;
+  if (!curSession) return null;
+  if (showGroup || editVibe) {
+    return null;
+  }
+  return (
+    <EditorField
+      label={input.label}
+      full
+      foldKey="extraPrompt"
+      defaultFolded
+      foldedBadge={curSession.extraPrompt.trim() ? '작성됨' : undefined}
+      hint={
+        '상위와 중간(씬 전용) 프롬프트 사이에 삽입되는 추가 프롬프트입니다.\n' +
+        '프리셋에는 저장되지 않고, 현재 프로젝트에 귀속되어 유지됩니다.'
+      }
+    >
+      <PromptEditTextArea
+        value={curSession.extraPrompt}
+        disabled={false}
+        onChange={(v: string) => {
+          curSession.extraPrompt = v;
+        }}
+      />
+    </EditorField>
+  );
+});
+
+const WFRProfilePresetSelect = observer((_props: WFElementProps) => (
+  <ProfilePreSetSelect />
+));
+
+const WFRPresetSelect = observer(({ element: _element }: WFElementProps) => {
+  const { type } = useContext(WFElementContext)!;
+  return <PreSetSelect workflowType={type} />;
+});
+
+const GlobalModelSettings = observer(() => {
+  const controlId = React.useId();
+  const effort = useContext(NaiEffortContext);
+  const [modelVersion, setModelVersion] = useState<ModelVersion>(
+    ModelVersion.V4_5,
+  );
+  const [switchingModel, setSwitchingModel] = useState(false);
+  const [furryMode, setFurryMode] = useState(false);
+  const [disableQuality, setDisableQuality] = useState(false);
+  const [qualityPreset, setQualityPreset] =
+    useState<GenerationQualityPreset>('standard');
+  const [ucPreset, setUcPreset] = useState<UcPresetKey>('none');
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    const load = async () => {
+      const config = await backend.getConfig();
+      setModelVersion(config.modelVersion ?? ModelVersion.V4_5);
+      setFurryMode(config.furryMode ?? false);
+      setDisableQuality(config.disableQuality ?? false);
+      setQualityPreset(resolveQualityPreset(config));
+      setUcPreset((config.ucPreset as UcPresetKey) ?? 'none');
+      setLoaded(true);
+    };
+    void load();
+    sessionService.addEventListener('config-changed', load);
+    return () => sessionService.removeEventListener('config-changed', load);
+  }, []);
+
+  const saveConfig = async (updates: Record<string, any>) => {
+    const config = await backend.getConfig();
+    await backend.setConfig({ ...config, ...updates });
+    sessionService.configChanged();
+  };
+
+  const changeModelVersion = async (next: ModelVersion) => {
+    if (switchingModel || next === modelVersion) return;
+    const previous = modelVersion;
+    const previousFamily = samplingFamilyForModel(previous);
+    const family = samplingFamilyForModel(next);
+    setSwitchingModel(true);
+    try {
+      if (family) switchSessionSamplingFamily(appState.curSession, family);
+      setModelVersion(next);
+      await saveConfig({ modelVersion: next });
+    } catch {
+      if (previousFamily) {
+        switchSessionSamplingFamily(appState.curSession, previousFamily);
+      }
+      setModelVersion(previous);
+      appState.pushMessage('모델 전환에 실패했습니다. 다시 시도해주세요.');
+    } finally {
+      setSwitchingModel(false);
+    }
+  };
+
+  if (!loaded) return null;
+  const medium = modelVersion === ModelVersion.V5 && effort === 'medium';
+
+  return (
+    <div className="mt-4 pt-4 border-t line-color">
+      <div className="text-sm font-semibold text-muted mb-3">
+        모델 설정 (전역)
+      </div>
+      <div className="space-y-3">
+        <div>
+          <label
+            className="text-sm gray-label mb-1 block"
+            htmlFor={`${controlId}-model`}
+          >
+            NAI 모델 버전
+          </label>
+          <DropdownSelect
+            inputId={`${controlId}-model`}
+            selectedOption={modelVersion}
+            menuPlacement="auto"
+            options={[
+              { label: 'V5 Full', value: ModelVersion.V5 },
+              { label: 'V5 Curated', value: ModelVersion.V5Curated },
+              { label: 'V4.5 Full', value: ModelVersion.V4_5 },
+              { label: 'V4.5 Curated', value: ModelVersion.V4_5Curated },
+              { label: 'V4 Full', value: ModelVersion.V4 },
+              { label: 'V4 Curated', value: ModelVersion.V4Curated },
+            ]}
+            onSelect={(opt) => {
+              void changeModelVersion(opt.value as ModelVersion);
+            }}
+            disabled={switchingModel}
+          />
+          {(modelVersion === ModelVersion.V5 ||
+            modelVersion === ModelVersion.V5Curated) && (
+            <div className="text-xs text-faint mt-1">
+              V5에서는 Karras가 고정되며 Vibe·캐릭터 레퍼런스·Variety+·DDIM은
+              생성 요청에서 안전하게 제외됩니다.
+            </div>
+          )}
+          {modelVersion === ModelVersion.V5Curated && (
+            <div className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+              V5 Curated 인페인트는 현재 NAI 공식 동작에 따라 V4.5 Curated
+              인페인트 모델로 처리됩니다.
+            </div>
+          )}
+        </div>
+        {modelVersion === ModelVersion.V5 && (
+          <NaiEffortControl
+            value={effort}
+            onChange={(value) => {
+              void saveConfig({ effort: value }).catch(() =>
+                appState.pushMessage('effort 저장에 실패했습니다.'),
+              );
+            }}
+          />
+        )}
+        <div className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            id="globalFurryMode"
+            checked={furryMode}
+            onChange={(e) => {
+              setFurryMode(e.target.checked);
+              saveConfig({ furryMode: e.target.checked });
+            }}
+          />
+          <label htmlFor="globalFurryMode" className="text-sm gray-label">
+            퍼리 모드 켜기
+          </label>
+        </div>
+        {modelVersion === ModelVersion.V5 ||
+        modelVersion === ModelVersion.V5Curated ? (
+          <div>
+            <label
+              className="text-sm gray-label mb-1 block"
+              htmlFor={`${controlId}-quality`}
+            >
+              품질 태그
+            </label>
+            <DropdownSelect
+              inputId={`${controlId}-quality`}
+              selectedOption={qualityPreset}
+              menuPlacement="auto"
+              options={QUALITY_PRESET_OPTIONS.map((value) => ({
+                value,
+                label: QUALITY_PRESET_LABELS[value],
+              }))}
+              onSelect={(opt) => {
+                const value = opt.value as GenerationQualityPreset;
+                setQualityPreset(value);
+                setDisableQuality(value === 'none');
+                saveConfig({
+                  qualityPreset: value,
+                  disableQuality: value === 'none',
+                });
+              }}
+            />
+            {qualityPreset !== 'none' && (
+              <div className="text-xs text-faint mt-1 break-all">
+                프롬프트 끝에 추가:{' '}
+                {qualityPresetTextFor(modelVersion, qualityPreset)}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="globalAddQuality"
+                checked={!disableQuality}
+                onChange={(e) => {
+                  setDisableQuality(!e.target.checked);
+                  saveConfig({ disableQuality: !e.target.checked });
+                }}
+              />
+              <label htmlFor="globalAddQuality" className="text-sm gray-label">
+                퀄리티 태그 추가 (Add Quality Tags)
+              </label>
+            </div>
+            {!disableQuality && (
+              <div className="text-xs text-faint mt-1 ml-6 break-all">
+                프롬프트 끝에 추가:{' '}
+                {qualityPresetTextFor(modelVersion, 'standard')}
+              </div>
+            )}
+          </div>
+        )}
+        {/* NAI 웹 패리티: Undesired Content Preset — 생성 시 네거티브 프롬프트
+            앞에 모델별 프리셋 텍스트가 병합된다. 기본 '없음' = 기존 결과 무변화. */}
+        <div>
+          <label
+            className="text-sm gray-label mb-1 block"
+            htmlFor={`${controlId}-uc`}
+          >
+            네거티브 프리셋 (Undesired Content Preset)
+          </label>
+          <DropdownSelect
+            inputId={`${controlId}-uc`}
+            selectedOption={
+              medium ? 'heavy' : effectiveUcPreset(modelVersion, ucPreset)
+            }
+            disabled={medium}
+            menuPlacement="auto"
+            options={ucPresetOptionsFor(modelVersion)}
+            onSelect={(opt) => {
+              setUcPreset(opt.value as UcPresetKey);
+              saveConfig({ ucPreset: opt.value });
+            }}
+          />
+          {(medium || effectiveUcPreset(modelVersion, ucPreset) !== 'none') && (
+            <div className="text-xs text-faint mt-1 break-all">
+              네거티브 앞에 추가:{' '}
+              {ucPresetTextFor(modelVersion, medium ? 'heavy' : ucPreset)}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+const TransparentBackgroundMainRow = observer(
+  ({ modelVersion }: { modelVersion: ModelVersion }) => {
+    const [enabled, setEnabled] = useState(false);
+    const [loaded, setLoaded] = useState(false);
+
+    useEffect(() => {
+      let mounted = true;
+      const load = async () => {
+        const config = await backend.getConfig();
+        if (!mounted) return;
+        setEnabled(config.transparentBackground ?? false);
+        setLoaded(true);
+      };
+      void load();
+      sessionService.addEventListener('config-changed', load);
+      return () => {
+        mounted = false;
+        sessionService.removeEventListener('config-changed', load);
+      };
+    }, []);
+
+    if (!loaded || !isV5ModelVersion(modelVersion)) return null;
+
+    return (
+      <div className="field-row pt-2 md:pt-3 flex gap-2 items-center">
+        <input
+          type="checkbox"
+          id="mainTransparentBackground"
+          checked={enabled}
+          onChange={async (e) => {
+            const { checked } = e.target;
+            setEnabled(checked);
+            const config = await backend.getConfig();
+            await backend.setConfig({
+              ...config,
+              transparentBackground: checked,
+            });
+            sessionService.configChanged();
+          }}
+        />
+        <label
+          htmlFor="mainTransparentBackground"
+          className="flex-none gray-label cursor-pointer"
+        >
+          투명 배경
+        </label>
+        <HelpIcon content={TRANSPARENT_BACKGROUND_HELP} />
+      </div>
+    );
+  },
+);
+
+const WFRGroup = observer(({ element }: WFElementProps) => {
+  const grp = element as WFIGroup;
+  const { editVibe, setShowGroupOverlay } = useContext(WFElementContext)!;
+  const iconRow = useContext(PresetIconRowContext);
+  if (editVibe !== undefined && editVibe !== null) {
+    return null;
+  }
+  // 동반 슬롯 (E2): 그룹 행(hostKey = wfiElementKey = 그룹 id 'sampling-group') 옆에
+  // 붙일 portable 버튼. 빈 배열이면 슬롯 없음 = 현행 렌더 100% 동일(회귀 기준).
+  // hostKey 를 renderCompanionButtons/CompanionHostRow 에 넘겨 편집모드(PC) 드래그(E4)를
+  // 붙인다 — 편집모드 밖은 CompanionHostRow 가 fragment 라 렌더 무변화.
+  const hostKey = wfiElementKey(element) ?? grp.label;
+  const companionIds = resolveCompanionButtons(
+    hostKey,
+    appState.uiCompanionSlots,
+  );
+  const companions = renderCompanionButtons(companionIds, hostKey);
+  const hasCompanions = companions.length > 0;
+  // 하단 아이콘 행(uiPresetIconRow) 안 — 아이콘 압축 형태. 동반 버튼은 그대로 이웃.
+  if (iconRow) {
+    return (
+      <CompanionHostRow hostKey={hostKey}>
+        <Tooltip content={grp.label}>
+          <button
+            type="button"
+            className="round-button back-gray h-8 flex-1 min-w-0"
+            onClick={() => {
+              setShowGroupOverlay(grp.label);
+            }}
+          >
+            <FaSlidersH size={14} className="inline-block" />
+          </button>
+        </Tooltip>
+        {companions}
+      </CompanionHostRow>
+    );
+  }
+  // 슬롯 없음 = 현행 렌더 100% 동일(회귀 기준). 동반 버튼이 있으면 그룹 버튼을 flex-1 로
+  // 축소하고 옆에 아이콘 버튼을 붙이는 flex 행으로 감싼다.
+  return (
+    <CompanionHostRow hostKey={hostKey}>
+      {!hasCompanions ? (
+        <button
+          type="button"
+          className="round-button back-gray h-8 w-full mt-2 md:mt-3"
+          onClick={() => {
+            setShowGroupOverlay(grp.label);
+          }}
+        >
+          {grp.label}
+        </button>
+      ) : (
+        <div className="w-full mt-2 md:mt-3 flex gap-1 items-stretch">
+          <button
+            type="button"
+            className="round-button back-gray h-8 flex-1"
+            onClick={() => {
+              setShowGroupOverlay(grp.label);
+            }}
+          >
+            {grp.label}
+          </button>
+          {companions}
+        </div>
+      )}
+    </CompanionHostRow>
+  );
+});
+
+const WFRStack = observer(({ element }: WFElementProps) => {
+  const stk = element as WFIStack;
+  return (
+    <VerticalStack>
+      {stk.inputs.map((x) => (
+        <WFRenderElement key={workflowElementKey(x)} element={x} />
+      ))}
+    </VerticalStack>
+  );
+});
+
+// 편집모드 래퍼가 세로 성장(flex-1)을 보존해야 하는 요소인지(L1-4).
+// EditorField(프롬프트 flex-1)·middlePlaceholder(항상 full)만 flex-1 콘텐츠를 낸다 —
+// 이 경우 래퍼도 flex-1 로 감싸야 프롬프트가 편집모드에서 접히지 않는다. 그 외는 flex-none.
+// ifIn/sceneOnly 래퍼는 내부 요소로 폴백(wfiElementKey 와 동일 계약).
+function presetRowGrows(el: WFIElement): boolean {
+  let cur: WFIElement = el;
+  while (cur.type === 'ifIn' || cur.type === 'sceneOnly') {
+    cur = (cur as WFIIfIn | WFISceneOnly).element;
+  }
+  if (cur.type === 'middlePlaceholder') return true;
+  if (cur.type === 'extraPrompt') return true;
+  if (cur.type === 'inline') return (cur as WFIInlineInput).flex === 'flex-1';
+  return false;
+}
+
+// 새 씬 기본 해상도 행 (2026-07-18) — 프리셋 패널 워크플로우 스택 바로 아래(시드 아래) 고정.
+// 여기서 고른 해상도는 세션(newSceneResolution)에 저장되어 [씬 추가]로 새로 만드는
+// 씬에만 적용된다(기존 씬 무영향). 우측 버튼 = 씬 탭의 모든 씬에 현재 해상도 일괄 적용.
+const NewSceneResolutionRow = observer(() => {
+  const { curSession } = appState;
+  if (!curSession) return null;
+  const value = curSession.newSceneResolution;
+  const size = resolutionValueToSize(value);
+  const applyAll = () => {
+    const scenes = Array.from(curSession.scenes.values());
+    if (scenes.length === 0) {
+      appState.pushMessage('적용할 씬이 없습니다');
+      return;
+    }
+    appState.pushDialog({
+      type: 'confirm',
+      danger: true,
+      text: `씬 탭의 모든 씬 ${scenes.length}개에 ${size.width}x${size.height} 해상도를 적용하시겠습니까?`,
+      callback: () => {
+        const v = value ?? { resolution: 'portrait' };
+        for (const scene of scenes) {
+          scene.resolution = v.resolution;
+          if (v.resolution === 'custom') {
+            scene.resolutionWidth = v.width;
+            scene.resolutionHeight = v.height;
+          }
+        }
+        appState.pushMessage(`${scenes.length}개 씬에 해상도를 적용했습니다`);
+      },
+    });
+  };
+  return (
+    <div className="flex-none mt-2 flex items-center gap-2">
+      <span className="flex-none gray-label">새 씬 해상도:</span>
+      {/* 남는 폭을 피커가 채운다 — 값은 왼쪽, 화살표는 오른쪽 끝 */}
+      <ResolutionPicker
+        className="flex-1 min-w-0"
+        triggerClassName="w-full justify-between py-1.5"
+        value={value}
+        onApply={(v) => {
+          curSession.newSceneResolution = v;
+        }}
+      />
+      <Tooltip content="씬 탭의 모든 씬에 이 해상도를 일괄 적용합니다 (인페인트 씬 제외)">
+        <button
+          type="button"
+          className="round-button back-gray text-sm flex-none px-2.5 py-1 min-w-0"
+          onClick={applyAll}
+        >
+          일괄 적용
+        </button>
+      </Tooltip>
+    </div>
+  );
+});
+
+// 하단 아이콘 행(uiPresetIconRow) 대상 요소의 안정 키 목록(wfiElementKey 계약,
+// 배포 후 불변) — 프리셋 패널의 넓은 버튼 4종. COMPANION_HOSTS 의 행 호스트 키에서
+// preset-select 를 제외한 집합과 동일. 워크플로우 스택에 존재하는 것만 하단 행으로
+// 이동한다(워크플로우별 구성 상이 — 예: 인페인트엔 레퍼런스 없음).
+const PRESET_ICON_ROW_KEYS: readonly string[] = [
+  'characterPrompts',
+  'sampling-group',
+  'vibes',
+  'characterReferences',
+];
+
+// 루트 스택 렌더의 단일 관문(L1-4). 편집모드 꺼짐(또는 모바일·비스택·키 없음)이면
+// 기존 경로(<WFRenderElement element/>)를 100% 그대로 태운다 = L1-3 회귀 기준 유지.
+// 편집모드 활성(PC) && 최상위 전 요소가 유효 키일 때만 각 요소를 세로 드래그 래퍼로 감싼다.
+// 앵커 키(PRESET_LAYOUT_ANCHOR_KEYS)는 래퍼 없이 그대로 렌더 = 최상단 고정·드래그 불가.
+// iconRow(uiPresetIconRow, ② B): 대상 키 요소를 본문에서 빼 하단 flex-none 아이콘 행으로
+// 보낸다. 요소는 원본 그대로 재렌더(래퍼·상태·핸들러 보존)하고, 압축 시각만
+// PresetIconRowContext 로 전환한다. 비활성(기본) = bottomEls 빈 배열 = 현행 렌더 100% 동일.
+const PresetRootRender = observer(
+  ({
+    element,
+    slotKey,
+    iconRow,
+    belowBody,
+  }: {
+    element: WFIElement;
+    slotKey?: string;
+    iconRow?: boolean;
+    // 본문(워크플로우 스택) 아래·하단 아이콘 행 위에 끼우는 고정 행
+    // (새 씬 해상도 행). 프리셋 패널(general)에서만 전달된다.
+    belowBody?: React.ReactNode;
+  }) => {
+    // 모바일 V2 하단 시트의 "반" 상태(빠른 수정): 상위·추가 프롬프트와 시드만 그린다.
+    // 해당 키가 하나도 없는 워크플로우면 평소 렌더로 폴백한다. 요소는 원본 그대로라 접힘 상태·값이 전체 보기와 공유된다.
+    const compact = useContext(PresetCompactContext);
+    // 모바일 V2 시트의 집중 모드(MobilePromptSheet.PresetFocusContext). 공급자가 있을 때만 요소마다
+    // data-wfi-key 래퍼(display:contents — 레이아웃 불변)를 두고, 집중 키가 있으면 그 요소만 보이게 한다.
+    // 래퍼는 모드와 무관하게 항상 있어야 한다(진입·해제가 트리를 바꾸면 포커스된 칸이 재마운트되어 포커스를 잃음).
+    const focus = useContext(PresetFocusContext);
+    const focusKey = focus?.key ?? null;
+    const renderEl = (x: WFIElement) => {
+      const k = wfiElementKey(x) ?? '';
+      const reactKey = workflowElementKey(x);
+      if (!focus) return <WFRenderElement key={reactKey} element={x} />;
+      const hidden = focusKey != null && k !== focusKey;
+      return (
+        <div
+          key={reactKey}
+          {...{ [WFI_KEY_ATTR]: k }}
+          style={{ display: hidden ? 'none' : 'contents' }}
+        >
+          <WFRenderElement element={x} />
+        </div>
+      );
+    };
+    // 집중 모드 머리줄: 편집 중인 칸 이름 + 완료(포커스 해제 → 키보드 내림). 어느 칸을 고치는지 알 수 있게.
+    const focusHead = (inputs: WFIElement[]) => {
+      if (!focus || focusKey == null) return null;
+      const target = inputs.find((x) => (wfiElementKey(x) ?? '') === focusKey);
+      if (!target) return null;
+      const label = (target as { label?: string }).label ?? '';
+      return (
+        <div
+          key="__v2-focus-head"
+          className="flex-none flex items-center gap-2 pb-1"
+        >
+          <span className="flex-1 min-w-0 truncate text-sm font-semibold gray-label">
+            {label || '편집 중'}
+          </span>
+          <button
+            type="button"
+            className="round-button back-sky text-sm px-3 py-0.5 min-w-0 min-h-0"
+            onClick={focus.done}
+          >
+            완료
+          </button>
+        </div>
+      );
+    };
+    if (compact && element.type === 'stack') {
+      const keep = (element as WFIStack).inputs.filter((x) =>
+        V2_SHEET_HALF_KEYS.includes(wfiElementKey(x) ?? ''),
+      );
+      if (keep.length > 0) {
+        return (
+          <VerticalStack>
+            {focusHead(keep)}
+            {keep.map(renderEl)}
+          </VerticalStack>
+        );
+      }
+    }
+    // 하단 행 분리(활성 시에만). 순서 오버라이드(resolveStackInputs)가 이미 적용된
+    // 스택을 받으므로, 본문 순서·하단 행 순서 모두 사용자 순서를 따른다.
+    let bodyInputs: WFIElement[] | undefined;
+    let bottomEls: WFIElement[] = [];
+    if (iconRow && element.type === 'stack') {
+      const stk = element as WFIStack;
+      bottomEls = stk.inputs.filter((x) =>
+        PRESET_ICON_ROW_KEYS.includes(wfiElementKey(x) ?? ''),
+      );
+      if (bottomEls.length > 0) {
+        bodyInputs = stk.inputs.filter((x) => !bottomEls.includes(x));
+      }
+    }
+    const bottomRow =
+      bottomEls.length > 0 ? (
+        <PresetIconRowContext.Provider value>
+          <div className="flex-none flex gap-1 items-stretch mt-2 md:mt-3">
+            {bottomEls.map((x) => (
+              <WFRenderElement key={workflowElementKey(x)} element={x} />
+            ))}
+          </div>
+        </PresetIconRowContext.Provider>
+      ) : null;
+
+    const editing =
+      appState.editMode && !isMobile && element.type === 'stack' && !!slotKey;
+    if (!editing) {
+      if (!bodyInputs) {
+        if (!belowBody || element.type !== 'stack') {
+          // 평상시 마크업/클래스 무변경 — 원래 렌더 경로 그대로.
+          return <WFRenderElement element={element} />;
+        }
+        // belowBody 만 있는 경우 — 스택이 h-full 이라 형제로는 못 붙이므로
+        // WFRStack 과 동일한 VerticalStack 골격에 본문+행을 렌더한다.
+        return (
+          <VerticalStack>
+            {focusHead((element as WFIStack).inputs)}
+            {(element as WFIStack).inputs.map((x) => renderEl(x))}
+            {focusKey == null && belowBody}
+          </VerticalStack>
+        );
+      }
+      // 아이콘 행 활성: WFRStack 과 동일한 VerticalStack 골격에 본문만 렌더하고
+      // 최하단에 아이콘 행을 붙인다. 집중 모드에서는 해상도 행·아이콘 행도 숨긴다.
+      return (
+        <VerticalStack>
+          {focusHead(bodyInputs)}
+          {bodyInputs.map(renderEl)}
+          {focusKey == null && belowBody}
+          {focusKey == null && bottomRow}
+        </VerticalStack>
+      );
+    }
+    const stk = element as WFIStack;
+    // 편집모드 드래그 대상 = 본문 요소만(하단 행 요소는 워크플로우 정의 순서 고정).
+    // 저장되는 순서 배열이 하단 행 키를 안 담아도 resolvePresetOrder 가 누락 키를
+    // 정의 위치에 삽입하므로(순열 계약) 옵션 해제 시에도 안전하다.
+    const rows = bodyInputs ?? stk.inputs;
+    const keys = rows.map((x) => wfiElementKey(x));
+    // 키 없는 최상위 요소 방어 — 하나라도 있으면 편집 비활성(정의 순서 그대로 폴백).
+    const allKeyed = keys.every(
+      (k): k is string => typeof k === 'string' && k.length > 0,
+    );
+    if (!allKeyed) {
+      return <WFRenderElement element={element} />;
+    }
+    const order = keys as string[]; // 현재 렌더된 전체 키 순서(앵커 포함)
+    const hasOverride = !!appState.uiPresetLayout[slotKey!];
+
+    // WFRStack 과 동일한 VerticalStack 골격 — 자식만 편집 래퍼로 감싼다.
+    return (
+      <VerticalStack>
+        {hasOverride && (
+          <div className="flex-none flex justify-end mb-1">
+            <button
+              type="button"
+              className="round-button back-gray text-sm px-2 py-0.5 min-w-0 min-h-0"
+              onClick={() => resetPresetOrder(slotKey!)}
+              title="이 화면의 요소 순서를 기본값으로 되돌립니다"
+            >
+              순서 초기화
+            </button>
+          </div>
+        )}
+        {rows.map((x, i) => {
+          const key = order[i];
+          // 앵커 = 최상단 고정 — 드래그/드롭 대상 아님(그대로 렌더).
+          if (isPresetAnchorKey(key)) {
+            return <WFRenderElement key={key} element={x} />;
+          }
+          return (
+            <DraggablePresetRow
+              key={key}
+              slotKey={slotKey!}
+              elementKey={key}
+              order={order}
+              grow={presetRowGrows(x)}
+              label={presetRowLabel(x)}
+            >
+              <WFRenderElement element={x} />
+            </DraggablePresetRow>
+          );
+        })}
+        {belowBody}
+        {bottomRow}
+      </VerticalStack>
+    );
+  },
+);
+
+const WFRPush = observer(({ element }: WFElementProps) => {
+  const { showGroup, showGroupOverlay, editVibe } =
+    useContext(WFElementContext)!;
+  const { curGroup } = useContext(WFGroupContext)!;
+  const push = element as WFIPush;
+  const isInOverlay = curGroup !== undefined && curGroup === showGroupOverlay;
+  if (!isInOverlay) {
+    if (
+      curGroup !== showGroup ||
+      (editVibe !== undefined && editVibe !== null)
+    ) {
+      return null;
+    }
+  }
+
+  if (push.direction === 'top') {
+    return <div className="mt-auto" />;
+  }
+  if (push.direction === 'bottom') {
+    return <div className="mb-auto" />;
+  }
+  if (push.direction === 'left') {
+    return <div className="ml-auto" />;
+  }
+  if (push.direction === 'right') {
+    return <div className="mr-auto" />;
+  }
+
+  return undefined;
+});
+
+export const CharacterPromptEditor = observer(
+  ({ input }: { input: WFIInlineInput }) => {
+    const effort = useContext(NaiEffortContext);
+    const {
+      preset,
+      shared,
+      meta,
+      editCharacters,
+      setEditCharacters,
+      middlePromptMode,
+      modelVersion,
+      getCharacterMiddlePrompt,
+      onCharacterMiddlePromptChange,
+    } = useContext(WFElementContext)!;
+    const negativePromptSupported = getNaiModelSpec(modelVersion, effort)
+      .capabilities.supportsNegativePrompt;
+
+    const getField = () => {
+      if (input.fieldType === 'preset') return preset[input.field] || [];
+      if (input.fieldType === 'shared') return shared[input.field] || [];
+      return meta![input.field] || [];
+    };
+
+    const setField = (val: any) => {
+      if (input.fieldType === 'preset') preset[input.field] = val;
+      else if (input.fieldType === 'shared') shared[input.field] = val;
+      else meta![input.field] = val;
+    };
+
+    const addCharacter = () => {
+      const sharedCount =
+        input.fieldType === 'preset'
+          ? (shared?.characterPrompts || []).length
+          : 0;
+      if (
+        (modelVersion === ModelVersion.V5 ||
+          modelVersion === ModelVersion.V5Curated) &&
+        sharedCount + getField().length >= 32
+      ) {
+        appState.pushMessage(
+          'V5 캐릭터 프롬프트는 최대 32개까지 사용할 수 있습니다.',
+        );
+        return;
+      }
+      const characters = [...getField()];
+      characters.push({
+        id: v4(),
+        name: '',
+        prompt: '',
+        uc: '',
+        position: { x: 0.5, y: 0.5 },
+        enabled: true,
+      });
+      setField(characters);
+    };
+
+    const removeCharacter = (id: string) => {
+      const characters = getField().filter((c: CharacterPrompt) => c.id !== id);
+      setField(characters);
+    };
+
+    const updateCharacter = (id: string, updates: Partial<CharacterPrompt>) => {
+      const characters = getField().map((c: CharacterPrompt) =>
+        c.id === id ? { ...c, ...updates } : c,
+      );
+      setField(characters);
+    };
+
+    const toggleCharacter = (id: string) => {
+      const characters = getField().map((c: CharacterPrompt) =>
+        c.id === id ? { ...c, enabled: c.enabled === false } : c,
+      );
+      setField(characters);
+    };
+
+    // 캐릭터 위치 지정 오버레이(2026-09-26): 인라인 좌표평면 대신 전체 화면 모달(ModalOverlay fullscreen — PC 프리셋 도크는 FloatViewProvider 밖). 배경은 열 때 한 번 정한다.
+    const [posOverlay, setPosOverlay] = useState<{
+      selectedId?: string;
+      bg: PositionBackground;
+    } | null>(null);
+
+    if (editCharacters !== input.field) {
+      return null;
+    }
+
+    const sharedCPs = shared?.characterPrompts || [];
+    const openPositionOverlay = (selectedId?: string) =>
+      setPosOverlay({
+        selectedId,
+        bg: resolvePositionBackground(appState.curSession),
+      });
+    const closePositionOverlay = () => setPosOverlay(null);
+    const allChars =
+      input.fieldType === 'preset'
+        ? getOrderedBaseCharacterPrompts(preset, shared)
+        : getField();
+    const moveCharacter = (from: number, to: number) => {
+      if (input.fieldType === 'preset') {
+        reorderBaseCharacterPrompts(preset, shared, from, to);
+        return;
+      }
+      const next = [...getField()];
+      if (
+        from < 0 ||
+        to < 0 ||
+        from >= next.length ||
+        to >= next.length ||
+        from === to
+      )
+        return;
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      setField(
+        next.map((item: CharacterPrompt, index: number) => ({
+          ...item,
+          order: index,
+        })),
+      );
+    };
+    const reachedV5CharacterLimit =
+      (modelVersion === ModelVersion.V5 ||
+        modelVersion === ModelVersion.V5Curated) &&
+      allChars.length >= 32;
+    const setCharPosition = (charId: string, position: CharacterPosition) => {
+      // preset(워크플로우) 캐릭터 프롬프트에서 찾기
+      const inField = getField().find((c: CharacterPrompt) => c.id === charId);
+      if (inField) {
+        updateCharacter(charId, { position });
+        return;
+      }
+      // shared(캐릭터 프리셋) 캐릭터 프롬프트에서 찾기
+      // in-place 변형은 자동 저장 reaction이 추적하지 못하므로 배열을 재할당한다.
+      const inShared = sharedCPs.find((c: CharacterPrompt) => c.id === charId);
+      if (inShared) {
+        shared.characterPrompts = (shared.characterPrompts || []).map(
+          (c: CharacterPrompt) => (c.id === charId ? { ...c, position } : c),
+        );
+      }
+    };
+
+    const charColors = [
+      '#38bdf8',
+      '#f472b6',
+      '#a78bfa',
+      '#fb923c',
+      '#4ade80',
+      '#facc15',
+      '#f87171',
+      '#94a3b8',
+    ];
+
+    return (
+      <div className="w-full h-full overflow-hidden flex flex-col">
+        <div className="flex-none mx-3 mt-3 flex items-center gap-2">
+          <input
+            type="checkbox"
+            id="useCoords"
+            checked={preset.useCoords ?? false}
+            onChange={(e) => {
+              preset.useCoords = e.target.checked;
+            }}
+          />
+          <label
+            htmlFor="useCoords"
+            className="text-sm gray-label cursor-pointer"
+          >
+            캐릭터 위치 지정 모드
+          </label>
+        </div>
+        {preset.useCoords && allChars.length > 0 && (
+          <div className="flex-none mx-3 mt-2">
+            <button
+              type="button"
+              className="round-button back-sky h-8 text-sm"
+              data-char-pos-open=""
+              onClick={() => openPositionOverlay()}
+            >
+              위치 지정 창 열기
+            </button>
+          </div>
+        )}
+        {posOverlay && (
+          <ModalOverlay
+            isOpen
+            onClose={closePositionOverlay}
+            title="캐릭터 위치 지정"
+            fullscreen
+          >
+            <CharacterPositionOverlay
+              markers={allChars.map(
+                (c: CharacterPrompt, i: number): PositionMarker => ({
+                  id: c.id,
+                  label: c.fromPreset
+                    ? `프리셋: ${c.fromPreset}`
+                    : typeof c.prompt === 'string'
+                      ? c.prompt
+                      : '',
+                  color: charColors[i % charColors.length],
+                  position: c.position ?? { x: 0.5, y: 0.5 },
+                  enabled: c.enabled !== false,
+                }),
+              )}
+              onMove={setCharPosition}
+              onDone={closePositionOverlay}
+              initialSelectedId={posOverlay.selectedId}
+              backgroundPath={posOverlay.bg.path}
+              fallbackAspect={posOverlay.bg.aspect}
+              caption={posOverlay.bg.caption}
+            />
+          </ModalOverlay>
+        )}
+        <div className="flex-1 overflow-hidden">
+          <div className="h-full overflow-auto px-3">
+            {allChars.map((character: CharacterPrompt, i: number) => {
+              const locked =
+                input.fieldType === 'preset' &&
+                sharedCPs.some((cp: CharacterPrompt) => cp.id === character.id);
+              return (
+                <div
+                  key={character.id}
+                  className={`border rounded-md r-card mt-3 p-3 ${
+                    locked
+                      ? 'border-green-300 dark:border-green-600 bg-green-50 dark:bg-green-900/20'
+                      : character.enabled === false
+                        ? 'opacity-60 line-color'
+                        : 'border-sky-500 bg-[var(--c-surface-2)]'
+                  }`}
+                >
+                  <div className="flex justify-between items-center mb-2">
+                    {/* 2026-09-26 사용자 지적: 미동작 끌기 손잡이와 자리만 차지하던 「캐릭터 프롬프트」 글자 제거(순서는 ↑↓) */}
+                    <div className="flex items-center gap-2 gray-label">
+                      <div
+                        className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-white"
+                        style={{
+                          backgroundColor: charColors[i % charColors.length],
+                        }}
+                      >
+                        {i + 1}
+                      </div>
+                      {locked ? (
+                        <span className="flex items-center gap-1 text-green-700 dark:text-green-400">
+                          <FaLock size={11} /> 프리셋: {character.fromPreset}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        className="icon-button back-gray w-7 h-7"
+                        disabled={i === 0}
+                        onClick={() => moveCharacter(i, i - 1)}
+                        title="위로"
+                      >
+                        <FaArrowUp size={11} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-button back-gray w-7 h-7"
+                        disabled={i === allChars.length - 1}
+                        onClick={() => moveCharacter(i, i + 1)}
+                        title="아래로"
+                      >
+                        <FaArrowDown size={11} />
+                      </button>
+                      {locked ? (
+                        <Tooltip
+                          content={`${character.fromPreset} 프리셋 해제 — 연결된 바이브/레퍼런스 함께 제거`}
+                        >
+                          <button
+                            type="button"
+                            className="flex-none text-muted hover:text-red-500 dark:hover:text-red-400 p-1"
+                            onClick={() =>
+                              appState.removeAppliedCharacterPreset(
+                                character.fromPreset!,
+                              )
+                            }
+                          >
+                            <FaTimes size={13} />
+                          </button>
+                        </Tooltip>
+                      ) : (
+                        <>
+                          <Tooltip
+                            content={
+                              character.enabled !== false
+                                ? '비활성화'
+                                : '활성화'
+                            }
+                          >
+                            <button
+                              type="button"
+                              className={`round-button h-8 px-4 ${character.enabled !== false ? 'back-sky' : 'back-gray'}`}
+                              onClick={() => toggleCharacter(character.id)}
+                            >
+                              {character.enabled !== false ? (
+                                <FaToggleOn className="mr-1" />
+                              ) : (
+                                <FaToggleOff className="mr-1" />
+                              )}
+                              {character.enabled !== false
+                                ? '활성화됨'
+                                : '비활성화됨'}
+                            </button>
+                          </Tooltip>
+                          <Tooltip content="캐릭터 삭제">
+                            <button
+                              type="button"
+                              className="icon-button back-red"
+                              onClick={() => removeCharacter(character.id)}
+                            >
+                              <FaTrash />
+                            </button>
+                          </Tooltip>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  {locked ? (
+                    <>
+                      <div className="text-xs text-muted mb-0.5">
+                        캐릭터 프롬프트:
+                      </div>
+                      <div className="text-xs text-body bg-[var(--c-surface)] p-1.5 rounded font-mono whitespace-pre-wrap break-all mb-1">
+                        {character.prompt || '(비어 있음)'}
+                      </div>
+                      {character.uc && (
+                        <>
+                          <div className="text-xs text-muted mb-0.5">
+                            네거티브 프롬프트
+                            {!negativePromptSupported &&
+                              ' (Medium 미적용 · 내용 보관)'}
+                            :
+                          </div>
+                          <div className="text-xs text-body bg-[var(--c-surface)] p-1.5 rounded font-mono whitespace-pre-wrap break-all">
+                            {character.uc}
+                          </div>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <div className="mb-2">
+                        <PromptEditTextArea
+                          value={character.prompt}
+                          onChange={(value) =>
+                            updateCharacter(character.id, { prompt: value })
+                          }
+                        />
+                      </div>
+                      {middlePromptMode && (
+                        <>
+                          <div className="flex justify-between items-center mb-2">
+                            <div className="flex items-center gap-2 gray-label">
+                              중간 프롬프트 (이 씬에만 적용됨)
+                            </div>
+                          </div>
+                          <div className="mb-2">
+                            <PromptEditTextArea
+                              value={getCharacterMiddlePrompt!(i)}
+                              onChange={(value) =>
+                                onCharacterMiddlePromptChange!(i, value)
+                              }
+                            />
+                          </div>
+                        </>
+                      )}
+                      <div className="flex justify-between items-center mb-2">
+                        <div className="flex items-center gap-2 gray-label">
+                          네거티브 프롬프트
+                          {!negativePromptSupported &&
+                            ' (Medium 미적용 · 내용 보관)'}
+                        </div>
+                      </div>
+                      <div className="mb-2">
+                        <PromptEditTextArea
+                          value={character.uc}
+                          disabled={!negativePromptSupported}
+                          onChange={(value) =>
+                            updateCharacter(character.id, { uc: value })
+                          }
+                        />
+                      </div>
+                      {preset.useCoords && (
+                        // 위치 줄을 누르면 그 캐릭터가 선택된 상태로 위치 지정 창이 열린다(2026-09-26)
+                        <button
+                          type="button"
+                          className="flex items-center gap-2 text-xs text-sky-500 mt-1 relative touch-hit"
+                          onClick={() => openPositionOverlay(character.id)}
+                        >
+                          <div
+                            className="w-3 h-3 rounded-full border"
+                            style={{
+                              backgroundColor:
+                                charColors[i % charColors.length],
+                            }}
+                          />
+                          위치: ({(character.position?.x ?? 0.5).toFixed(2)},{' '}
+                          {(character.position?.y ?? 0.5).toFixed(2)}) · 위치
+                          지정 창에서 조정
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="flex-none mt-auto pt-2 flex gap-2 items-center">
+          <button
+            type="button"
+            className="round-button back-green h-8"
+            onClick={addCharacter}
+            disabled={reachedV5CharacterLimit}
+            title={reachedV5CharacterLimit ? 'V5 최대 32개' : undefined}
+          >
+            캐릭터 추가{reachedV5CharacterLimit ? ' (최대 32개)' : ''}
+          </button>
+          <button
+            type="button"
+            className="round-button back-gray h-8 w-full"
+            onClick={() => {
+              setEditCharacters(undefined);
+            }}
+          >
+            캐릭터 프롬프트 닫기
+          </button>
+        </div>
+      </div>
+    );
+  },
+);
+
+export const CharacterButton = observer(
+  ({ input }: { input: WFIInlineInput }) => {
+    const { editCharacters, setEditCharacters, preset, shared, meta } =
+      useContext(WFElementContext)!;
+    const iconRow = useContext(PresetIconRowContext);
+
+    const getField = () => {
+      if (input.fieldType === 'preset') return preset[input.field] || [];
+      if (input.fieldType === 'shared') return shared[input.field] || [];
+      return meta![input.field] || [];
+    };
+
+    const onClick = () => {
+      setEditCharacters(input.field);
+    };
+
+    const field = getField();
+    const enabledCount = field.filter(
+      (c: CharacterPrompt) => c.enabled !== false,
+    ).length;
+    const totalCount = field.length;
+    const sharedCPs = shared?.characterPrompts || [];
+    const hasPresetApplied =
+      input.fieldType === 'preset' && sharedCPs.length > 0;
+    const anyCharacters = field.length > 0 || hasPresetApplied;
+
+    // 동반 슬롯 (L3-2): 이 호스트 행(hostKey = wfiElementKey, 인라인은 id ?? field)에
+    // 붙일 portable 버튼 목록. 빈 배열이면 슬롯 없음 = 현행 렌더 100% 동일(회귀 기준).
+    // hostKey 를 renderCompanionButtons/CompanionHostRow 에 넘겨 편집모드(PC) 드래그(E4)를 붙인다.
+    const hostKey = wfiElementKey(input) ?? input.field;
+    const companionIds = resolveCompanionButtons(
+      hostKey,
+      appState.uiCompanionSlots,
+    );
+    const companions =
+      companionIds.length > 0
+        ? renderCompanionButtons(companionIds, hostKey)
+        : [];
+    const hasCompanions = companions.length > 0;
+    // 동반 버튼이 있으면 호스트는 flex-1 로 축소해 아이콘 버튼 자리를 내준다.
+    const hostWidth = hasCompanions ? 'flex-1' : 'w-full';
+
+    // 하단 아이콘 행(uiPresetIconRow) 안 — 아이콘+활성 수 압축 형태(색 의미는 넓은
+    // 버튼과 동일: 프리셋 적용=green / 캐릭터 있음=sky / 없음=gray).
+    if (iconRow) {
+      return (
+        <CompanionHostRow hostKey={hostKey}>
+          <Tooltip content="캐릭터 프롬프트 열기">
+            <button
+              type="button"
+              className={`round-button ${hasPresetApplied ? 'back-green' : anyCharacters ? 'back-sky' : 'back-gray'} h-8 flex-1 min-w-0`}
+              onClick={onClick}
+            >
+              <FaUserAlt size={14} className="inline-block" />
+              {totalCount > 0 && (
+                <span className="ml-1 text-xs">
+                  {enabledCount}/{totalCount}
+                </span>
+              )}
+            </button>
+          </Tooltip>
+          {companions}
+        </CompanionHostRow>
+      );
+    }
+
+    return (
+      <CompanionHostRow hostKey={hostKey}>
+        {editCharacters === undefined &&
+          !anyCharacters &&
+          (hasCompanions ? (
+            <div className="w-full mt-2 md:mt-3 flex gap-1 items-stretch">
+              <button
+                type="button"
+                className="round-button back-gray h-8 flex-1 flex"
+                onClick={onClick}
+              >
+                <div className="flex-1">
+                  <FaUserAlt className="inline mr-2" />
+                  캐릭터 프롬프트 열기
+                </div>
+              </button>
+              {companions}
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="round-button back-gray h-8 w-full flex mt-2 md:mt-3"
+              onClick={onClick}
+            >
+              <div className="flex-1">
+                <FaUserAlt className="inline mr-2" />
+                캐릭터 프롬프트 열기
+              </div>
+            </button>
+          ))}
+        {editCharacters === undefined && anyCharacters && (
+          <div
+            className={`w-full mt-2 md:mt-3${hasCompanions ? ' flex gap-1 items-stretch' : ''}`}
+          >
+            <button
+              type="button"
+              className={`round-button ${hasPresetApplied ? 'back-green' : 'back-sky'} h-8 ${hostWidth} flex items-center`}
+              onClick={onClick}
+            >
+              <div className="flex items-center">
+                <FaUserAlt className="mr-2" />
+                <span>캐릭터 프롬프트 열기</span>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {hasPresetApplied && (
+                  <span className="px-2 py-0.5 text-xs rounded-full bg-white/30">
+                    프리셋 적용 중
+                  </span>
+                )}
+                {totalCount > 0 && (
+                  <span className="px-2 py-0.5 text-xs rounded-full bg-gray-100 text-green-800">
+                    {enabledCount}/{totalCount} 활성화
+                  </span>
+                )}
+              </div>
+            </button>
+            {hasCompanions && companions}
+          </div>
+        )}
+      </CompanionHostRow>
+    );
+  },
+);
+
+const WFRInline = observer(({ element }: WFElementProps) => {
+  const effort = useContext(NaiEffortContext);
+  const {
+    editVibe,
+    type,
+    showGroup,
+    showGroupOverlay,
+    preset,
+    shared,
+    meta,
+    modelVersion,
+  } = useContext(WFElementContext)!;
+  const { curGroup } = useContext(WFGroupContext)!;
+  const input = element as WFIInlineInput;
+  const field = workFlowService.getVarDef(type, input.fieldType, input.field)!;
+  const getField = () => {
+    if (input.fieldType === 'preset') {
+      return preset[input.field];
+    }
+    if (input.fieldType === 'shared') {
+      return shared[input.field];
+    }
+    return meta![input.field];
+  };
+  const setField = (val: any) => {
+    if (input.fieldType === 'preset') {
+      const family = samplingFamilyForModel(modelVersion);
+      if (
+        !family ||
+        !setPresetSamplingField(preset, family, input.field, val)
+      ) {
+        preset[input.field] = val;
+      }
+    } else if (input.fieldType === 'shared') {
+      shared[input.field] = val;
+    } else {
+      meta![input.field] = val;
+    }
+  };
+  // 오버레이 내부에서는 curGroup이 설정됨 — showGroupOverlay와 비교
+  // 일반 인라인에서는 기존대로 showGroup과 비교
+  const isInOverlay = curGroup !== undefined && curGroup === showGroupOverlay;
+  if (!isInOverlay) {
+    if (
+      curGroup !== showGroup ||
+      (editVibe !== undefined && editVibe !== null)
+    ) {
+      return null;
+    }
+  }
+  const key = `${type}_${preset.name}_${input.field}`;
+  const isV5 = isV5ModelVersion(modelVersion);
+  const caps = getNaiModelSpec(modelVersion, effort).capabilities;
+  if (
+    caps.fixedSteps &&
+    ['steps', 'sampling', 'cfgRescale'].includes(input.field)
+  ) {
+    const effective =
+      input.field === 'steps'
+        ? caps.fixedSteps
+        : input.field === 'sampling'
+          ? caps.supportedSamplers[0]
+          : '사용하지 않음';
+    return (
+      <InlineEditorField label={input.label}>
+        <span className="text-sm text-muted">{effective} (Medium)</span>
+      </InlineEditorField>
+    );
+  }
+  if (
+    isV5 &&
+    [
+      'noiseSchedule',
+      'varietyPlus',
+      'legacyPromptConditioning',
+      'deliberateEulerAncestralBug',
+      'normalizeStrength',
+    ].includes(input.field)
+  ) {
+    return null;
+  }
+  switch (field.type) {
+    case 'prompt':
+      return (
+        <EditorField
+          label={input.label}
+          full={input.flex === 'flex-1'}
+          // 문법 안내는 첫 프롬프트(상위)에만 1회 — 문법은 전 프롬프트 공통
+          hint={input.field === 'frontPrompt' ? PROMPT_SYNTAX_HELP : undefined}
+          // 접기 (2026-07-18): 필드명 키로 워크플로우 공용 영속, 기본 펼침.
+          // 접힌 채 내용이 있으면 배지로 표시해 보이지 않는 프롬프트를 방지.
+          foldKey={input.flex === 'flex-1' ? input.field : undefined}
+          foldedBadge={
+            typeof getField() === 'string' && getField().trim()
+              ? '작성됨'
+              : undefined
+          }
+        >
+          <PromptEditTextArea
+            key={key}
+            value={getField()}
+            disabled={input.field === 'uc' && !caps.supportsNegativePrompt}
+            onChange={setField}
+          />
+        </EditorField>
+      );
+    case 'select':
+      return (
+        <InlineEditorField label={input.label}>
+          <DropdownSelect
+            key={key}
+            selectedOption={getField()}
+            disabled={false}
+            menuPlacement={input.menuPlacement}
+            options={field.options.map((x) => ({
+              label: x.label,
+              value: x.value,
+            }))}
+            onSelect={(opt) => {
+              setField(opt.value);
+            }}
+          />
+        </InlineEditorField>
+      );
+    case 'characterPrompts':
+      return <CharacterButton input={input} key={key} />;
+    case 'nullInt':
+      return (
+        <>
+          {input.field === 'seed' && (
+            <TransparentBackgroundMainRow modelVersion={modelVersion} />
+          )}
+          <InlineEditorField label={input.label}>
+            <NullIntInput
+              label={input.label}
+              value={getField()}
+              disabled={false}
+              onChange={(val) => setField(val)}
+              key={key}
+            />
+          </InlineEditorField>
+        </>
+      );
+    case 'vibeSet':
+      return <VibeButton input={input} key={key} />;
+    case 'characterReferences':
+      return <CharacterReferenceButton input={input} key={key} />;
+    case 'bool':
+      return (
+        <InlineEditorField label={input.label}>
+          <input
+            key={key}
+            type="checkbox"
+            checked={getField()}
+            onChange={(e) => setField(e.target.checked)}
+          />
+        </InlineEditorField>
+      );
+    case 'int':
+      return (
+        <IntSliderInput
+          label={input.label}
+          value={getField()}
+          onChange={setField}
+          disabled={false}
+          min={field.min}
+          max={field.max}
+          step={field.step}
+          key={key}
+        />
+      );
+    case 'sampling':
+      return (
+        <InlineEditorField label={input.label}>
+          <DropdownSelect
+            key={key}
+            selectedOption={getField()}
+            disabled={false}
+            menuPlacement="auto"
+            options={(isV5 ? V5_SAMPLERS : Object.values(Sampling)).map(
+              (x) => ({
+                label: x,
+                value: x,
+              }),
+            )}
+            onSelect={(opt) => {
+              setField(opt.value);
+            }}
+          />
+        </InlineEditorField>
+      );
+    case 'noiseSchedule':
+      return (
+        <InlineEditorField label={input.label}>
+          <DropdownSelect
+            key={key}
+            selectedOption={getField()}
+            disabled={false}
+            menuPlacement="auto"
+            options={Object.values(NoiseSchedule).map((x) => ({
+              label: x,
+              value: x,
+            }))}
+            onSelect={(opt) => {
+              setField(opt.value);
+            }}
+          />
+        </InlineEditorField>
+      );
+    case 'image':
+      return <ImageSelect input={input} key={key} />;
+    default:
+      return null;
+  }
+});
+
+interface ImplProps {
+  type: string;
+  shared: any;
+  preset: any;
+  meta?: any;
+  middlePromptMode: boolean;
+  element: WFIElement;
+  // 루트 스택 슬롯 키 계약(L1-3): innerEditor 렌더면 true → `${type}@inner`.
+  // 미지정(false) = 일반 editor. 순서 오버라이드 슬롯 구분에만 쓰인다.
+  inner?: boolean;
+  getMiddlePrompt?: () => string;
+  onMiddlePromptChange?: (txt: string) => void;
+  getCharacterMiddlePrompt?: (index: number) => string;
+  onCharacterMiddlePromptChange?: (index: number, txt: string) => void;
+  onImageUploaded?: (field: string, base64: string) => void;
+}
+
+export const PreSetEditorImpl = observer(
+  ({
+    type,
+    shared,
+    preset,
+    element,
+    meta,
+    middlePromptMode,
+    inner,
+    getMiddlePrompt,
+    onMiddlePromptChange,
+    getCharacterMiddlePrompt,
+    onCharacterMiddlePromptChange,
+    onImageUploaded,
+  }: ImplProps) => {
+    const [editVibe, setEditVibe] = useState<WFIInlineInput | undefined>(
+      undefined,
+    );
+    const [editCharacterReference, setEditCharacterReference] = useState<
+      WFIInlineInput | undefined
+    >(undefined);
+    const [editCharacters, setEditCharacters] = useState<string | undefined>(
+      undefined,
+    );
+    const [showGroup, setShowGroup] = useState<string | undefined>(undefined);
+    const [showGroupOverlay, setShowGroupOverlay] = useState<
+      string | undefined
+    >(undefined);
+    const [effort, setEffort] = useState<GenerationEffort>('high');
+    const [modelVersion, setModelVersion] = useState<ModelVersion>(
+      ModelVersion.V4_5,
+    );
+
+    useEffect(() => {
+      const loadModel = async () => {
+        const config = await backend.getConfig();
+        const next = config.modelVersion ?? ModelVersion.V4_5;
+        const family = samplingFamilyForModel(next);
+        if (family) activatePresetSamplingFamily(preset, family);
+        setModelVersion(next);
+        setEffort(config.effort === 'medium' ? 'medium' : 'high');
+      };
+      void loadModel();
+      sessionService.addEventListener('config-changed', loadModel);
+      return () =>
+        sessionService.removeEventListener('config-changed', loadModel);
+    }, [preset]);
+
+    // element 트리에서 group 요소 찾기
+    const findGroupElement = (el: WFIElement): WFIGroup | undefined => {
+      if (el.type === 'group') return el as WFIGroup;
+      if (el.type === 'stack') {
+        for (const child of (el as WFIStack).inputs) {
+          const found = findGroupElement(child);
+          if (found) return found;
+        }
+      }
+      return undefined;
+    };
+    const groupElement = findGroupElement(element);
+
+    useEffect(() => {
+      setShowGroup(undefined);
+      setShowGroupOverlay(undefined);
+    }, [type]);
+
+    // 단축키에서 샘플링/모델 설정 열기 이벤트 수신
+    useEffect(() => {
+      const handler = (e: Event) => {
+        const action = (e as CustomEvent).detail?.action;
+        if (action === 'open-sampling-settings' && groupElement) {
+          setShowGroupOverlay('샘플링/모델 설정');
+        }
+      };
+      window.addEventListener('shortcut-action', handler);
+      return () => window.removeEventListener('shortcut-action', handler);
+    }, [groupElement]);
+
+    // 루트 스택 최상위 요소 순서 오버라이드 적용(L1-3, 읽기 배선).
+    //   재배열 대상은 이 "루트 스택"의 최상위 요소뿐 — 중첩 스택/그룹 내부는 손대지 않는다.
+    //   오버라이드 없음(현재 모든 사용자)이면 resolveStackInputs 가 원본 inputs 동일 참조를
+    //   돌려주므로 rootElement === element 가 되어 현행 렌더 결과 100% 동일(회귀 기준).
+    //   appState.uiPresetLayout 읽기는 observer 컴포넌트라 MobX 로 즉시 반응한다.
+    let rootElement: WFIElement = element;
+    let rootSlotKey: string | undefined;
+    if (element.type === 'stack') {
+      const stk = element as WFIStack;
+      rootSlotKey = presetLayoutSlotKey(type, !!inner);
+      const ordered = resolveStackInputs(
+        stk,
+        appState.uiPresetLayout[rootSlotKey],
+      );
+      if (ordered !== stk.inputs) {
+        rootElement = { ...stk, inputs: ordered };
+      }
+    }
+
+    return (
+      <StackGrow>
+        <NaiEffortContext.Provider value={effort}>
+          <WFElementContext.Provider
+            value={{
+              preset,
+              shared,
+              meta,
+              showGroup,
+              editVibe,
+              setEditVibe,
+              editCharacterReference,
+              setEditCharacterReference,
+              editCharacters,
+              setEditCharacters,
+              setShowGroup,
+              showGroupOverlay,
+              setShowGroupOverlay,
+              groupElement,
+              type,
+              middlePromptMode,
+              modelVersion,
+              getMiddlePrompt,
+              onMiddlePromptChange,
+              getCharacterMiddlePrompt,
+              onCharacterMiddlePromptChange,
+              onImageUploaded,
+            }}
+          >
+            <WFGroupContext.Provider value={{}}>
+              <VibeEditor disabled={false} />
+              <CharacterReferenceEditor disabled={false} />
+              {editCharacters && (
+                <CharacterPromptEditor
+                  input={
+                    {
+                      type: 'inline',
+                      label: 'Characters',
+                      field: editCharacters,
+                      fieldType:
+                        shared?.type === 'SDImageGenEasy' ? 'shared' : 'preset',
+                      flex: 'flex-none',
+                    } as WFIInlineInput
+                  }
+                />
+              )}
+              {!editVibe && !editCharacters && !editCharacterReference && (
+                <PresetRootRender
+                  element={rootElement}
+                  slotKey={rootSlotKey}
+                  // 하단 아이콘 행은 프리셋 패널(general)만 — inner(씬 에디터 등 내장
+                  // 편집기)는 오버레이 문맥이라 현행 세로 버튼 유지.
+                  iconRow={!inner && appState.uiPresetIconRow}
+                  // 새 씬 해상도 행도 프리셋 패널(general)만 — inner 는 개별 씬 편집
+                  // 문맥이라 새 씬 기본값 컨트롤이 어울리지 않는다.
+                  belowBody={!inner ? <NewSceneResolutionRow /> : undefined}
+                />
+              )}
+            </WFGroupContext.Provider>
+            {/* 샘플링/모델 설정 오버레이 */}
+            <ModalOverlay
+              isOpen={!!showGroupOverlay && !!groupElement}
+              onClose={() => setShowGroupOverlay(undefined)}
+              title={showGroupOverlay || ''}
+              width="max-w-xl"
+            >
+              {showGroupOverlay && groupElement && (
+                <WFGroupContext.Provider value={{ curGroup: showGroupOverlay }}>
+                  {groupElement.inputs.map((child) => (
+                    <WFRenderElement
+                      key={workflowElementKey(child)}
+                      element={child}
+                    />
+                  ))}
+                  <GlobalModelSettings />
+                </WFGroupContext.Provider>
+              )}
+            </ModalOverlay>
+          </WFElementContext.Provider>
+        </NaiEffortContext.Provider>
+      </StackGrow>
+    );
+  },
+);
+
+interface InnerProps {
+  type: string;
+  shared: any;
+  preset: any;
+  meta?: any;
+  element: WFIElement;
+  middlePromptMode: boolean;
+  nopad?: boolean;
+  getMiddlePrompt?: () => string;
+  onMiddlePromptChange?: (txt: string) => void;
+  getCharacterMiddlePrompt?: (index: number) => string;
+  onCharacterMiddlePromptChange?: (index: number, txt: string) => void;
+  /** 이미지 입력칸에 파일을 올린 뒤(저장 완료 후) 호출 — 필드명과 base64. */
+  onImageUploaded?: (field: string, base64: string) => void;
+}
+
+interface UnionProps {
+  general: boolean;
+  type?: string;
+  shared?: any;
+  meta?: any;
+  preset?: any;
+  middlePromptMode: boolean;
+  getMiddlePrompt?: () => string;
+  onMiddlePromptChange?: (txt: string) => void;
+  getCharacterMiddlePrompt?: (index: number) => string;
+  onCharacterMiddlePromptChange?: (index: number, txt: string) => void;
+}
+
+export const InnerPreSetEditor = observer(
+  ({
+    type,
+    shared,
+    preset,
+    meta,
+    element,
+    middlePromptMode,
+    getMiddlePrompt,
+    onMiddlePromptChange,
+    getCharacterMiddlePrompt,
+    onCharacterMiddlePromptChange,
+    nopad,
+    onImageUploaded,
+  }: InnerProps) => {
+    return (
+      <VerticalStack className={nopad ? '' : 'p-2 md:p-3'}>
+        <PreSetEditorImpl
+          type={type}
+          shared={shared}
+          preset={preset}
+          meta={meta}
+          element={element}
+          inner
+          middlePromptMode={middlePromptMode}
+          getMiddlePrompt={getMiddlePrompt}
+          onMiddlePromptChange={onMiddlePromptChange}
+          getCharacterMiddlePrompt={getCharacterMiddlePrompt}
+          onCharacterMiddlePromptChange={onCharacterMiddlePromptChange}
+          onImageUploaded={onImageUploaded}
+        />
+      </VerticalStack>
+    );
+  },
+);
+
+interface Props {
+  meta?: any;
+  middlePromptMode: boolean;
+  getMiddlePrompt?: () => string;
+  onMiddlePromptChange?: (txt: string) => void;
+  getCharacterMiddlePrompt?: (index: number) => string;
+  onCharacterMiddlePromptChange?: (index: number, txt: string) => void;
+}
+
+// 사전세팅선택 행 "위"의 독립 동반 행(② A, hostKey 'preset-top') — 프리셋 패널(general)
+// 최상단. 다른 호스트와 달리 자체 콘텐츠(호스트 버튼)가 없어, 배정이 없으면 평상시엔
+// 행 자체를 렌더하지 않는다(현행 무변화). PC 편집모드에선 빈 상태도 드롭 안내와 함께
+// 노출해 드래그 배정 타깃을 제공한다.
+const PresetTopCompanionRow = observer(() => {
+  const ids = resolveCompanionButtons('preset-top', appState.uiCompanionSlots);
+  // 모던 행 스타일(② A 실기 피드백 3·2차 1 + 재검증 2026-07-18): 무배경
+  // icon-button('project' 적응)을 탭 세그먼트(tab-seg)풍 알약 컨테이너로 묶어
+  // 중앙 배치 — 낱개로 떠 있으면 어색하다는 피드백, 탭 헤더와 같은 그룹 문법 사용.
+  const companions =
+    ids.length > 0 ? renderCompanionButtons(ids, 'preset-top', 'project') : [];
+  const editing = appState.editMode && !isMobile;
+  if (companions.length === 0 && !editing) return null;
+  return (
+    <StackFixed>
+      <CompanionHostRow hostKey="preset-top">
+        <div className="field-row flex items-center justify-center min-h-[2rem]">
+          {companions.length === 0 && editing ? (
+            <span className="text-xs text-faint">
+              여기로 전역 버튼을 끌어다 놓을 수 있습니다
+            </span>
+          ) : (
+            <div className="flex items-center gap-1.5 rounded-full bg-[var(--c-input-bg)] px-2.5 py-1">
+              {companions}
+            </div>
+          )}
+        </div>
+      </CompanionHostRow>
+    </StackFixed>
+  );
+});
+
+const PreSetEditor = observer(
+  ({
+    middlePromptMode,
+    getMiddlePrompt,
+    onMiddlePromptChange,
+    getCharacterMiddlePrompt,
+    onCharacterMiddlePromptChange,
+    meta,
+  }: Props) => {
+    const [, rerender] = useState<{}>({});
+    const curSession = appState.curSession!;
+    // 레거시 작업모드(W3): 기본(OFF)에선 작업모드를 SDImageGen 하나로 고정.
+    // 세션 데이터는 비파괴 — 이지모드/수정 프리셋은 보존되고 포인터만 바뀐다.
+    const legacyWf = appState.legacyWorkflowMode;
+    const workflowType = curSession.selectedWorkflow?.workflowType;
+    const shared = curSession.presetShareds?.get(workflowType!);
+    const presets = curSession.presets?.get(workflowType!);
+    if (!workflowType) {
+      curSession.selectedWorkflow = {
+        workflowType: legacyWf
+          ? workFlowService.generalFlows[0].getType()
+          : 'SDImageGen',
+      };
+      rerender({});
+    } else if (!legacyWf && workflowType !== 'SDImageGen') {
+      curSession.selectedWorkflow = { workflowType: 'SDImageGen' };
+      rerender({});
+    } else if (!presets) {
+      const preset = workFlowService.buildPreset(workflowType);
+      preset.name = 'default';
+      curSession.presets.set(workflowType, [preset]);
+      rerender({});
+    } else if (!shared) {
+      curSession.presetShareds.set(
+        workflowType,
+        workFlowService.buildShared(workflowType),
+      );
+      rerender({});
+    } else if (
+      !curSession.selectedWorkflow!.presetName ||
+      !presets.find((x) => x.name === curSession.selectedWorkflow!.presetName)
+    ) {
+      if (presets.length === 0) {
+        const preset = workFlowService.buildPreset(workflowType);
+        preset.name = 'default';
+        curSession.presets.set(workflowType, [preset]);
+        curSession.selectedWorkflow!.presetName = 'default';
+      } else {
+        curSession.selectedWorkflow!.presetName = presets[0].name;
+      }
+      rerender({});
+    }
+    return (
+      workflowType &&
+      shared &&
+      curSession.selectedWorkflow!.presetName && (
+        <VerticalStack className="p-2 md:p-3">
+          {/* 사전세팅선택 위 동반 행(② A) — 배정 없으면 평상시 미렌더(현행 무변화) */}
+          <PresetTopCompanionRow />
+          {/* 작업모드 선택 — 레거시 작업모드에서만 노출(기본은 SDImageGen 고정, 행 제거로 공간 확보) */}
+          {legacyWf && (
+            <StackFixed className="field-row flex gap-2 items-center">
+              <span className="flex-none gray-label">작업모드: </span>
+              <DropdownSelect
+                selectedOption={workflowType}
+                menuPlacement="bottom"
+                options={workFlowService.generalFlows.map((x) => ({
+                  value: x.getType(),
+                  label: x.getTitle(),
+                }))}
+                onSelect={(opt) => {
+                  curSession.selectedWorkflow = {
+                    workflowType: opt.value,
+                  };
+                }}
+              />
+            </StackFixed>
+          )}
+          <PreSetEditorImpl
+            type={workflowType}
+            shared={shared}
+            meta={meta}
+            preset={
+              presets!.find(
+                (x) => x.name === curSession.selectedWorkflow!.presetName,
+              )!
+            }
+            middlePromptMode={middlePromptMode}
+            element={workFlowService.getGeneralEditor(workflowType)}
+            getMiddlePrompt={getMiddlePrompt}
+            onMiddlePromptChange={onMiddlePromptChange}
+            getCharacterMiddlePrompt={getCharacterMiddlePrompt}
+            onCharacterMiddlePromptChange={onCharacterMiddlePromptChange}
+          />
+        </VerticalStack>
+      )
+    );
+  },
+);
+
+export const UnionPreSetEditor = observer(
+  ({
+    general,
+    type,
+    shared,
+    meta,
+    preset,
+    middlePromptMode,
+    getMiddlePrompt,
+    onMiddlePromptChange,
+    getCharacterMiddlePrompt,
+    onCharacterMiddlePromptChange,
+  }: UnionProps) => {
+    return general ? (
+      <PreSetEditor
+        meta={meta}
+        middlePromptMode={middlePromptMode}
+        getMiddlePrompt={getMiddlePrompt}
+        onMiddlePromptChange={onMiddlePromptChange}
+        getCharacterMiddlePrompt={getCharacterMiddlePrompt}
+        onCharacterMiddlePromptChange={onCharacterMiddlePromptChange}
+      />
+    ) : (
+      <InnerPreSetEditor
+        meta={meta}
+        type={type!}
+        shared={shared!}
+        preset={preset!}
+        element={workFlowService.getInnerEditor(type!)}
+        middlePromptMode={middlePromptMode}
+        getMiddlePrompt={getMiddlePrompt}
+        onMiddlePromptChange={onMiddlePromptChange}
+        getCharacterMiddlePrompt={getCharacterMiddlePrompt}
+        onCharacterMiddlePromptChange={onCharacterMiddlePromptChange}
+      />
+    );
+  },
+);
+
+export default PreSetEditor;
+
+function renderWorkflowElement({ element }: WFElementProps) {
+  switch (element.type) {
+    case 'stack':
+      return <WFRStack element={element} />;
+    case 'inline':
+      return <WFRInline element={element} />;
+    case 'group':
+      return <WFRGroup element={element} />;
+    case 'presetSelect':
+      return <WFRPresetSelect element={element} />;
+    case 'profilePresetSelect':
+      return <WFRProfilePresetSelect element={element} />;
+    case 'push':
+      return <WFRPush element={element} />;
+    case 'middlePlaceholder':
+      return <WFRMiddlePlaceholder element={element} />;
+    case 'extraPrompt':
+      return <WFRExtraPrompt element={element} />;
+    case 'showImage':
+      return <WFRShowImage element={element} />;
+    case 'mainSamplingNotice':
+      return <WFRMainSamplingNotice element={element} />;
+    case 'ifIn':
+      return <WFRIfIn element={element} />;
+    case 'sceneOnly':
+      return <WFRSceneOnly element={element} />;
+    default:
+      return null;
+  }
+}
+
+function InnerPresetEditor({
+  type,
+  preset,
+  shared,
+  getPrompt,
+  setPrompt,
+}: InnerEditorProps & {
+  getPrompt: () => string;
+  setPrompt: (prompt: string) => void;
+}) {
+  return (
+    <UnionPreSetEditor
+      general={false}
+      type={type}
+      preset={preset}
+      shared={shared}
+      middlePromptMode
+      getMiddlePrompt={getPrompt}
+      onMiddlePromptChange={setPrompt}
+      getCharacterMiddlePrompt={() => ''}
+      onCharacterMiddlePromptChange={() => {}}
+    />
+  );
+}

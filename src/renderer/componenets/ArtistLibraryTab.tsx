@@ -1,0 +1,1151 @@
+import * as React from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { observer } from 'mobx-react-lite';
+import { Buffer } from 'buffer';
+import {
+  FaPlus,
+  FaSearch,
+  FaHeart,
+  FaRegHeart,
+  FaCopy,
+  FaTrash,
+  FaImage,
+  FaFileAlt,
+  FaPen,
+  FaFileArchive,
+  FaFileImport,
+  FaCheckSquare,
+  FaSquare,
+  FaGlobe,
+  FaCompressArrowsAlt,
+  FaMagic,
+} from 'react-icons/fa';
+import { ActionIcon } from './ActionIcon';
+import { queueArtistSample } from '../models/sceneQueueActions';
+import { artistLibraryService, backend } from '../models';
+import type {
+  IArtistEntry,
+  IArtistImage,
+} from '../models/ArtistLibraryService';
+import type { ModelSamplingFamily } from '../models/modelSamplingProfiles';
+import { appState } from '../models/AppService';
+import { promptName } from '../models/nameInput';
+import {
+  batchResultLine,
+  deleteConfirmText,
+  failedNamesLine,
+} from '../models/deleteFlowRules';
+import { dataUriToBase64 } from '../models/ImageService';
+import { extractPromptDataFromBase64 } from '../models/util';
+import { IMPORT_IMAGE_ACCEPT } from '../models/imageFormats';
+import Tooltip from './Tooltip';
+import ModalOverlay from './ModalOverlay';
+import ImagePreview from './ImagePreview';
+
+// 작가 삭제 확인 창의 덧붙임 줄 — 단건·여러 명 공통
+const ARTIST_DELETE_EXTRA = '첨부된 이미지도 함께 삭제됩니다.';
+
+// ─── 모델 계열 보기(2026-09-26): 같은 작가라도 v4.5/v5 의 학습 여부·출력 화풍이 달라 구분한다 ───
+type FamilyView = 'all' | ModelSamplingFamily;
+const FAMILY_VIEW_KEY = 'sdstudio-artist-lib-family';
+const FAMILY_LABEL: Record<ModelSamplingFamily, string> = {
+  v4_5: 'v4.5',
+  v5: 'v5',
+};
+const loadFamilyView = (): FamilyView => {
+  try {
+    const v = localStorage.getItem(FAMILY_VIEW_KEY);
+    return v === 'v4_5' || v === 'v5' ? v : 'all';
+  } catch {
+    return 'all';
+  }
+};
+const saveFamilyView = (v: FamilyView) => {
+  try {
+    localStorage.setItem(FAMILY_VIEW_KEY, v);
+  } catch {
+    /* 무시 */
+  }
+};
+/** 보기 계열에 맞는 이미지들(전체 보기면 전부). */
+const imagesFor = (artist: IArtistEntry, view: FamilyView): IArtistImage[] =>
+  view === 'all'
+    ? artist.images
+    : artist.images.filter((i) => i.family === view);
+/** 썸네일 구석의 계열 배지. 미지정은 표시하지 않는다. */
+function FamilyBadge({
+  family,
+  className,
+}: {
+  family?: ModelSamplingFamily;
+  className?: string;
+}) {
+  return family ? (
+    <span
+      className={`pointer-events-none text-[10px] leading-none px-1 py-0.5 rounded bg-black/60 text-white ${
+        className || ''
+      }`}
+    >
+      {FAMILY_LABEL[family]}
+    </span>
+  ) : null;
+}
+
+const copyText = async (text: string, msg: string) => {
+  try {
+    await navigator.clipboard.writeText(text);
+    appState.pushMessage(msg);
+  } catch {
+    appState.pushMessage('복사 실패');
+  }
+};
+
+const fileToBase64 = async (file: File): Promise<string> => {
+  const buf = await file.arrayBuffer();
+  return Buffer.from(buf).toString('base64');
+};
+
+// ─── 이미지 표시 ───
+const ArtistImage = observer(
+  ({
+    path,
+    className,
+    onClick,
+    previewSize = 400,
+  }: {
+    path: string;
+    className?: string;
+    onClick?: () => void;
+    previewSize?: number;
+  }) => {
+    const preview = (
+      <ImagePreview
+        path={path}
+        size={previewSize}
+        className={className}
+        alt="작가 샘플 이미지"
+        placeholder={<FaImage />}
+      />
+    );
+    return onClick ? (
+      <button
+        type="button"
+        className={`inline-flex flex-none p-0 overflow-hidden ${className ?? ''}`}
+        aria-label="작가 샘플 이미지 보기"
+        onClick={onClick}
+      >
+        {preview}
+      </button>
+    ) : (
+      preview
+    );
+  },
+);
+
+// ─── 태그 프리셋 관리 ───
+const TagPresetManageModal = observer(
+  ({ onClose }: { onClose: () => void }) => {
+    const [input, setInput] = useState('');
+    return (
+      <ModalOverlay
+        isOpen
+        onClose={onClose}
+        title="태그 프리셋 관리"
+        width="max-w-md"
+      >
+        <div className="flex flex-col gap-3">
+          <div className="flex gap-2">
+            <input
+              className="flex-1 gray-input text-sm"
+              placeholder="새 태그 (예: 러프)"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  artistLibraryService.addTagPreset(input);
+                  setInput('');
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="back-sky !rounded-md px-3 py-1.5 text-sm"
+              onClick={() => {
+                artistLibraryService.addTagPreset(input);
+                setInput('');
+              }}
+            >
+              추가
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {artistLibraryService.tagPresets.length === 0 && (
+              <span className="text-sm text-faint">프리셋이 없습니다.</span>
+            )}
+            {artistLibraryService.tagPresets.map((t) => (
+              <span
+                key={t}
+                className="flex items-center gap-1 text-sm px-2 py-1 rounded-md bg-[var(--c-surface)] text-body"
+              >
+                {t}
+                <button
+                  type="button"
+                  className="text-faint hover:text-red-500"
+                  aria-label={`태그 프리셋 ${t} 삭제`}
+                  onClick={() => artistLibraryService.removeTagPreset(t)}
+                >
+                  <FaTrash size={11} />
+                </button>
+              </span>
+            ))}
+          </div>
+        </div>
+      </ModalOverlay>
+    );
+  },
+);
+
+// ─── 프롬프트 보기 ───
+const PromptView = observer(({ path }: { path: string }) => {
+  const [loading, setLoading] = useState(true);
+  const [prompt, setPrompt] = useState<string | null>(null);
+  const [uc, setUc] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setPrompt(null);
+      setUc(null);
+      try {
+        const dataUri = await backend.readDataFile(path);
+        const base64 = dataUriToBase64(dataUri);
+        const job = await extractPromptDataFromBase64(base64);
+        if (!cancelled) {
+          setPrompt(job?.prompt ?? null);
+          setUc(job?.uc ?? null);
+        }
+      } catch {
+        if (!cancelled) {
+          setPrompt(null);
+          setUc(null);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [path]);
+
+  if (loading)
+    return <div className="text-xs text-faint py-2">프롬프트 추출 중...</div>;
+  if (!prompt && !uc)
+    return (
+      <div className="text-xs text-faint py-2">
+        이 이미지에서 프롬프트 메타데이터를 찾지 못했습니다.
+      </div>
+    );
+  return (
+    <div className="flex flex-col gap-2 mt-2">
+      {prompt && (
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs text-muted">프롬프트</span>
+            <button
+              type="button"
+              className="text-xs btn-link"
+              onClick={() => copyText(prompt, '프롬프트를 복사했습니다')}
+            >
+              <FaCopy className="inline mr-1" size={10} />
+              복사
+            </button>
+          </div>
+          <div className="text-xs p-2 rounded bg-[var(--c-surface)] text-default break-words max-h-32 overflow-auto">
+            {prompt}
+          </div>
+        </div>
+      )}
+      {uc && (
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs text-muted">네거티브</span>
+            <button
+              type="button"
+              className="text-xs btn-link"
+              onClick={() => copyText(uc, '네거티브를 복사했습니다')}
+            >
+              <FaCopy className="inline mr-1" size={10} />
+              복사
+            </button>
+          </div>
+          <div className="text-xs p-2 rounded bg-[var(--c-surface)] text-default break-words max-h-24 overflow-auto">
+            {uc}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+// ─── 카드 상세 모달 ───
+const ArtistDetailModal = observer(
+  ({ artistId, onClose }: { artistId: string; onClose: () => void }) => {
+    const artist = artistLibraryService.getArtist(artistId);
+    const [selectedId, setSelectedId] = useState<string | null>(null);
+    const [showPrompt, setShowPrompt] = useState(false);
+    const [tagInput, setTagInput] = useState('');
+    const [managePreset, setManagePreset] = useState(false);
+    const fileRef = useRef<HTMLInputElement>(null);
+
+    if (!artist) {
+      onClose();
+      return null;
+    }
+
+    const selected: IArtistImage | undefined =
+      artist.images.find((i) => i.id === selectedId) || artist.images[0];
+
+    const addImages = async (files: FileList) => {
+      for (let i = 0; i < files.length; i++) {
+        const b64 = await fileToBase64(files[i]);
+        await artistLibraryService.addImage(artist.id, b64);
+      }
+    };
+
+    return (
+      <>
+        <ModalOverlay
+          isOpen
+          onClose={onClose}
+          title={artist.name}
+          width="max-w-3xl"
+        >
+          <div className="flex flex-col gap-3">
+            {/* 작가 태그 + 즐겨찾기 — 모바일(md 미만)은 태그가 한 줄 전체를 쓰고 버튼은 다음 줄(2026-10-02 I1) */}
+            <div className="flex flex-wrap md:flex-nowrap items-center justify-end gap-2">
+              <span
+                className="basis-full md:basis-auto flex-1 min-w-0 text-sm font-mono px-2 py-1.5 rounded bg-[var(--c-surface)] text-default truncate"
+                title={`artist:${artist.name}`}
+              >
+                artist:{artist.name}
+              </span>
+              <button
+                type="button"
+                className="back-sky !rounded-md px-3 py-1.5 text-sm"
+                onClick={() =>
+                  copyText(`artist:${artist.name}`, '작가 태그를 복사했습니다')
+                }
+              >
+                <FaCopy className="inline mr-1" size={12} />
+                복사
+              </button>
+              <Tooltip content="작가 이름 변경">
+                <button
+                  type="button"
+                  className="icon-button back-gray !rounded-md p-2"
+                  onClick={async () => {
+                    // 현재 이름을 채워 연다 — 다른 작가와 같은 이름(대소문자·공백 무시)은 창 안에서 거부(D2)
+                    const newName = await promptName({
+                      title: `새 작가 이름을 입력하세요 (현재: ${artist.name})`,
+                      kind: 'artist',
+                      current: artist.name,
+                      existing: (n) =>
+                        !!artistLibraryService.findArtistByName(n, artist.id),
+                    });
+                    if (newName) {
+                      artistLibraryService.renameArtist(artist.id, newName);
+                    }
+                  }}
+                >
+                  <FaPen />
+                </button>
+              </Tooltip>
+              <Tooltip content="즐겨찾기">
+                <button
+                  type="button"
+                  className="icon-button back-gray !rounded-md p-2"
+                  onClick={() => artistLibraryService.toggleFavorite(artist.id)}
+                >
+                  {artist.favorite ? (
+                    <FaHeart className="text-red-500" />
+                  ) : (
+                    <FaRegHeart />
+                  )}
+                </button>
+              </Tooltip>
+              <Tooltip content="작가 삭제">
+                <button
+                  type="button"
+                  className="icon-button bg-red-500 text-white !rounded-md p-2"
+                  onClick={() => {
+                    appState.pushDialog({
+                      type: 'confirm',
+                      // 휴지통이 없다 — 영구 삭제(Enter 무시, 2026-10-03 E1)
+                      ...deleteConfirmText({
+                        kind: 'artist',
+                        name: artist.name,
+                        outcome: 'permanent',
+                        extra: ARTIST_DELETE_EXTRA,
+                      }),
+                      callback: () => {
+                        artistLibraryService.deleteArtist(artist.id);
+                        onClose();
+                      },
+                    });
+                  }}
+                >
+                  <FaTrash />
+                </button>
+              </Tooltip>
+            </div>
+
+            <div className="flex flex-col md:flex-row gap-4">
+              {/* 좌: 이미지 */}
+              <div className="flex-1 min-w-0">
+                <div className="w-full aspect-[3/4] rounded-lg overflow-hidden bg-[var(--c-surface)] flex items-center justify-center">
+                  {selected ? (
+                    <ArtistImage
+                      path={selected.path}
+                      previewSize={-1}
+                      className="w-full h-full"
+                    />
+                  ) : (
+                    <div className="text-faint text-sm">이미지가 없습니다</div>
+                  )}
+                </div>
+                {/* 썸네일 스트립 */}
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {artist.images.map((img) => (
+                    <div
+                      key={img.id}
+                      className={`relative w-14 h-14 rounded overflow-hidden cursor-pointer border-2 ${
+                        selected?.id === img.id
+                          ? 'border-sky-500'
+                          : 'border-transparent'
+                      }`}
+                    >
+                      <ArtistImage
+                        path={img.path}
+                        previewSize={200}
+                        className="w-full h-full"
+                        onClick={() => {
+                          setSelectedId(img.id);
+                          setShowPrompt(false);
+                        }}
+                      />
+                      <FamilyBadge
+                        family={img.family}
+                        className="absolute left-0.5 bottom-0.5"
+                      />
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    className="w-14 h-14 rounded border border-dashed line-color flex items-center justify-center text-faint hover:text-sky-500"
+                    aria-label="이미지 추가"
+                    onClick={() => fileRef.current?.click()}
+                  >
+                    <FaPlus />
+                  </button>
+                  {/* 샘플 생성(2026-09-26): 현재 프리셋에서 다른 작가 태그를 빼고 이 작가만으로 1장 생성해 카드에 저장 */}
+                  <Tooltip content="현재 프리셋에서 다른 artist: 태그를 빼고 이 작가만으로 1장 생성해 카드에 저장">
+                    <button
+                      type="button"
+                      className="w-14 h-14 rounded border border-dashed line-color flex flex-col items-center justify-center gap-0.5 text-faint hover:text-sky-500 disabled:opacity-40"
+                      disabled={!appState.curSession}
+                      data-artist-sample-generate=""
+                      onClick={() => {
+                        if (!appState.curSession) {
+                          appState.pushMessage('프로젝트를 먼저 여세요.');
+                          return;
+                        }
+                        queueArtistSample(
+                          appState.curSession,
+                          artist.id,
+                          artist.name,
+                        );
+                      }}
+                    >
+                      <FaMagic />
+                      <span className="text-[10px] leading-none">
+                        샘플 생성
+                      </span>
+                    </button>
+                  </Tooltip>
+                  <input
+                    type="file"
+                    accept={IMPORT_IMAGE_ACCEPT}
+                    multiple
+                    ref={fileRef}
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files) addImages(e.target.files);
+                      e.target.value = '';
+                    }}
+                  />
+                </div>
+                {selected && (
+                  <div className="flex items-center gap-1.5 mt-2 text-xs">
+                    <span className="text-muted mr-1">모델 계열</span>
+                    {(['v4_5', 'v5'] as ModelSamplingFamily[]).map((f) => (
+                      <button
+                        type="button"
+                        key={f}
+                        className={`px-2 py-0.5 rounded-full border ${
+                          selected.family === f
+                            ? 'border-sky-500 text-sky-500 bg-sky-100 dark:bg-sky-900/40'
+                            : 'line-color text-muted hover:border-sky-400'
+                        }`}
+                        onClick={() =>
+                          artistLibraryService.setImageFamily(
+                            artist.id,
+                            selected.id,
+                            selected.family === f ? undefined : f,
+                          )
+                        }
+                        title="이 샘플이 나온 모델 계열(다시 누르면 미지정)"
+                      >
+                        {FAMILY_LABEL[f]}
+                      </button>
+                    ))}
+                    {!selected.family && (
+                      <span className="text-faint">
+                        미지정 — 메타데이터에서 못 읽음
+                      </span>
+                    )}
+                  </div>
+                )}
+                {selected && (
+                  <div className="flex gap-2 mt-2">
+                    {artist.images[0]?.id !== selected.id && (
+                      <button
+                        type="button"
+                        className="text-xs back-gray !rounded-md px-2 py-1"
+                        onClick={() =>
+                          artistLibraryService.setThumbnail(
+                            artist.id,
+                            selected.id,
+                          )
+                        }
+                      >
+                        <ActionIcon
+                          id="pin-default"
+                          className="inline mr-1"
+                          size={10}
+                        />
+                        대표로 지정
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="text-xs back-gray !rounded-md px-2 py-1"
+                      onClick={() => setShowPrompt((v) => !v)}
+                    >
+                      <FaFileAlt className="inline mr-1" size={10} />
+                      {showPrompt ? '프롬프트 닫기' : '프롬프트 보기'}
+                    </button>
+                    <button
+                      type="button"
+                      className="text-xs icon-button bg-red-500 text-white !rounded-md px-2 py-1"
+                      onClick={() => {
+                        // 샘플 이미지 파일을 영구 삭제하므로 확인 1회(X11)
+                        const imageId = selected.id;
+                        appState.pushDialog({
+                          type: 'confirm',
+                          ...deleteConfirmText({
+                            kind: 'sampleImage',
+                            outcome: 'permanent',
+                          }),
+                          callback: async () => {
+                            await artistLibraryService.removeImage(
+                              artist.id,
+                              imageId,
+                            );
+                            setSelectedId(null);
+                            setShowPrompt(false);
+                          },
+                        });
+                      }}
+                    >
+                      <FaTrash className="inline mr-1" size={10} />
+                      이미지 삭제
+                    </button>
+                  </div>
+                )}
+                {selected && showPrompt && <PromptView path={selected.path} />}
+              </div>
+
+              {/* 우: 태그 */}
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-muted mb-1">태그</div>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {artist.tags.length === 0 && (
+                    <span className="text-xs text-faint">태그 없음</span>
+                  )}
+                  {artist.tags.map((t) => (
+                    <span
+                      key={t}
+                      className="flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300"
+                    >
+                      {t}
+                      <button
+                        type="button"
+                        className="hover:text-red-500"
+                        onClick={() =>
+                          artistLibraryService.removeTag(artist.id, t)
+                        }
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+                <input
+                  className="w-full gray-input text-sm mb-3"
+                  placeholder="태그 추가 후 Enter (예: 러프)"
+                  value={tagInput}
+                  onChange={(e) => setTagInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      artistLibraryService.addTag(artist.id, tagInput);
+                      setTagInput('');
+                    }
+                  }}
+                />
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs text-muted">
+                    태그 프리셋 (클릭해서 추가)
+                  </span>
+                  <button
+                    type="button"
+                    className="text-xs btn-link"
+                    onClick={() => setManagePreset(true)}
+                  >
+                    <ActionIcon id="edit" className="inline mr-1" size={9} />
+                    관리
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {artistLibraryService.tagPresets.length === 0 && (
+                    <span className="text-xs text-faint">
+                      프리셋 없음 — &quot;관리&quot;에서 추가
+                    </span>
+                  )}
+                  {artistLibraryService.tagPresets.map((t) => {
+                    const has = artist.tags.includes(t);
+                    return (
+                      <button
+                        type="button"
+                        key={t}
+                        disabled={has}
+                        className={`text-xs px-2.5 py-1 rounded-full border ${
+                          has
+                            ? 'line-color text-gray-300 dark:text-gray-600'
+                            : 'line-color text-muted hover:border-sky-500 hover:text-sky-500'
+                        }`}
+                        onClick={() =>
+                          artistLibraryService.addTag(artist.id, t)
+                        }
+                      >
+                        + {t}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+        </ModalOverlay>
+        {managePreset && (
+          <TagPresetManageModal onClose={() => setManagePreset(false)} />
+        )}
+      </>
+    );
+  },
+);
+
+// ─── 카드 ───
+const ArtistCard = observer(
+  ({
+    artist,
+    onOpen,
+    multiSelectMode,
+    selected,
+    onToggleSelect,
+    familyView,
+  }: {
+    artist: IArtistEntry;
+    onOpen: () => void;
+    multiSelectMode: boolean;
+    selected: boolean;
+    onToggleSelect: () => void;
+    familyView: FamilyView;
+  }) => {
+    // 계열 보기면 그 계열의 첫 이미지가 대표(없으면 "샘플 없음"), 전체 보기면 대표 썸네일(images[0])
+    const shown = imagesFor(artist, familyView);
+    const thumb = shown[0];
+    const handleClick = () => {
+      if (multiSelectMode) onToggleSelect();
+      else onOpen();
+    };
+    return (
+      <div
+        className={`flex-none w-[calc(50%-8px)] md:w-60 rounded-lg overflow-hidden flex flex-col border bg-[var(--c-surface-2)] transition-colors ${
+          selected
+            ? 'border-sky-500 ring-2 ring-inset ring-sky-500'
+            : 'line-color hover:border-sky-400'
+        }`}
+      >
+        {/* 대표 이미지 */}
+        <button
+          type="button"
+          aria-label={`${artist.name} ${multiSelectMode ? '선택' : '보기'}`}
+          aria-pressed={multiSelectMode ? selected : undefined}
+          className="relative w-full aspect-[3/4] md:aspect-auto md:h-72 bg-[var(--c-surface)] cursor-pointer"
+          onClick={handleClick}
+        >
+          {thumb ? (
+            <ArtistImage path={thumb.path} className="w-full h-full" />
+          ) : (
+            <div className="w-full h-full flex flex-col items-center justify-center gap-1 text-faint">
+              <FaImage size={30} />
+              {familyView !== 'all' && artist.images.length > 0 && (
+                <span className="text-xs">
+                  {FAMILY_LABEL[familyView]} 샘플 없음
+                </span>
+              )}
+            </div>
+          )}
+          {shown.length > 0 && (
+            <span className="absolute top-2 right-2 text-xs bg-black/60 text-white rounded-md px-2 py-0.5">
+              {familyView === 'all'
+                ? `${shown.length}장`
+                : `${FAMILY_LABEL[familyView]} ${shown.length}장`}
+            </span>
+          )}
+          {familyView === 'all' && (
+            <FamilyBadge
+              family={thumb?.family}
+              className="absolute bottom-2 left-2"
+            />
+          )}
+          {multiSelectMode && (
+            <div className="absolute top-2 left-2 bg-[var(--c-surface-2)] rounded p-1 shadow">
+              {selected ? (
+                <FaCheckSquare className="text-sky-500" size={20} />
+              ) : (
+                <FaSquare className="text-faint" size={20} />
+              )}
+            </div>
+          )}
+        </button>
+        {/* 이름 + 큰 액션 버튼 — 모바일(md 미만)은 두 줄(이름 한 줄 전체 + 버튼 줄). 반 폭 카드에서 한 줄에 두면
+          버튼 3개(약 114px)에 밀려 이름이 한 글자만 보였다(2026-10-02 I1). PC(md 이상)는 예전 한 줄 그대로. */}
+        <div className="p-2.5">
+          <div className="flex flex-col items-stretch gap-1 md:flex-row md:items-center md:justify-between md:gap-2">
+            <button
+              type="button"
+              className="block min-w-0 text-left text-sm font-medium text-default truncate cursor-pointer"
+              title={artist.name}
+              onClick={handleClick}
+            >
+              {artist.name}
+            </button>
+            <div className="flex gap-1.5 flex-none justify-end md:justify-start">
+              <Tooltip content="작가 태그 복사">
+                <button
+                  type="button"
+                  className="p-2 max-md:inline-flex max-md:items-center max-md:justify-center max-md:min-w-9 max-md:min-h-9 rounded-lg text-muted hover:bg-sky-100 dark:hover:bg-sky-900/40 hover:text-sky-500 transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    copyText(
+                      `artist:${artist.name}`,
+                      '작가 태그를 복사했습니다',
+                    );
+                  }}
+                >
+                  <FaCopy size={18} />
+                </button>
+              </Tooltip>
+              <Tooltip content="Danbooru에서 검색">
+                <button
+                  type="button"
+                  className="p-2 max-md:inline-flex max-md:items-center max-md:justify-center max-md:min-w-9 max-md:min-h-9 rounded-lg text-muted hover:bg-sky-100 dark:hover:bg-sky-900/40 hover:text-sky-500 transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    window.dispatchEvent(
+                      new CustomEvent('danbooru-search-request', {
+                        detail: { text: artist.name },
+                      }),
+                    );
+                  }}
+                >
+                  <FaGlobe size={18} />
+                </button>
+              </Tooltip>
+              <Tooltip content="즐겨찾기">
+                <button
+                  type="button"
+                  className="p-2 max-md:inline-flex max-md:items-center max-md:justify-center max-md:min-w-9 max-md:min-h-9 rounded-lg text-muted hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    artistLibraryService.toggleFavorite(artist.id);
+                  }}
+                >
+                  {artist.favorite ? (
+                    <FaHeart size={18} className="text-red-500" />
+                  ) : (
+                    <FaRegHeart size={18} className="hover:text-red-500" />
+                  )}
+                </button>
+              </Tooltip>
+            </div>
+          </div>
+          {artist.tags.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-2">
+              {artist.tags.slice(0, 4).map((t) => (
+                <span
+                  key={t}
+                  className="text-[11px] px-1.5 py-0.5 rounded bg-[var(--c-surface)] text-muted"
+                >
+                  {t}
+                </span>
+              ))}
+              {artist.tags.length > 4 && (
+                <span className="text-[11px] text-faint">
+                  +{artist.tags.length - 4}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  },
+);
+
+// ─── 그리드 끝 "새 작가 추가" 카드 ───
+function AddArtistCard({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className="flex-none w-[calc(50%-8px)] md:w-60 self-stretch min-h-[16rem] rounded-lg border-2 border-dashed line-color flex flex-col items-center justify-center text-faint hover:border-sky-400 hover:text-sky-500 transition-colors"
+      onClick={onClick}
+    >
+      <FaPlus size={30} />
+      <span className="mt-2 text-sm font-medium">새 작가 추가</span>
+    </button>
+  );
+}
+
+// ─── 탭 ───
+type SortKey = 'recent' | 'name' | 'favorite';
+
+const ArtistLibraryTab = observer(() => {
+  const [query, setQuery] = useState('');
+  const [sortBy, setSortBy] = useState<SortKey>('recent');
+  const [favOnly, setFavOnly] = useState(false);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [mergingDuplicates, setMergingDuplicates] = useState(false);
+  const [familyView, setFamilyViewState] = useState<FamilyView>(loadFamilyView);
+  const setFamilyView = (v: FamilyView) => {
+    setFamilyViewState(v);
+    saveFamilyView(v);
+  };
+  // 프롬프트 편집기의 「작가 라이브러리」 버튼 → 해당 카드 열기(appState.openArtistInLibrary)
+  const focusId = appState.artistLibraryFocus?.id;
+  const focusNonce = appState.artistLibraryFocus?.nonce;
+  useEffect(() => {
+    if (!focusId) return;
+    if (artistLibraryService.getArtist(focusId)) setOpenId(focusId);
+  }, [focusId, focusNonce]);
+
+  const exitMultiSelect = () => {
+    setMultiSelectMode(false);
+    setSelectedIds(new Set());
+  };
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const doBulkDelete = () => {
+    if (selectedIds.size === 0) return;
+    appState.pushDialog({
+      type: 'confirm',
+      ...deleteConfirmText({
+        kind: 'artist',
+        count: selectedIds.size,
+        outcome: 'permanent',
+        extra: ARTIST_DELETE_EXTRA,
+      }),
+      callback: async () => {
+        // 한 명이 실패해도 나머지를 계속 지우고 결과를 알린다(X13 — 예전에는 첫 실패에서 멈추고 무안내)
+        const ids = Array.from(selectedIds);
+        const failedNames: string[] = [];
+        for (const id of ids) {
+          try {
+            await artistLibraryService.deleteArtist(id);
+          } catch (e) {
+            console.error('작가 삭제 실패:', id, e);
+            failedNames.push(artistLibraryService.getArtist(id)?.name ?? id);
+          }
+        }
+        exitMultiSelect();
+        if (failedNames.length > 0) {
+          appState.pushDialog({
+            type: 'yes-only',
+            text:
+              `작가 ${batchResultLine(ids.length - failedNames.length, failedNames.length)}\n` +
+              `삭제하지 못한 작가: ${failedNamesLine(failedNames)}`,
+          });
+        } else {
+          appState.pushMessage(`작가 ${ids.length}명을 삭제했습니다.`);
+        }
+      },
+    });
+  };
+
+  const newArtist = async () => {
+    // 같은 이름(대소문자·공백 무시)이 있으면 그 카드를 연다(기존 동작) — 중복을 거부하지 않는다
+    const name = await promptName({
+      title: '작가 이름을 입력하세요 (예: suko mugi)',
+      kind: 'artist',
+    });
+    if (!name) return;
+    const existing = artistLibraryService.findArtistByName(name);
+    const a = artistLibraryService.createArtist(name);
+    if (a) {
+      if (existing) {
+        appState.pushMessage('동일한 작가가 있어 기존 카드를 열었습니다.');
+      }
+      setOpenId(a.id);
+    }
+  };
+
+  const mergeDuplicates = () => {
+    const groups = artistLibraryService.getDuplicateArtistGroups();
+    if (groups.length === 0) {
+      appState.pushMessage('동일한 이름의 중복 작가가 없습니다.');
+      return;
+    }
+    const cards = groups.reduce((sum, group) => sum + group.length, 0);
+    const images = groups.reduce(
+      (sum, group) =>
+        sum + group.reduce((n, artist) => n + artist.images.length, 0),
+      0,
+    );
+    appState.pushDialog({
+      type: 'confirm',
+      danger: true,
+      text:
+        `동일한 이름의 작가 ${groups.length}그룹을 일괄 병합할까요?\n` +
+        `대상 카드 ${cards}개 · 샘플 이미지 ${images}장\n\n` +
+        '실행 전 작가 라이브러리 백업을 권장합니다.\n' +
+        '각 그룹에서 가장 먼저 만든 카드를 기준으로 이미지와 태그를 합칩니다.',
+      callback: async () => {
+        setMergingDuplicates(true);
+        appState.setProgressDialog({
+          text: '중복 작가 병합 중...',
+          done: 0,
+          total: groups.length,
+        });
+        try {
+          const result = await artistLibraryService.mergeDuplicateArtists(
+            (done, total) =>
+              appState.setProgressDialog({
+                text: '중복 작가 병합 중...',
+                done,
+                total,
+              }),
+          );
+          appState.pushDialog({
+            type: 'yes-only',
+            text:
+              `중복 작가 ${result.groups}그룹을 병합했습니다.\n` +
+              `정리한 카드 ${result.mergedArtists}개 · 이동한 이미지 ${result.copiedImages}장`,
+          });
+        } catch (e: any) {
+          appState.pushMessage(`중복 작가 병합 실패: ${e?.message || e}`);
+        } finally {
+          appState.setProgressDialog(undefined);
+          setMergingDuplicates(false);
+        }
+      },
+    });
+  };
+
+  let list = artistLibraryService.search(query);
+  if (favOnly) list = list.filter((a) => a.favorite);
+  list = [...list].sort((a, b) => {
+    if (sortBy === 'name')
+      return a.name.localeCompare(b.name, undefined, {
+        numeric: true,
+        sensitivity: 'base',
+      });
+    if (sortBy === 'favorite')
+      return (
+        (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0) || b.updatedAt - a.updatedAt
+      );
+    return b.updatedAt - a.updatedAt;
+  });
+
+  const total = artistLibraryService.artists.length;
+
+  return (
+    <div className="w-full h-full flex flex-col bg-[var(--c-surface)] overflow-hidden">
+      {/* 툴바 */}
+      <div className="flex-none p-3 border-b line-color flex flex-wrap gap-2 items-center bg-[var(--c-surface)]">
+        <div className="relative flex-1 min-w-[180px]">
+          <FaSearch
+            className="absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+            size={13}
+          />
+          <input
+            className="w-full pl-9 pr-3 py-2 rounded-lg border line-color bg-[var(--c-input-bg)] text-sm text-default focus:outline-none focus:ring-2 focus:ring-sky-400"
+            placeholder="작가 이름 · 태그로 검색…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
+        <select
+          className="gray-input text-sm"
+          value={sortBy}
+          onChange={(e) => setSortBy(e.target.value as SortKey)}
+        >
+          <option value="recent">최근순</option>
+          <option value="name">이름순</option>
+          <option value="favorite">즐겨찾기 우선</option>
+        </select>
+        <button
+          type="button"
+          className={`round-button px-3 py-2 text-sm ${
+            favOnly ? 'back-orange' : 'back-gray'
+          }`}
+          onClick={() => setFavOnly((v) => !v)}
+        >
+          <FaHeart className="inline mr-1" size={12} />
+          즐겨찾기
+        </button>
+        {/* 모델 계열 보기: 카드의 대표 이미지·장수가 그 계열 샘플 기준이 된다 */}
+        <div
+          className="flex rounded-lg border line-color overflow-hidden text-sm"
+          role="group"
+          aria-label="모델 계열 보기"
+          data-artist-family-view={familyView}
+        >
+          {(['all', 'v4_5', 'v5'] as FamilyView[]).map((v) => (
+            <button
+              type="button"
+              key={v}
+              className={`px-3 py-2 ${familyView === v ? 'back-sky' : 'back-gray'}`}
+              onClick={() => setFamilyView(v)}
+              aria-pressed={familyView === v}
+            >
+              {v === 'all' ? '전체' : FAMILY_LABEL[v]}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          className="round-button back-sky px-4 py-2 text-sm flex items-center gap-1"
+          onClick={newArtist}
+        >
+          <FaPlus size={12} /> 새 작가
+        </button>
+        <Tooltip content="동일한 이름의 기존 작가 카드를 일괄 병합">
+          <button
+            type="button"
+            className="round-button back-gray px-3 py-2 text-sm flex items-center gap-1 disabled:opacity-50"
+            disabled={mergingDuplicates}
+            onClick={mergeDuplicates}
+          >
+            <FaCompressArrowsAlt size={12} /> 중복 병합
+          </button>
+        </Tooltip>
+        <Tooltip content="작가 라이브러리 전체 백업">
+          <button
+            type="button"
+            className="round-button back-gray px-3 py-2 text-sm flex items-center gap-1"
+            onClick={() => appState.artistLibraryBackupExport()}
+          >
+            <FaFileArchive size={13} /> 백업
+          </button>
+        </Tooltip>
+        <Tooltip content="백업 파일 불러오기 (동명 처리 선택)">
+          <button
+            type="button"
+            className="round-button back-gray px-3 py-2 text-sm flex items-center gap-1"
+            onClick={() => appState.artistLibraryBackupImport()}
+          >
+            <FaFileImport size={13} /> 백업 불러오기
+          </button>
+        </Tooltip>
+        {!multiSelectMode ? (
+          <button
+            type="button"
+            className="round-button back-gray px-3 py-2 text-sm"
+            onClick={() => setMultiSelectMode(true)}
+          >
+            멀티선택
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="round-button btn-solid-red px-3 py-2 text-sm flex items-center gap-1 disabled:opacity-50"
+              disabled={selectedIds.size === 0}
+              onClick={doBulkDelete}
+            >
+              <FaTrash size={12} /> 선택 삭제 ({selectedIds.size})
+            </button>
+            <button
+              type="button"
+              className="round-button back-gray px-3 py-2 text-sm"
+              onClick={exitMultiSelect}
+            >
+              취소
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* 본문 */}
+      <div className="flex-1 overflow-auto p-4">
+        {total > 0 && list.length === 0 ? (
+          <div className="text-center text-faint py-10">
+            검색 결과가 없습니다.
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-4 items-start">
+            {list.map((a) => (
+              <ArtistCard
+                key={a.id}
+                artist={a}
+                multiSelectMode={multiSelectMode}
+                selected={selectedIds.has(a.id)}
+                onToggleSelect={() => toggleSelect(a.id)}
+                onOpen={() => setOpenId(a.id)}
+                familyView={familyView}
+              />
+            ))}
+            {/* 항상 그리드 끝에 추가 카드 (멀티선택 중엔 숨김) */}
+            {!multiSelectMode && <AddArtistCard onClick={newArtist} />}
+          </div>
+        )}
+      </div>
+
+      {openId && (
+        <ArtistDetailModal artistId={openId} onClose={() => setOpenId(null)} />
+      )}
+    </div>
+  );
+});
+
+export default ArtistLibraryTab;

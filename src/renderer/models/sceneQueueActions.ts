@@ -1,0 +1,796 @@
+import { v4 } from 'uuid';
+import { appState } from './AppService';
+import {
+  backend,
+  imageService,
+  promptService,
+  sessionService,
+  taskQueueService,
+  templateService,
+  artistLibraryService,
+} from '.';
+import {
+  createMirrorCanvasMemo,
+  type MirrorCanvasMemo,
+  queueI2IWorkflow,
+  queueMirrorWorkflow,
+  queueWorkflow,
+} from './TaskQueueService';
+import type { GenerationSettingsSnapshot } from '../backends/imageGen';
+import {
+  type GenericScene,
+  type InpaintScene,
+  Piece,
+  PieceLibrary,
+  Scene,
+  type Session,
+} from './types';
+import { createSDCharacterPrompts, createSDPrompts } from './PromptService';
+import { buildArtistPromptVariants } from './promptTransforms';
+import { selectedScenesOfType } from './sceneSelection';
+import {
+  type ArtistPrefixMode,
+  hasArtistNamed,
+  makeArtistLookup,
+  removeArtistSegments,
+  resolveUnprefixedArtistNames,
+  transformArtistPrefix,
+} from './artistTags';
+import { dataUriToBase64 } from './ImageService';
+import { samplingFamilyForModel } from './modelSamplingProfiles';
+
+// 씬 큐 예약(추가/제거) 공유 로직 단일 출처.
+// SceneQueueControl(툴바·단축키·카드 버튼)과 AppContextMenu(우클릭 메뉴)가 함께 사용한다.
+// (이전엔 SceneQueueControl 내부에만 있던 것을 추출해 중복 없이 재사용)
+
+export const createMissingPiecesForSession = (
+  session: Session,
+  missing: { library: string; piece: string }[],
+) => {
+  for (const m of missing) {
+    let lib = session.library.get(m.library);
+    if (!lib) {
+      lib = new PieceLibrary();
+      lib.name = m.library;
+      session.library.set(m.library, lib);
+    }
+    if (!lib.pieces.find((x) => x.name === m.piece)) {
+      const piece = new Piece();
+      piece.name = m.piece;
+      lib.pieces.push(piece);
+    }
+  }
+  sessionService.markDirty(session.name);
+  sessionService.reloadPieceLibraryDB(session);
+};
+
+export const queueScene = async (
+  session: Session,
+  scene: GenericScene,
+  samples: number,
+  generationSnapshot?: GenerationSettingsSnapshot,
+  // 일괄 예약 묶음이 공유하는 미러 합성 캔버스 기억(없으면 씬마다 새로 만든다)
+  mirrorCanvasMemo?: MirrorCanvasMemo,
+) => {
+  const snapshot =
+    generationSnapshot ?? (await taskQueueService.captureGenerationSnapshot());
+  if (scene.type === 'scene') {
+    await queueWorkflow(
+      session,
+      session.selectedWorkflow!,
+      scene,
+      samples,
+      snapshot,
+    );
+  } else {
+    const inpaintScene = scene as InpaintScene;
+    if (inpaintScene.workflowType === 'SDMirror') {
+      await queueMirrorWorkflow(
+        session,
+        inpaintScene.workflowType,
+        inpaintScene.preset,
+        inpaintScene,
+        samples,
+        undefined,
+        snapshot,
+        mirrorCanvasMemo,
+      );
+    } else {
+      await queueI2IWorkflow(
+        session,
+        scene.workflowType,
+        scene.preset,
+        scene,
+        samples,
+        undefined,
+        snapshot,
+      );
+    }
+  }
+};
+
+// ── 퀵 생성 전용 예약 (퀵 생성 개편, 2026-07-18 합의) ──
+//
+// 프롬프트/프리셋 해석은 promptSession(현재 프로젝트 좌측 패널), 태스크 귀속
+// (출력 폴더·imageMap·통계·image-added 이벤트)은 quickSession(전용 숨김 프로젝트).
+// queueWorkflow 를 그대로 쓰면 세션이 하나로 묶여 출력이 현재 프로젝트에 떨어지므로,
+// 해석 단계(createPrompt — 조각/캐릭터 프리셋이 promptSession 기준)와 귀속 단계
+// (def.handler — getOutputDir(session, scene)이 quickSession 기준)를 분리한다.
+//
+// 바이브/레퍼런스 파일은 실행 시점에 task.params.session(=quickSession) 폴더에서
+// 로드되므로(TaskHandlers), 예약 시점에 현재 프로젝트 폴더에서 전용 프로젝트
+// 폴더로 복사해 둔다(없을 때만 — 인코딩된 바이브도 함께 복사해 재인코딩 방지).
+const copyIfMissing = async (src: string, dest: string) => {
+  try {
+    if (await backend.existFile(dest)) return;
+    if (!(await backend.existFile(src))) return;
+    await backend.copyFile(src, dest);
+  } catch (e) {
+    // 복사 실패 시 예약은 계속 — 실행 시점 로드 실패가 사용자 메시지로 안내된다
+    console.warn('퀵 생성 자산 복사 실패:', src, e);
+  }
+};
+
+const copyPresetAssets = async (
+  from: Session,
+  to: Session,
+  shared: any,
+): Promise<void> => {
+  for (const v of shared.vibes ?? []) {
+    if (!v?.path) continue;
+    await copyIfMissing(
+      imageService.getVibeImagePath(from, v.path),
+      imageService.getVibeImagePath(to, v.path),
+    );
+    await copyIfMissing(
+      imageService.getEncodedVibeImagePath(from, v.path, v.info),
+      imageService.getEncodedVibeImagePath(to, v.path, v.info),
+    );
+  }
+  for (const r of shared.characterReferences ?? []) {
+    if (r?.enabled === false || !r?.path) continue;
+    const name = r.path.split('/').pop()!;
+    await copyIfMissing(
+      `${imageService.getReferenceDir(from)}/${name}`,
+      `${imageService.getReferenceDir(to)}/${name}`,
+    );
+  }
+};
+
+export const queueQuickScene = async (
+  promptSession: Session,
+  quickSession: Session,
+  scene: Scene,
+  samples: number,
+) => {
+  const workflow = promptSession.selectedWorkflow!;
+  const [type, preset, shared, def] = promptSession.getCommonSetup(workflow);
+  const prompts = await def.createPrompt!(promptSession, scene, preset, shared);
+  const characterPrompts = await def.createCharacterPrompts!(
+    promptSession,
+    scene,
+    preset,
+    shared,
+  );
+  await copyPresetAssets(promptSession, quickSession, shared);
+  for (let i = 0; i < prompts.length; i++) {
+    await def.handler(
+      quickSession,
+      scene,
+      prompts[i],
+      characterPrompts[i],
+      preset,
+      shared,
+      samples,
+      scene.meta.get(type),
+    );
+  }
+};
+
+/** 앱의 접두 없는 작가 판별 = 작가 라이브러리 이름 + 태그 DB 작가(규칙은 artistTags.makeArtistLookup). */
+const makeAppArtistLookup = () =>
+  makeArtistLookup(
+    (w) => backend.lookupTag(w),
+    (n) => !!artistLibraryService.findArtistByName(n),
+  );
+
+const ensureArtistBreakdownScene = (session: Session): Scene => {
+  let scene = session.scenes.get('default');
+  if (scene) return scene;
+  const resolution = session.newSceneResolution;
+  scene = Scene.fromJSON({
+    type: 'scene',
+    name: 'default',
+    resolution: resolution?.resolution ?? 'portrait',
+    resolutionWidth:
+      resolution?.resolution === 'custom' ? resolution.width : undefined,
+    resolutionHeight:
+      resolution?.resolution === 'custom' ? resolution.height : undefined,
+    slots: [[{ id: v4(), prompt: '', characterPrompts: [], enabled: true }]],
+    mains: [],
+    imageMap: [],
+    meta: {},
+    round: undefined,
+    game: undefined,
+  });
+  session.addScene(scene);
+  sessionService.markDirty(session.name);
+  return scene;
+};
+
+/**
+ * 좌측 양의 프롬프트에 있는 작가 태그를 하나씩 남겨 default 씬에 1장씩 예약한다.
+ * 프리셋·프로젝트 프롬프트는 건드리지 않고 예약 시점의 복제본만 사용한다.
+ */
+export const queueArtistBreakdown = async (session: Session) => {
+  const workflow = session.selectedWorkflow;
+  if (!workflow) {
+    appState.pushMessage('먼저 이미지 생성 워크플로우를 선택해주세요.');
+    return;
+  }
+  const [type, preset, shared, def] = session.getCommonSetup(workflow);
+  if (!preset || !shared || !['SDImageGen', 'SDImageGenEasy'].includes(type)) {
+    appState.pushMessage(
+      '이미지 생성 프리셋에서만 작가 분해를 사용할 수 있습니다.',
+    );
+    return;
+  }
+
+  const sources = {
+    frontPrompt: preset.frontPrompt ?? '',
+    extraPrompt: session.extraPrompt ?? '',
+    backPrompt: preset.backPrompt ?? '',
+    characterPrompt:
+      type === 'SDImageGenEasy' ? (shared.characterPrompt ?? '') : undefined,
+    backgroundPrompt:
+      type === 'SDImageGenEasy' ? (shared.backgroundPrompt ?? '') : undefined,
+  };
+  // 접두 없는 작가(0.8::aaa:: 등)도 라이브러리·태그 DB 로 판별해 함께 분해한다(2026-10-05 사용자 요청).
+  const isUnprefixedArtist = await resolveUnprefixedArtistNames(
+    Object.values(sources).filter((v): v is string => typeof v === 'string'),
+    makeAppArtistLookup(),
+  );
+  const variants = buildArtistPromptVariants(sources, isUnprefixedArtist);
+  if (variants.length === 0) {
+    appState.pushMessage(
+      '좌측 프롬프트에서 작가 태그를 찾지 못했습니다(artist: 접두·작가 라이브러리·태그 DB 기준).',
+    );
+    return;
+  }
+
+  let generationSnapshot: GenerationSettingsSnapshot;
+  try {
+    generationSnapshot = await taskQueueService.captureGenerationSnapshot();
+  } catch (e) {
+    console.error('작가 분해 생성 설정을 읽지 못했습니다:', e);
+    appState.pushMessage('생성 설정을 읽지 못해 예약하지 못했습니다.');
+    return;
+  }
+
+  const targetScene = ensureArtistBreakdownScene(session);
+  const promptScene = Scene.fromJSON({
+    ...targetScene.toJSON(),
+    slots: [[{ id: v4(), prompt: '', characterPrompts: [], enabled: true }]],
+  });
+  let queued = 0;
+  for (const variant of variants) {
+    const variantPreset = {
+      ...preset,
+      frontPrompt: variant.frontPrompt ?? '',
+      backPrompt: variant.backPrompt ?? '',
+    };
+    const variantShared = {
+      ...shared,
+      ...(type === 'SDImageGenEasy'
+        ? {
+            characterPrompt: variant.characterPrompt ?? '',
+            backgroundPrompt: variant.backgroundPrompt ?? '',
+          }
+        : {}),
+    };
+    try {
+      const prompts = await createSDPrompts(
+        session,
+        variantPreset,
+        variantShared,
+        promptScene,
+        variant.extraPrompt ?? '',
+      );
+      const characterPrompts = await createSDCharacterPrompts(
+        session,
+        variantPreset,
+        variantShared,
+        promptScene,
+      );
+      for (let i = 0; i < prompts.length; i++) {
+        await def.handler(
+          session,
+          targetScene,
+          prompts[i],
+          characterPrompts[i],
+          variantPreset,
+          variantShared,
+          1,
+          targetScene.meta.get(type),
+          undefined,
+          undefined,
+          generationSnapshot,
+        );
+        queued++;
+      }
+    } catch (e: any) {
+      appState.pushMessage(
+        `작가 분해 예약 실패 (${variant.artistTag}): ${e.message}`,
+      );
+    }
+  }
+  if (queued > 0) {
+    appState.pushMessage(`작가 ${queued}명 · default 씬에 각 1장 예약됨`);
+  }
+};
+
+// 모든(또는 선택한) 씬을 큐에 예약 추가. 누락 프롬프트조각이 있으면 생성 여부를 확인한다.
+export type SceneQueueFilter = 'all' | 'empty' | 'no-favorites';
+
+export const addScenesToQueue = async (
+  session: Session,
+  type: 'scene' | 'inpaint',
+  selectedOnly: boolean,
+  filter: SceneQueueFilter = 'all',
+) => {
+  try {
+    let scenes = session.getScenes(type);
+    if (selectedOnly) {
+      // 선택 종류가 다른 탭이면 같은 이름의 씬을 예약하지 않는다(빈 목록).
+      scenes = selectedScenesOfType(
+        { names: appState.selectedScenes, type: appState.selectedScenesType },
+        type,
+        scenes,
+      );
+    }
+    if (filter === 'empty') {
+      scenes = scenes.filter(
+        (scene) => imageService.getOutputs(session, scene).length === 0,
+      );
+    } else if (filter === 'no-favorites') {
+      scenes = scenes.filter((scene) => scene.mains.length === 0);
+    }
+    if (scenes.length === 0) return;
+
+    const allMissing: { library: string; piece: string }[] = [];
+    for (const scene of scenes) {
+      const missing = promptService.findMissingPieces(session, scene);
+      for (const m of missing) {
+        if (
+          !allMissing.find(
+            (x) => x.library === m.library && x.piece === m.piece,
+          )
+        ) {
+          allMissing.push(m);
+        }
+      }
+    }
+
+    const doQueue = async () => {
+      let generationSnapshot: GenerationSettingsSnapshot;
+      try {
+        generationSnapshot = await taskQueueService.captureGenerationSnapshot();
+      } catch (e) {
+        console.error('일괄 예약 생성 설정을 읽지 못했습니다:', e);
+        appState.pushMessage('생성 설정을 읽지 못해 예약하지 못했습니다.');
+        return;
+      }
+      // 미러 씬은 같은 원본·모드의 합성 캔버스를 묶음 안에서 한 번만 만든다(2026-10-02 P1)
+      const mirrorCanvasMemo = createMirrorCanvasMemo();
+      await taskQueueService.withProgressBatch(async () => {
+        for (const scene of scenes) {
+          try {
+            await queueScene(
+              session,
+              scene,
+              appState.samples,
+              generationSnapshot,
+              mirrorCanvasMemo,
+            );
+          } catch (e: any) {
+            appState.pushMessage(`프롬프트 에러 (${scene.name}): ${e.message}`);
+          }
+        }
+      });
+    };
+
+    if (allMissing.length > 0) {
+      const list = allMissing
+        .map((m) => `<${m.library}.${m.piece}>`)
+        .join(', ');
+      appState.pushDialog({
+        type: 'confirm',
+        text: `존재하지 않는 프롬프트조각이 발견되었습니다:\n${list}\n\n로컬 프롬프트조각으로 새로 만들까요?\n(빈 조각이 생성되며, 내용은 직접 채워주세요)`,
+        callback: async () => {
+          createMissingPiecesForSession(session, allMissing);
+          await doQueue();
+        },
+      });
+      return;
+    }
+    await doQueue();
+  } catch (e: any) {
+    appState.pushMessage(`프롬프트 에러: ${e.message}`);
+  }
+};
+
+// 한 세션의 모든 씬을 예약 추가 (프롬프트 에러 등 씬 단위 실패는 집계만)
+const queueAllScenesOfSession = async (
+  session: Session,
+  samples: number,
+  sharedSnapshot?: GenerationSettingsSnapshot,
+) => {
+  let queued = 0;
+  let failed = 0;
+  const scenes = session.getScenes('scene');
+  let generationSnapshot = sharedSnapshot;
+  if (!generationSnapshot) {
+    try {
+      generationSnapshot = await taskQueueService.captureGenerationSnapshot();
+    } catch (e) {
+      console.error('일괄 예약 생성 설정을 읽지 못했습니다:', e);
+      return { queued: 0, failed: scenes.length };
+    }
+  }
+  await taskQueueService.withProgressBatch(async () => {
+    for (const scene of scenes) {
+      try {
+        await queueScene(session, scene, samples, generationSnapshot);
+        queued++;
+      } catch {
+        failed++;
+      }
+    }
+  });
+  return { queued, failed };
+};
+
+// 단일 프로젝트에 "모든 씬 예약 추가" — 드로어 프로젝트 메뉴의 간편 예약
+// (2026-07-17, 확인 창 없이 즉시). 예약 수 = 생성 위젯의 현재 예약 개수.
+export const queueProjectForGeneration = async (name: string) => {
+  const { samples } = appState;
+  let session: Session | undefined;
+  try {
+    session = await sessionService.get(name);
+  } catch {
+    // Missing and unreadable projects share the existing user-facing error below.
+  }
+  if (!session) {
+    appState.pushMessage('프로젝트를 불러올 수 없습니다.');
+    return;
+  }
+  const { queued, failed } = await queueAllScenesOfSession(session, samples);
+  const parts = [`씬 ${queued}개 × ${samples}장 예약됨`];
+  if (failed > 0) parts.push(`실패 ${failed}개`);
+  appState.pushMessage(`"${name}" — ${parts.join(' · ')}`);
+};
+
+// 폴더(서브폴더 포함) 안 모든 프로젝트에 "모든 씬 예약 추가"를 실행하는
+// 일괄 생성 예약 (2026-07-17). 예약 수 = 생성 위젯의 현재 예약 개수
+// (appState.samples). 큐에 추가만 하고 실행은 기존 예약 의미론대로 사용자가
+// 시작한다. 비활성 세션 예약은 순차 생성 프로젝트 파일 모드와 같은 경로
+// (queueScene 이 세션 매개변수화돼 있음). 프로젝트가 많아 누락 프롬프트조각
+// 자동 생성을 대화형으로 물을 수 없으므로, 프롬프트 에러는 프로젝트 단위로
+// 수집해 요약만 한다.
+export const queueFolderProjectsForGeneration = async (folder: string) => {
+  // 숨김 씬 템플릿은 일괄 예약 대상에서 제외 (씬 템플릿 개편 2026-07-18)
+  const names = templateService
+    .filterVisibleProjects(sessionService.list())
+    .filter((n) => {
+      const f = sessionService.getFolderOf(n);
+      return f === folder || !!(f && f.startsWith(`${folder}/`));
+    });
+  if (names.length === 0) {
+    appState.pushMessage('이 폴더에 프로젝트가 없습니다.');
+    return;
+  }
+  const { samples } = appState;
+  appState.pushDialog({
+    type: 'confirm',
+    text:
+      `"${sessionService.folderLeafName(folder)}" 폴더(서브폴더 포함)의 ` +
+      `프로젝트 ${names.length}개에\n프로젝트마다 모든 씬 × ${samples}장 ` +
+      `생성 예약을 추가할까요?`,
+    callback: async () => {
+      let generationSnapshot: GenerationSettingsSnapshot;
+      try {
+        generationSnapshot = await taskQueueService.captureGenerationSnapshot();
+      } catch (e) {
+        console.error('일괄 예약 생성 설정을 읽지 못했습니다:', e);
+        appState.pushMessage('생성 설정을 읽지 못해 예약하지 못했습니다.');
+        return;
+      }
+      let queuedScenes = 0;
+      const failed: string[] = [];
+      appState.setProgressDialog({
+        text: '일괄 생성 예약 중...',
+        done: 0,
+        total: names.length,
+      });
+      try {
+        await taskQueueService.withProgressBatch(async () => {
+          for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            try {
+              const session = await sessionService.get(name);
+              if (!session) throw new Error('프로젝트 로드 실패');
+              const r = await queueAllScenesOfSession(
+                session,
+                samples,
+                generationSnapshot,
+              );
+              queuedScenes += r.queued;
+              if (r.failed > 0 && !failed.includes(name)) failed.push(name);
+            } catch {
+              if (!failed.includes(name)) failed.push(name);
+            }
+            appState.setProgressDialog({
+              text: '일괄 생성 예약 중...',
+              done: i + 1,
+              total: names.length,
+            });
+          }
+        });
+      } finally {
+        appState.setProgressDialog(undefined);
+      }
+      const parts = [`씬 ${queuedScenes}개 × ${samples}장 예약됨`];
+      if (failed.length > 0) {
+        parts.push(`문제 발생 ${failed.length}개 (${failed.join(', ')})`);
+      }
+      appState.pushMessage(`일괄 생성 예약 완료 — ${parts.join(' · ')}`);
+    },
+  });
+};
+
+// 모든(또는 선택한) 씬의 예약을 큐에서 제거.
+export const removeScenesFromQueue = (
+  session: Session,
+  type: 'scene' | 'inpaint',
+  selectedOnly: boolean,
+) => {
+  let scenes = session.getScenes(type);
+  if (selectedOnly) {
+    scenes = selectedScenesOfType(
+      { names: appState.selectedScenes, type: appState.selectedScenesType },
+      type,
+      scenes,
+    );
+  }
+  if (scenes.length === 0) return;
+  taskQueueService.removeTasksFromScenes(new Set(scenes), session);
+};
+
+/**
+ * 긍정 프롬프트 칸 전체의 작가 태그 artist: 접두를 전환한다(2026-09-25 추가/제거 → 2026-09-26 사용자 결정으로 버튼 하나의 반전).
+ * 구획마다 접두가 있으면 떼고, 없는데 작가 라이브러리 이름이거나 태그 DB(카테고리 1)상 작가면 붙인다 — 섞여 있어도 한쪽으로 몰지 않는다.
+ * 대상 = preset.frontPrompt·backPrompt, session.extraPrompt, (이지) shared.characterPrompt·backgroundPrompt,
+ * 캐릭터 프롬프트 배열의 prompt. 부정(uc)은 제외(사용자 결정: 수정할 일이 적고 태그 명시가 의도적일 수 있음).
+ * 변환 결과를 먼저 계산해 붙일/뗄 개수를 확인창에 보여 주고, 확인 뒤에만 적용한다. models/artistTags.ts 가 단일 출처.
+ */
+export const applyArtistPrefixBatch = async (
+  session: Session,
+  mode: ArtistPrefixMode = 'toggle',
+) => {
+  const workflow = session.selectedWorkflow;
+  if (!workflow) {
+    appState.pushMessage('먼저 이미지 생성 워크플로우를 선택해주세요.');
+    return;
+  }
+  const [type, preset, shared] = session.getCommonSetup(workflow);
+  if (!preset || !shared || !['SDImageGen', 'SDImageGenEasy'].includes(type)) {
+    appState.pushMessage(
+      '이미지 생성 프리셋에서만 작가 접두 전환을 사용할 수 있습니다.',
+    );
+    return;
+  }
+  const lookup = makeAppArtistLookup();
+  type Field = { label: string; get: () => string; set: (v: string) => void };
+  const fields: Field[] = [];
+  const addField = (label: string, holder: any, key: string) => {
+    if (!holder || typeof holder[key] !== 'string') return;
+    fields.push({
+      label,
+      get: () => holder[key] as string,
+      set: (v) => {
+        holder[key] = v;
+      },
+    });
+  };
+  addField('상위 프롬프트', preset, 'frontPrompt');
+  addField('추가 프롬프트', session, 'extraPrompt');
+  addField('하위 프롬프트', preset, 'backPrompt');
+  if (type === 'SDImageGenEasy') {
+    addField('캐릭터 관련 태그', shared, 'characterPrompt');
+    addField('배경 관련 태그', shared, 'backgroundPrompt');
+  }
+  for (const holder of [preset, shared] as any[]) {
+    const list = holder?.characterPrompts;
+    if (!Array.isArray(list)) continue;
+    list.forEach((cp: any, i: number) =>
+      addField(`캐릭터 프롬프트 ${i + 1}`, cp, 'prompt'),
+    );
+  }
+
+  const results: { field: Field; text: string; changed: number }[] = [];
+  let added = 0;
+  let removed = 0;
+  let artists = 0;
+  for (const field of fields) {
+    const r = await transformArtistPrefix(field.get(), mode, lookup);
+    artists += r.artists;
+    added += r.added;
+    removed += r.removed;
+    if (r.changed > 0)
+      results.push({ field, text: r.text, changed: r.changed });
+  }
+  const changed = added + removed;
+  if (changed === 0) {
+    appState.pushMessage(
+      artists > 0
+        ? '바꿀 artist: 접두가 없습니다.'
+        : '긍정 프롬프트에서 작가 태그를 찾지 못했습니다(작가 라이브러리·태그 DB 기준).',
+    );
+    return;
+  }
+  const what = [
+    added > 0 ? `추가 ${added}개` : '',
+    removed > 0 ? `제거 ${removed}개` : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
+  const where = results
+    .map((r) => `${r.field.label} ${r.changed}개`)
+    .join(', ');
+  appState.pushDialog({
+    type: 'confirm',
+    text: `작가 태그의 artist: 접두를 전환합니다 — ${what}.\n(${where})`,
+    callback: async () => {
+      results.forEach((r) => r.field.set(r.text));
+      sessionService.markDirty(session.name);
+      appState.pushMessage(`artist: 접두를 전환했습니다 — ${what}.`);
+    },
+  });
+};
+
+/**
+ * 작가 라이브러리 카드에서 「샘플 생성」(2026-09-26): 현재 프리셋의 긍정 프롬프트에서 artist: 접두 구획을 전부 빼고
+ * 이 작가만 남겨(없으면 상위 프롬프트 맨 앞에 artist:이름 추가) default 씬에 1장 예약한다. 완료되면 결과 이미지를
+ * 그 작가 카드에 저장한다(모델 계열은 예약 시점 스냅샷의 modelVersion). 작가 분해와 같은 경로·같은 씬.
+ */
+export const queueArtistSample = async (
+  session: Session,
+  artistId: string,
+  artistName: string,
+): Promise<boolean> => {
+  const workflow = session.selectedWorkflow;
+  if (!workflow) {
+    appState.pushMessage('먼저 이미지 생성 워크플로우를 선택해주세요.');
+    return false;
+  }
+  const [type, preset, shared, def] = session.getCommonSetup(workflow);
+  if (!preset || !shared || !['SDImageGen', 'SDImageGenEasy'].includes(type)) {
+    appState.pushMessage('이미지 생성 프리셋에서만 샘플을 생성할 수 있습니다.');
+    return false;
+  }
+  const name = artistName.trim();
+  if (!name) return false;
+
+  // 다른 작가는 접두 유무와 관계없이 빼고(작가 분해와 같은 기준), 대상 작가의 접두 없는 구획은 가중치째 남긴다.
+  const isUnprefixedArtist = await resolveUnprefixedArtistNames(
+    [
+      preset.frontPrompt ?? '',
+      session.extraPrompt ?? '',
+      preset.backPrompt ?? '',
+      ...(type === 'SDImageGenEasy'
+        ? [shared.characterPrompt ?? '', shared.backgroundPrompt ?? '']
+        : []),
+    ],
+    makeAppArtistLookup(),
+  );
+  const strip = (v?: string) =>
+    removeArtistSegments(v ?? '', isUnprefixedArtist, name);
+  let frontPrompt = strip(preset.frontPrompt);
+  const extraPrompt = strip(session.extraPrompt);
+  const backPrompt = strip(preset.backPrompt);
+  const characterPrompt =
+    type === 'SDImageGenEasy' ? strip(shared.characterPrompt) : undefined;
+  const backgroundPrompt =
+    type === 'SDImageGenEasy' ? strip(shared.backgroundPrompt) : undefined;
+  // 접두 없는 같은 이름은 그대로 두고(DB 기준 작가일 수 있음), 없으면 맨 앞에 붙인다
+  const already = [
+    frontPrompt,
+    extraPrompt,
+    backPrompt,
+    characterPrompt ?? '',
+    backgroundPrompt ?? '',
+  ].some((t) => hasArtistNamed(t, name));
+  if (!already)
+    frontPrompt = frontPrompt
+      ? `artist:${name}, ${frontPrompt}`
+      : `artist:${name}`;
+
+  let generationSnapshot: GenerationSettingsSnapshot;
+  try {
+    generationSnapshot = await taskQueueService.captureGenerationSnapshot();
+  } catch (e) {
+    console.error('샘플 생성 설정을 읽지 못했습니다:', e);
+    appState.pushMessage('생성 설정을 읽지 못해 예약하지 못했습니다.');
+    return false;
+  }
+  const family = samplingFamilyForModel(generationSnapshot.modelVersion);
+
+  const targetScene = ensureArtistBreakdownScene(session);
+  const promptScene = Scene.fromJSON({
+    ...targetScene.toJSON(),
+    slots: [[{ id: v4(), prompt: '', characterPrompts: [], enabled: true }]],
+  });
+  const variantPreset = { ...preset, frontPrompt, backPrompt };
+  const variantShared = {
+    ...shared,
+    ...(type === 'SDImageGenEasy' ? { characterPrompt, backgroundPrompt } : {}),
+  };
+  const wasEmpty = taskQueueService.isEmpty();
+  try {
+    const prompts = await createSDPrompts(
+      session,
+      variantPreset,
+      variantShared,
+      promptScene,
+      extraPrompt,
+    );
+    const characterPrompts = await createSDCharacterPrompts(
+      session,
+      variantPreset,
+      variantShared,
+      promptScene,
+    );
+    if (prompts.length === 0) {
+      appState.pushMessage('프롬프트를 만들지 못했습니다.');
+      return false;
+    }
+    await def.handler(
+      session,
+      targetScene,
+      prompts[0],
+      characterPrompts[0],
+      variantPreset,
+      variantShared,
+      1,
+      targetScene.meta.get(type),
+      async (path: string) => {
+        try {
+          const dataUri = await backend.readDataFile(path);
+          await artistLibraryService.addImage(
+            artistId,
+            dataUriToBase64(dataUri),
+            family,
+          );
+          appState.pushMessage(
+            `「${name}」 샘플 이미지를 작가 라이브러리에 저장했습니다.`,
+          );
+        } catch (e: any) {
+          appState.pushMessage(`샘플 저장 실패: ${e?.message ?? e}`);
+        }
+      },
+      undefined,
+      generationSnapshot,
+    );
+  } catch (e: any) {
+    appState.pushMessage(`샘플 생성 예약 실패: ${e?.message ?? e}`);
+    return false;
+  }
+  // 큐가 비어 있었으면 바로 돌린다(다른 대기 작업을 멋대로 시작하지 않기 위해 비어 있을 때만)
+  if (wasEmpty && !taskQueueService.isRunning()) taskQueueService.run();
+  appState.pushMessage(
+    wasEmpty
+      ? `「${name}」 샘플 1장 생성 시작 — 완료되면 카드에 저장됩니다.`
+      : `「${name}」 샘플 1장을 예약했습니다(큐 실행 시 생성·저장).`,
+  );
+  return true;
+};

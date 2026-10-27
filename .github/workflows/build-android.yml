@@ -1,0 +1,103 @@
+name: Build Android (unsigned)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@v4
+
+      - name: Use Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Use Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Ubuntu 24.04 already provides the Android SDK and command-line tools.
+      # setup-android@v3 runs `sdkmanager tools`, an obsolete package name that
+      # makes the setup action fail before the actual APK build starts.
+      - name: Install Android SDK packages for native build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$sdk_root" && test -d "$sdk_root"
+          if [[ -x "$sdk_root/cmdline-tools/latest/bin/sdkmanager" ]]; then
+            sdkmanager_bin="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          else
+            sdkmanager_bin="$(command -v sdkmanager)"
+          fi
+          "$sdkmanager_bin" --version
+          "$sdkmanager_bin" --install 'platforms;android-34' 'build-tools;35.0.0' 'ndk;26.1.10909125' 'cmake;3.22.1'
+
+      - name: Build repository-local Capacitor dependency
+        run: |
+          cd externals/capacitor-background-mode
+          npm ci
+          npm run build
+
+      - name: Install app dependencies without running nested hooks
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Verify the intended version and distinct Android identity
+        run: node tools/check-release-metadata.cjs --ci-env
+
+      - name: Build production mobile renderer
+        run: npm run build:renderer
+
+      - name: Include source and font license notices in the APK
+        run: |
+          mkdir -p release/app/dist/renderer/licenses
+          cp assets/SDStudio-LICENSE.txt assets/THIRD_PARTY_NOTICES.txt assets/fonts/OFL.txt release/app/dist/renderer/licenses/
+
+      # A clean GitHub runner has none of the gitignored generated Cordova
+      # Gradle files. `cap copy` only copies web assets, while `cap sync` also
+      # recreates the native plugin/cordova.variables.gradle dependency.
+      - name: Sync production renderer and Android native plugins
+        run: npx cap sync android
+
+      - name: Compile release APK, including actual C++ native library
+        working-directory: android
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease
+
+      - name: Inspect unsigned APK identity and packaged renderer
+        run: |
+          set -euo pipefail
+          apk='android/app/build/outputs/apk/release/app-release-unsigned.apk'
+          test -s "$apk"
+          metadata=$(node tools/check-release-metadata.cjs)
+          expected_code="${metadata##*versionCode=}"
+          expected_version=$(node -p 'require("./package.json").version')
+          badging=$("$ANDROID_SDK_ROOT/build-tools/35.0.0/aapt" dump badging "$apk" | grep '^package:')
+          [[ "$badging" == *"name='${{ env.app_id }}'"* ]]
+          [[ "$badging" == *"versionCode='$expected_code'"* ]]
+          [[ "$badging" == *"versionName='$expected_version'"* ]]
+          unzip -l "$apk" | grep -F 'assets/public/index.html'
+          sha256sum "$apk"
+
+      # Release artifacts are unsigned. The maintainer signs the APK outside CI.
+      - name: Retain unsigned APK and signing tool for controlled release
+        run: |
+          mkdir -p release/build/android-unsigned
+          cp android/app/build/outputs/apk/release/app-release-unsigned.apk release/build/android-unsigned/
+          cp "$ANDROID_SDK_ROOT/build-tools/35.0.0/lib/apksigner.jar" release/build/android-unsigned/
+
+      - name: Upload unsigned Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact_prefix }}-Android-unsigned
+          path: release/build/android-unsigned/
+          if-no-files-found: error
+          retention-days: 30

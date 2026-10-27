@@ -1,0 +1,280 @@
+// resolveLayout 순수 함수 단위 테스트.
+// layoutTemplates.ts 는 외부 import 가 없으므로 별도 mock 없이 직접 import 한다.
+
+import {
+  layoutTemplates,
+  resolveLayout,
+  dockOrder,
+  DOCK_RANK,
+  isMobileV2Layout,
+} from '../layoutTemplates';
+
+describe('resolveLayout — 폴백/강제', () => {
+  it('미지정(undefined) → classic 폴백', () => {
+    const r = resolveLayout(undefined, false);
+    expect(r.id).toBe('classic');
+    expect(r.bottomBar).toBe('bottom');
+    expect(r.sessionSelectTop).toBe(false);
+  });
+  it('미지정(undefined) + 모바일 → mobile-v2 기본(2026-09-27, 5.4.0 부터)', () => {
+    const r = resolveLayout(undefined, true);
+    expect(r.id).toBe('mobile-v2');
+    expect(r.mobileV2).toBe(true);
+    expect(resolveLayout('ghost', true).id).toBe('mobile-v2');
+    // PC 는 종전대로 classic
+    expect(resolveLayout(undefined, false).mobileV2).toBe(false);
+  });
+  it("미존재 id('ghost') → classic 폴백", () => {
+    const r = resolveLayout('ghost', false);
+    expect(r.id).toBe('classic');
+    expect(r.bottomBar).toBe('bottom');
+    expect(r.sessionSelectTop).toBe(false);
+  });
+  it('compact + 모바일 → classic 강제(mobileAllowed=false)', () => {
+    const r = resolveLayout('compact', true);
+    expect(r.id).toBe('classic');
+    expect(r.bottomBar).toBe('bottom');
+    expect(r.sessionSelectTop).toBe(false);
+  });
+  it('compact + PC → bottomBar none + sessionSelectTop true', () => {
+    const r = resolveLayout('compact', false);
+    expect(r.id).toBe('compact');
+    expect(r.bottomBar).toBe('none');
+    expect(r.sessionSelectTop).toBe(true);
+  });
+});
+
+describe('레지스트리 계약', () => {
+  it('id 중복이 없다 (config 저장 키 공용)', () => {
+    const ids = layoutTemplates.map((t) => t.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+  it("'classic' 이 존재하고 mobileAllowed=true", () => {
+    const classic = layoutTemplates.find((t) => t.id === 'classic');
+    expect(classic).toBeDefined();
+    expect(classic?.mobileAllowed).toBe(true);
+  });
+});
+
+describe('슬롯 개인화 — 회귀 가드(기존 필드 불변 + 새 필드 기본값)', () => {
+  // slots 미지정/undefined/빈객체에서 기존 필드는 이전과 100% 동일해야 하고,
+  // 새 필드는 템플릿 기본값(classic: right/left/docked, compact: right/left/floating).
+  it('classic + slots 미지정 → 기존 필드 불변 + 기본 슬롯(right/left/left/docked)', () => {
+    const r = resolveLayout('classic', false);
+    expect(r.id).toBe('classic');
+    expect(r.bottomBar).toBe('bottom');
+    expect(r.sessionSelectTop).toBe(false);
+    expect(r.historySide).toBe('right');
+    expect(r.presetSide).toBe('left');
+    expect(r.projectSide).toBe('left');
+    expect(r.genControl).toBe('docked');
+  });
+  it('classic + slots undefined → 기본 슬롯', () => {
+    const r = resolveLayout('classic', false, undefined);
+    expect(r.historySide).toBe('right');
+    expect(r.presetSide).toBe('left');
+    expect(r.genControl).toBe('docked');
+  });
+  it('classic + slots 빈객체 → 기본 슬롯', () => {
+    const r = resolveLayout('classic', false, {});
+    expect(r.historySide).toBe('right');
+    expect(r.presetSide).toBe('left');
+    expect(r.genControl).toBe('docked');
+  });
+  it('compact + PC + slots 미지정 → 기존 필드 불변 + 기본 슬롯(right/left/floating)', () => {
+    const r = resolveLayout('compact', false);
+    expect(r.id).toBe('compact');
+    expect(r.bottomBar).toBe('none');
+    expect(r.sessionSelectTop).toBe(true);
+    expect(r.historySide).toBe('right');
+    expect(r.presetSide).toBe('left');
+    expect(r.genControl).toBe('floating');
+  });
+});
+
+describe('슬롯 개인화 — 오버라이드 반영(PC)', () => {
+  it('historySide=left 단독', () => {
+    const r = resolveLayout('classic', false, { historySide: 'left' });
+    expect(r.historySide).toBe('left');
+    expect(r.presetSide).toBe('left'); // 미지정은 기본 유지
+    expect(r.genControl).toBe('docked');
+  });
+  it('presetSide=right 단독', () => {
+    const r = resolveLayout('classic', false, { presetSide: 'right' });
+    expect(r.presetSide).toBe('right');
+    expect(r.historySide).toBe('right');
+    expect(r.genControl).toBe('docked');
+  });
+  it('genControl=floating 단독', () => {
+    const r = resolveLayout('classic', false, { genControl: 'floating' });
+    expect(r.genControl).toBe('floating');
+    expect(r.historySide).toBe('right');
+    expect(r.presetSide).toBe('left');
+  });
+  it('세 필드 조합 오버라이드', () => {
+    const r = resolveLayout('classic', false, {
+      historySide: 'left',
+      presetSide: 'right',
+      genControl: 'floating',
+    });
+    expect(r.historySide).toBe('left');
+    expect(r.presetSide).toBe('right');
+    expect(r.genControl).toBe('floating');
+    // 기존 필드는 여전히 classic 값
+    expect(r.id).toBe('classic');
+    expect(r.bottomBar).toBe('bottom');
+  });
+});
+
+describe('슬롯 개인화 — 모바일 무시', () => {
+  it('classic + 모바일 + slots → slots 전부 무시(기본 슬롯 강제)', () => {
+    const r = resolveLayout('classic', true, {
+      historySide: 'left',
+      presetSide: 'right',
+      genControl: 'floating',
+    });
+    expect(r.id).toBe('classic');
+    expect(r.bottomBar).toBe('bottom');
+    expect(r.historySide).toBe('right');
+    expect(r.presetSide).toBe('left');
+    expect(r.genControl).toBe('docked');
+  });
+});
+
+describe('슬롯 개인화 — stale 안전', () => {
+  it('잘못된 slot 값(타입 밖 문자열)은 기본값으로', () => {
+    const r = resolveLayout('classic', false, {
+      historySide: 'top' as any,
+      presetSide: 'bottom' as any,
+      genControl: 'hidden' as any,
+    });
+    expect(r.historySide).toBe('right');
+    expect(r.presetSide).toBe('left');
+    expect(r.genControl).toBe('docked');
+  });
+  it("미존재 id('ghost') + slots → classic 폴백 위에 slots 적용", () => {
+    const r = resolveLayout('ghost', false, {
+      historySide: 'left',
+      genControl: 'floating',
+    });
+    expect(r.id).toBe('classic');
+    expect(r.bottomBar).toBe('bottom');
+    expect(r.historySide).toBe('left');
+    expect(r.presetSide).toBe('left'); // 미지정 기본
+    expect(r.genControl).toBe('floating');
+  });
+});
+
+describe('projectSide 슬롯', () => {
+  it('기본값 left', () => {
+    expect(resolveLayout('classic', false).projectSide).toBe('left');
+  });
+  it('projectSide=right 오버라이드(PC)', () => {
+    const r = resolveLayout('classic', false, { projectSide: 'right' });
+    expect(r.projectSide).toBe('right');
+    expect(r.presetSide).toBe('left'); // 다른 슬롯 불변
+    expect(r.historySide).toBe('right');
+  });
+  it('모바일이면 projectSide 무시(기본 left)', () => {
+    const r = resolveLayout('classic', true, { projectSide: 'right' });
+    expect(r.projectSide).toBe('left');
+  });
+  it('잘못된 값은 기본 left', () => {
+    const r = resolveLayout('classic', false, { projectSide: 'top' as any });
+    expect(r.projectSide).toBe('left');
+  });
+});
+
+describe('projectSidebar 템플릿', () => {
+  it('classic/compact 는 projectSidebar=false', () => {
+    expect(resolveLayout('classic', false).projectSidebar).toBe(false);
+    expect(resolveLayout('compact', false).projectSidebar).toBe(false);
+  });
+  it("'sidebar' 템플릿(PC) → projectSidebar=true, 하단바 없음+생성 플로팅", () => {
+    const r = resolveLayout('sidebar', false);
+    expect(r.id).toBe('sidebar');
+    expect(r.projectSidebar).toBe(true);
+    expect(r.bottomBar).toBe('none');
+    expect(r.genControl).toBe('floating');
+    expect(r.sessionSelectTop).toBe(true); // bottomBar==='none' 파생(사이드바라 실제 미사용)
+  });
+  it('sidebar + 모바일 → classic 폴백(projectSidebar=false)', () => {
+    const r = resolveLayout('sidebar', true);
+    expect(r.id).toBe('classic');
+    expect(r.projectSidebar).toBe(false);
+  });
+});
+
+describe("projectStrip 템플릿('modern' — ② A)", () => {
+  it('classic/compact/sidebar 는 projectStrip=false', () => {
+    expect(resolveLayout('classic', false).projectStrip).toBe(false);
+    expect(resolveLayout('compact', false).projectStrip).toBe(false);
+    expect(resolveLayout('sidebar', false).projectStrip).toBe(false);
+  });
+  it("'modern' 템플릿(PC) → projectStrip=true·projectSidebar=false, 하단바 없음+생성 플로팅", () => {
+    const r = resolveLayout('modern', false);
+    expect(r.id).toBe('modern');
+    expect(r.projectStrip).toBe(true);
+    expect(r.projectSidebar).toBe(false);
+    expect(r.bottomBar).toBe('none');
+    expect(r.genControl).toBe('floating');
+  });
+  it('modern + 모바일 → classic 폴백(projectStrip=false)', () => {
+    const r = resolveLayout('modern', true);
+    expect(r.id).toBe('classic');
+    expect(r.projectStrip).toBe(false);
+  });
+});
+
+describe('dockOrder — 가장자리 순서(프로젝트<프리셋<히스토리)', () => {
+  it('좌측: 프로젝트가 가장 왼쪽, 히스토리가 콘텐츠에 가장 가까움', () => {
+    const p = dockOrder('left', DOCK_RANK.project);
+    const s = dockOrder('left', DOCK_RANK.preset);
+    const h = dockOrder('left', DOCK_RANK.history);
+    expect(p).toBeLessThan(s);
+    expect(s).toBeLessThan(h);
+    expect(h).toBeLessThan(0); // 전부 콘텐츠(0)보다 왼쪽
+    expect([p, s, h]).toEqual([-3, -2, -1]);
+  });
+  it('우측: 프로젝트가 가장 오른쪽, 히스토리가 콘텐츠에 가장 가까움', () => {
+    const p = dockOrder('right', DOCK_RANK.project);
+    const s = dockOrder('right', DOCK_RANK.preset);
+    const h = dockOrder('right', DOCK_RANK.history);
+    expect(p).toBeGreaterThan(s);
+    expect(s).toBeGreaterThan(h);
+    expect(h).toBeGreaterThan(0); // 전부 콘텐츠(0)보다 오른쪽
+    expect([p, s, h]).toEqual([3, 2, 1]);
+  });
+});
+
+describe('모바일 V2 템플릿 — 선택형·되돌리기 가능(2026-09-20)', () => {
+  it('모바일에서 mobile-v2 를 고르면 V2 로 해석되고 골격은 클래식과 같다', () => {
+    const v2 = resolveLayout('mobile-v2', true);
+    const classic = resolveLayout('classic', true);
+    expect(v2.id).toBe('mobile-v2');
+    expect(v2.mobileV2).toBe(true);
+    expect({ ...v2, id: 'classic', mobileV2: false }).toEqual(classic);
+  });
+  it('클래식·모바일 비허용 템플릿은 모바일에서 V2 가 아니다(미지정·미존재 id 는 2026-09-27 부터 모바일 기본 V2)', () => {
+    for (const id of ['classic', 'compact', 'sidebar', 'modern']) {
+      expect(resolveLayout(id, true).mobileV2).toBe(false);
+    }
+  });
+  it('PC 에서는 mobile-v2 가 classic 으로 폴백된다(설정 복원 등 유입 안전)', () => {
+    const r = resolveLayout('mobile-v2', false, { historySide: 'left' });
+    expect(r.id).toBe('classic');
+    expect(r.mobileV2).toBe(false);
+    expect(r.historySide).toBe('left');
+    expect(isMobileV2Layout('mobile-v2', false)).toBe(false);
+    expect(isMobileV2Layout('mobile-v2', true)).toBe(true);
+  });
+  it('기존 PC 템플릿은 전부 desktopAllowed 이고 mobile-v2 만 모바일 전용이다', () => {
+    const mobileOnly = layoutTemplates
+      .filter((t) => !t.desktopAllowed)
+      .map((t) => t.id);
+    expect(mobileOnly).toEqual(['mobile-v2']);
+    expect(
+      layoutTemplates.filter((t) => t.mobileAllowed).map((t) => t.id),
+    ).toEqual(['classic', 'mobile-v2']);
+  });
+});

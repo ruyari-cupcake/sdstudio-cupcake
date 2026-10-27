@@ -1,0 +1,3148 @@
+import { observable } from 'mobx';
+import { v4 } from 'uuid';
+import {
+  backend,
+  imageService,
+  workFlowService,
+  zipService,
+  sessionService,
+  trashService,
+  taskQueueService,
+  globalPieceService,
+  globalPresetService,
+  projectSizeService,
+  templateService,
+  projectTemplateService,
+  globalCharacterPresetService,
+} from '.';
+import { type IBatchPlanItem, resolveBatchName } from './batchCreatePlan';
+import type { TemplateProtectArea } from './TemplateService';
+import { getAppState } from './appStateRef';
+import type { FileEntry } from '../backend';
+import defaultassets from '../defaultassets';
+import { dataUriToBase64 } from './ImageService';
+
+import {
+  ResourceSyncService,
+  type ResourceStorage,
+} from './ResourceSyncService';
+import { persistService } from './PersistenceService';
+import { isOutputImageFile } from './imageFormats';
+import { isWorkspaceBakHealCandidate } from './trashList';
+import {
+  projectPath,
+  projectFolderPath,
+  projectJsonPath,
+  workspacePath,
+  WORKSPACE_ROOT,
+  PROJECT_JSON_ROOT,
+  PROJECT_IMAGE_ROOTS,
+  invalidProjectName,
+} from './projectPaths';
+import {
+  isWorkspaceLayout,
+  physicalDirOf,
+  nameOfPhysicalDir,
+  registerProjectDir,
+  unregisterProjectDir,
+  renameProjectDirKey,
+  makeWorkspaceDirName,
+  type WorkspaceProjectMeta,
+  PROJECT_META_FILE,
+  PROJECT_JSON_FILE,
+} from './storageLayout';
+import {
+  type GenericScene,
+  type InpaintScene,
+  Session,
+  type ISession,
+} from './types';
+
+import * as legacy from './legacy';
+import {
+  embedJSONInPNG,
+  readJSONFromPNG,
+  normalizePresetJson,
+  createImageWithText,
+} from './presetImageMetadata';
+
+export {
+  embedJSONInPNG,
+  readJSONFromPNG,
+  normalizePresetJson,
+  createImageWithText,
+};
+
+const SESSION_SERVICE_INTERVAL = 5000;
+
+export class SessionService extends ResourceSyncService<Session> {
+  favorites: Set<string> = new Set();
+
+  // 메타 파일(즐겨찾기/북마크 등) 로드가 IO 오류(저장소 권한 등)로 실패한 경우
+  // 해당 파일의 저장을 차단한다 — 빈 메모리 상태를 디스크에 되써서 기존 데이터를
+  // 지우는 것을 막는 안전벨트 (씬 유실 가드와 같은 철학). 파싱 오류(SyntaxError,
+  // 파손 파일)는 기존대로 빈 값 재시작을 허용한다.
+  private metaLoadFailed = new Set<string>();
+
+  // IO 오류면 저장 차단 플래그를 세운다. true 반환 = 차단 상태.
+  private markMetaLoadError(file: string, e: unknown): boolean {
+    if (e instanceof SyntaxError) return false;
+    this.metaLoadFailed.add(file);
+    console.error(`${file} 로드 실패(IO) — 덮어쓰기 방지 위해 저장 차단:`, e);
+    return true;
+  }
+
+  private metaSaveBlocked(file: string): boolean {
+    if (!this.metaLoadFailed.has(file)) return false;
+    console.warn(`${file} 저장 건너뜀 — 부팅 로드 실패 상태(기존 파일 보호)`);
+    return true;
+  }
+
+  constructor(storage: ResourceStorage) {
+    super(storage, PROJECT_JSON_ROOT, SESSION_SERVICE_INTERVAL);
+  }
+
+  // ===== 읽기 전용 미러 (같은 프로젝트 중복 열기, W6 후속) =====
+  // 이 창에서 "읽기 전용 미러"로 연 프로젝트 이름 집합. 미러는 락을 보유하지 않아
+  // P0 가드가 디스크 쓰기를 드롭한다(이미지 즐겨찾기·삭제·생성만 소유 창에 위임).
+  readonly mirrorSessions = observable.set<string>();
+
+  isMirror(name: string): boolean {
+    return this.mirrorSessions.has(name);
+  }
+
+  // 미러 종료 — 마킹 해제 + 편집 경고 1회 상태 리셋 + 메모리 캐시 파기.
+  // 캐시를 버리는 이유: 미러의 편집은 저장되지 않는데 캐시 인스턴스가 살아 있으면
+  // 재열기 때 그 편집이 "그대로 남은" 것처럼 보여(디스크와 괴리) 혼동을 준다
+  // (2026-07-18 실기 피드백). 다음 접근은 디스크 최신본을 읽는다.
+  endMirror(name: string) {
+    this.mirrorSessions.delete(name);
+    this.#mirrorEditWarned.delete(name);
+    this.evict(name);
+  }
+
+  // P2 창 간 op 적용 중 표시 — 이 동안의 markDirty 는 "미러 편집 경고" 토스트를
+  // 띄우지 않는다(op 적용은 사용자의 편집이 아니라 다른 창의 반영이므로).
+  applyingSessionOp = false;
+
+  // 마지막 op 적용 시각 — 변경 감지 reaction 이 updateInterval 디바운스로 늦게
+  // markDirty 를 호출하므로, 동기 플래그만으로는 op 유래 dirty 를 걸러내지 못한다.
+  // 적용 직후 한 디바운스 창 동안은 경고를 억제한다(그 사이 사용자 편집의 경고는
+  // 세션당 1회 안내 성격상 다음 편집 때 떠도 무방).
+  #lastSessionOpAt = 0;
+
+  // 미러 편집 경고 토스트를 세션당 1회만 띄우기 위한 집합.
+  #mirrorEditWarned = new Set<string>();
+
+  // 미러 세션이 dirty 로 마킹되는 최초 1회, 저장되지 않는 편집임을 안내한다.
+  // (op 적용 중에는 억제 — applyingSessionOp + 디바운스 지연분은 시각 창으로)
+  markDirty(name: string) {
+    if (
+      this.isMirror(name) &&
+      !this.applyingSessionOp &&
+      Date.now() - this.#lastSessionOpAt > SESSION_SERVICE_INTERVAL + 2000 &&
+      !this.#mirrorEditWarned.has(name)
+    ) {
+      this.#mirrorEditWarned.add(name);
+      try {
+        getAppState().pushMessage(
+          '읽기 전용 미러 — 즐겨찾기·삭제·생성 외 편집은 저장되지 않습니다',
+        );
+      } catch (error) {
+        console.warn('읽기 전용 미러 안내를 표시하지 못했습니다:', error);
+      }
+    }
+    super.markDirty(name);
+  }
+
+  // 창 간 세션 op 적용(읽기 전용 미러) — 다른 창이 보낸 이미지 즐겨찾기(mains)
+  // 변경을 이 창의 메모리에 반영한다. 이미 로드된 세션에만 적용하며(디스크 읽기
+  // 유발 금지), 적용 중에는 미러 편집 경고를 억제한다. 소유 창이면 mobx reaction 이
+  // 자동 저장(=위임의 실체), 비소유(미러) 창은 P0 가드가 저장을 드롭한다.
+  applySessionOp(payload: {
+    project: string;
+    sceneType: 'scene' | 'inpaint';
+    sceneName: string;
+    filename: string;
+    op: string;
+    on: boolean;
+  }) {
+    const session = this.getLoaded(payload.project);
+    if (!session) return; // 이 창에 로드돼 있지 않으면 무시
+    const scene =
+      payload.sceneType === 'inpaint'
+        ? session.inpaints.get(payload.sceneName)
+        : session.scenes.get(payload.sceneName);
+    if (!scene) return;
+    if (payload.op === 'set-main') {
+      const has = scene.mains.includes(payload.filename);
+      if (payload.on === has) return; // 이미 일치 — no-op
+      this.applyingSessionOp = true;
+      this.#lastSessionOpAt = Date.now();
+      try {
+        if (payload.on) scene.mains.push(payload.filename);
+        else scene.mains.splice(scene.mains.indexOf(payload.filename), 1);
+      } finally {
+        this.applyingSessionOp = false;
+      }
+    }
+  }
+
+  // ===== 신 배치(workspace/, storage v2) 계층 =====
+  // 아래 분기는 모두 isWorkspaceLayout()===true 일 때만 동작한다. 비활성 시엔
+  // super/기존 경로로 위임되어 기존 동작이 1바이트도 바뀌지 않는다. 스펙 §2·§5.
+
+  // 세션 본체 경로. 신 배치 활성 시 폴더 무관하게 workspace/<물리폴더>/project.json.
+  getPath(name: string) {
+    if (isWorkspaceLayout()) {
+      return projectJsonPath(name);
+    }
+    return super.getPath(name);
+  }
+
+  // 소프트 삭제 경로: 신 배치는 project.json → project.json.deleted (접미).
+  protected deletedPathOf(src: string): string {
+    if (isWorkspaceLayout()) {
+      return `${src}.deleted`;
+    }
+    return super.deletedPathOf(src);
+  }
+
+  // 결합 직후 훅 — 신규 프로젝트가 첫 디스크 쓰기 전에 물리 폴더에 등록되도록
+  // 보장하는 안전망. 이미 등록된 이름(스캔으로 올라온 기존 프로젝트, 또는
+  // deep 복제/import 가 복사 전 명시 등록한 경우)은 그대로 통과한다.
+  protected async onAttached(name: string, instance: Session): Promise<void> {
+    if (!isWorkspaceLayout()) return;
+    // 자가 치유: 마이그레이션 동명 충돌('_복구N')로 project.json 안의 name 이
+    // 레지스트리 키와 어긋난 세션은 키를 진실로 삼아 정정한다. 어긋난 채 두면
+    // vibes/references 등 이미지 경로가 다른(또는 미등록) 프로젝트로 해석된다.
+    // (변경은 watch reaction 이 감지해 정정된 이름으로 저장까지 이어진다.)
+    if (instance.name !== name) {
+      instance.name = name;
+    }
+    if (physicalDirOf(name) !== undefined) return;
+    if (!instance.id) instance.id = v4();
+    await this.ensureWorkspaceProject(name, {
+      id: instance.id,
+      folder: this.folderMap[name] ?? '',
+    });
+  }
+
+  // 신 배치 등록 seam: id 확보 → 물리 폴더명 결정 → 레지스트리 등록 → meta.json
+  // 기록. 멱등(이미 등록된 이름은 기존 물리 폴더를 그대로 반환). deep 복제/import
+  // 는 이미지 복사가 createFrom(→onAttached) 보다 앞서므로 복사 시작 전에 이 함수를
+  // 명시 호출해 등록을 선행시킨다(스펙 §A-4).
+  async ensureWorkspaceProject(
+    name: string,
+    opts?: { id?: string; folder?: string },
+  ): Promise<string> {
+    const existing = physicalDirOf(name);
+    if (existing !== undefined) return existing;
+    const id = opts?.id || v4();
+    const dir = makeWorkspaceDirName(name, id);
+    registerProjectDir(name, dir);
+    const meta: WorkspaceProjectMeta = {
+      version: 1,
+      id,
+      name,
+      folder: opts?.folder ?? this.folderMap[name] ?? '',
+    };
+    try {
+      await backend.writeFile(
+        workspacePath(dir, PROJECT_META_FILE),
+        JSON.stringify(meta),
+      );
+    } catch (e) {
+      // meta.json 기록 실패 → 등록을 되돌려 "경로는 풀리는데 meta 는 없는" 갈라짐 방지.
+      unregisterProjectDir(name);
+      throw e;
+    }
+    return dir;
+  }
+
+  // meta.json 의 특정 필드를 부분 갱신한다(read-modify-write). 기존 id/version 보존.
+  private async updateWorkspaceMeta(
+    name: string,
+    patch: Partial<Pick<WorkspaceProjectMeta, 'name' | 'folder'>>,
+  ): Promise<void> {
+    const dir = physicalDirOf(name);
+    if (dir === undefined) {
+      throw new Error(`meta.json 갱신 대상 미등록: ${JSON.stringify(name)}`);
+    }
+    const metaPath = workspacePath(dir, PROJECT_META_FILE);
+    let meta: WorkspaceProjectMeta;
+    try {
+      meta = JSON.parse(await backend.readFile(metaPath));
+    } catch {
+      // meta 부재/파손 시 현재 알고 있는 정보로 재구성(자기치유의 최소형).
+      const inst = this.getLoaded(name) as Session | undefined;
+      meta = {
+        version: 1,
+        id: inst?.id || v4(),
+        name,
+        folder: this.folderMap[name] ?? '',
+      };
+    }
+    if (patch.name !== undefined) meta.name = patch.name;
+    if (patch.folder !== undefined) meta.folder = patch.folder;
+    await backend.writeFile(metaPath, JSON.stringify(meta));
+  }
+
+  // 신 배치 목록 스캔: workspace/ 1단 나열 → 각 하위 폴더의 meta.json 을 읽어
+  // 프로젝트 목록·folderMap(meta.folder 파생)·레지스트리를 채운다. project.json
+  // 부재+project.json.deleted 존재 = 소프트 삭제 상태(목록 제외 — 구 .deleted 와
+  // 동일 의미, 휴지통 스캔이 별도로 소비). meta 파손/부재 폴더는 경고 후 스킵.
+  protected async scanResources(): Promise<{
+    names: string[];
+    folderMap: { [name: string]: string | null };
+    folderList: string[];
+  }> {
+    if (!isWorkspaceLayout()) return super.scanResources();
+
+    const names: string[] = [];
+    const folderMap: { [name: string]: string | null } = {};
+    const folderSet = new Set<string>();
+    const activeNames = new Set<string>();
+    // 소프트 삭제로만 발견된 이름 — 활성 등록이 없을 때만 스캔 끝에 unregister 한다.
+    // (동명 재생성: 옛 폴더=삭제, 새 폴더=활성이 공존할 때 순서와 무관하게 활성 우선)
+    const softOnly: string[] = [];
+    // .bak 자가치유 후보(project.json·.deleted 둘 다 부재) — 루프 뒤에서 처리.
+    const bakHealCandidates: { dir: string; name: string }[] = [];
+    // 이번 스캔에서 확정된 이름 → 물리 폴더 (동명 meta 중복 감지용)
+    const seenNameToDir = new Map<string, string>();
+    let metaReadFailures = 0;
+    let successCount = 0;
+
+    // Missing workspace roots are acknowledged as []; actual IO failures propagate
+    // to the initial-scan guard so a failed scan cannot clear the previous list.
+    const dirs = await backend.listFiles(WORKSPACE_ROOT);
+
+    const projectDirs = dirs.filter((d) => !d.startsWith('.'));
+    for (const dir of projectDirs) {
+      let meta: WorkspaceProjectMeta | undefined;
+      try {
+        const raw = await backend.readFile(
+          workspacePath(dir, PROJECT_META_FILE),
+        );
+        meta = JSON.parse(raw);
+      } catch {
+        meta = undefined;
+      }
+      if (!meta || typeof meta.name !== 'string' || !meta.name) {
+        // 자가치유: .bak → project.json(name/id) → 폴더명 유추 순으로 meta 재구성.
+        // (마이그레이션/쓰기 중단으로 meta 만 깨진 프로젝트가 조용히 영구
+        //  비가시가 되던 문제 — 복구 실패 시에만 스킵+고지)
+        meta = await this.recoverWorkspaceMeta(dir);
+        if (!meta) {
+          metaReadFailures++;
+          this.noteMetaSkip(dir);
+          continue;
+        }
+      }
+      let { name } = meta;
+      const folder = typeof meta.folder === 'string' ? meta.folder : '';
+      // 활성 판정 = project.json 존재. 소프트 삭제(project.json.deleted)만 있으면
+      // 목록/등록에서 제외한다(동명 새 프로젝트가 삭제 폴더를 재사용하지 않게).
+      const hasActive = await backend.existFile(
+        workspacePath(dir, PROJECT_JSON_FILE),
+      );
+      if (!hasActive) {
+        const hasDeleted = await backend.existFile(
+          workspacePath(dir, `${PROJECT_JSON_FILE}.deleted`),
+        );
+        // 휴지통 프로젝트(.deleted 있음) 폴더는 자가치유 대상이 아니다(S2 — 동명 공존 시 부활 방지).
+        if (isWorkspaceBakHealCandidate({ hasJson: hasActive, hasDeleted })) {
+          // 본문도 삭제본도 안 보임 — 쓰기 교체 창(모바일 2단계 rename)이나
+          // 일시 오류일 수 있다. 삭제로 단정해 unregister 하지 않고 이번
+          // 스캔에서만 제외한다(다음 주기에 재평가). 단 2단계 쓰기가 중간에
+          // 끊겨 .bak 만 남은 잔해는 방치 시 영구 미인식이 되므로 자가치유
+          // 후보로 모아 루프 뒤에서 복원한다 — 루프 안에서 즉시 입양하면
+          // 뒤에 나올 동명 활성 폴더가 '_복구N' 으로 개명당할 수 있다.
+          bakHealCandidates.push({ dir, name });
+          successCount++;
+          continue;
+        }
+        successCount++;
+        softOnly.push(name);
+        continue;
+      }
+      // 동명 meta.name 중복 — 나중 폴더가 레지스트리를 덮어써 앞 폴더가 영구
+      // 그림자가 되는 것을 막는다. 뒤에 온 폴더에 '_복구N'을 부여하고 재기록.
+      if (seenNameToDir.has(name) && seenNameToDir.get(name) !== dir) {
+        let n = 2;
+        while (seenNameToDir.has(`${name}_복구${n}`)) n++;
+        const newName = `${name}_복구${n}`;
+        console.warn(
+          `[workspace 스캔] 동명 프로젝트 감지 — ${dir} 을(를) '${newName}' 으로 정규화`,
+        );
+        try {
+          await backend.writeFile(
+            workspacePath(dir, PROJECT_META_FILE),
+            JSON.stringify({ ...meta, name: newName }),
+          );
+        } catch (e) {
+          console.error('동명 정규화 meta 기록 실패(다음 스캔 재시도):', e);
+          this.noteMetaSkip(dir);
+          continue;
+        }
+        name = newName;
+      }
+      seenNameToDir.set(name, dir);
+      successCount++;
+      registerProjectDir(name, dir);
+      activeNames.add(name);
+      names.push(name);
+      folderMap[name] = folder || null;
+      // 폴더 조상 경로 파생(a/b/c → a, a/b, a/b/c)
+      if (folder) {
+        const parts = folder.split('/');
+        let acc = '';
+        for (const p of parts) {
+          acc = acc ? `${acc}/${p}` : p;
+          folderSet.add(acc);
+        }
+      }
+    }
+
+    // 폴더는 있는데 meta 읽기가 전부 실패 = 목록이 아니라 스캔이 죽은 것(일시
+    // IO 장애 가능성) — 빈 목록으로 갈아치우지 않고 오류로 승격해 직전 목록을
+    // 유지한다(update() 가 예외를 전파, runLoop 이 재시도).
+    if (projectDirs.length > 0 && successCount === 0 && metaReadFailures > 0) {
+      throw new Error(
+        `workspace 스캔 실패: 폴더 ${projectDirs.length}개 전부 meta 읽기 실패`,
+      );
+    }
+
+    // 소프트 삭제로만 존재하는 이름은 레지스트리에서 내린다 — 단, 같은 이름의
+    // 활성 프로젝트(다른 물리 폴더)가 있으면 그 등록을 지우지 않는다.
+    for (const name of softOnly) {
+      if (!activeNames.has(name)) unregisterProjectDir(name);
+    }
+
+    // .bak 자가치유(지연 실행): 활성 폴더 전수 파악이 끝난 뒤에만 복원한다.
+    //  - 동명 활성 폴더가 있으면 부활 금지 — 휴지통 정리가 남긴 좀비 잔재일
+    //    가능성이 높고, 복원하면 살아있는 프로젝트가 동명 정규화로 개명당한다
+    //  - 로드 중 이름은 쓰기 교체 창일 수 있어 제외
+    //  - 복원만 하고 입양은 다음 스캔이 자연 수행한다(등록 순서 경합 회피)
+    for (const c of bakHealCandidates) {
+      if (seenNameToDir.has(c.name)) continue;
+      if (this.isLoaded(c.name)) continue;
+      const reg = physicalDirOf(c.name);
+      if (reg !== undefined && reg !== c.dir) continue;
+      await SessionService.restoreProjectJsonFromBak(c.dir);
+    }
+
+    // 빈 폴더(프로젝트 0개)는 meta.folder 에 나타나지 않으므로 folderOrder.json 을
+    // 진실 원천으로 병합한다 — 신 배치에서 빈 폴더 생존의 단일 출처(§A-4).
+    for (const f of this.folderOrderKnown()) folderSet.add(f);
+
+    return { names, folderMap, folderList: Array.from(folderSet) };
+  }
+
+  // folderOrder.json 에 기록된 폴더명(빈 폴더 포함) — scanResources 병합용.
+  private folderOrderKnown(): string[] {
+    return this.folderOrder.slice();
+  }
+
+  // meta.json 소실/파손 폴더 자가치유 — .bak → project.json(name/id) → 폴더명
+  // 유추 순으로 복구를 시도하고, 성공 시 meta.json 을 재기록해 반환한다.
+  // project.json(.deleted 포함)이 아예 없는 폴더는 프로젝트가 아니라고 보고 포기.
+  private async recoverWorkspaceMeta(
+    dir: string,
+  ): Promise<WorkspaceProjectMeta | undefined> {
+    const metaPath = workspacePath(dir, PROJECT_META_FILE);
+    // 1) 모바일 2단계 쓰기가 남긴 .bak
+    try {
+      const meta = JSON.parse(
+        await backend.readFile(`${metaPath}.bak`),
+      ) as WorkspaceProjectMeta;
+      if (meta && typeof meta.name === 'string' && meta.name) {
+        await backend.writeFile(metaPath, JSON.stringify(meta));
+        console.warn(`[workspace 스캔] meta.json 을 .bak 에서 복구: ${dir}`);
+        return meta;
+      }
+    } catch {
+      // An absent or unreadable backup cannot establish metadata; try the project body.
+    }
+    // 2) project.json / project.json.deleted 의 name/id 로 재구성.
+    // 폴더 소속은 직전 스캔의 folderMap(마지막으로 알려진 값)에서 승계한다 —
+    // ''(루트) 하드코딩이면 일시적 meta 읽기 오류만으로 폴더 분류가 영구
+    // 소실된다(meta.json 이 소속의 유일한 영속 출처).
+    // 본문 "읽기 성공 + 파싱 불가"와 "읽기 자체 실패"를 구분해, 후자만으로는
+    // 3단계(이름 유추+id 재발급)로 내려가지 않는다 — 일시 IO 오류로 프로젝트가
+    // 영구 개명되는 것을 막는다(스킵 후 다음 스캔에서 재시도).
+    let bodyReadButUnparsable = false;
+    for (const f of [PROJECT_JSON_FILE, `${PROJECT_JSON_FILE}.deleted`]) {
+      let raw: string;
+      try {
+        raw = await backend.readFile(workspacePath(dir, f));
+      } catch {
+        continue; // 부재 또는 일시 읽기 오류 — 이 파일로는 판단하지 않음
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        bodyReadButUnparsable = true;
+        continue;
+      }
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const name =
+          typeof parsed.name === 'string' && parsed.name
+            ? parsed.name
+            : SessionService.nameFromWorkspaceDir(dir);
+        if (!name) continue;
+        const meta: WorkspaceProjectMeta = {
+          version: 1,
+          id: typeof parsed.id === 'string' && parsed.id ? parsed.id : v4(),
+          name,
+          folder: this.folderMap[name] ?? '',
+        };
+        await backend.writeFile(metaPath, JSON.stringify(meta));
+        console.warn(
+          `[workspace 스캔] meta.json 을 ${f} 에서 재구성: ${dir} → ${name}`,
+        );
+        return meta;
+      }
+      bodyReadButUnparsable = true;
+    }
+    // 3) 본문을 실제로 읽었는데 파싱 불가 — 폴더명에서 이름 유추(최후 수단).
+    // 읽기 자체가 실패한 경우는 여기로 오지 않는다(위 주석 참조).
+    try {
+      if (bodyReadButUnparsable) {
+        const name = SessionService.nameFromWorkspaceDir(dir);
+        if (name) {
+          const meta: WorkspaceProjectMeta = {
+            version: 1,
+            id: v4(),
+            name,
+            folder: this.folderMap[name] ?? '',
+          };
+          await backend.writeFile(metaPath, JSON.stringify(meta));
+          console.warn(
+            `[workspace 스캔] meta.json 을 폴더명에서 재구성: ${dir} → ${name}`,
+          );
+          return meta;
+        }
+      }
+    } catch (error) {
+      console.warn('폴더명으로 재구성한 프로젝트 메타 저장 실패:', dir, error);
+    }
+    return undefined;
+  }
+
+  // 물리 폴더명 '정제이름__짧은id' 에서 표시 이름 후보를 유추한다.
+  private static nameFromWorkspaceDir(dir: string): string {
+    const idx = dir.lastIndexOf('__');
+    const base = idx > 0 ? dir.slice(0, idx) : dir;
+    return base.trim();
+  }
+
+  // project.json 이 없는 폴더의 .bak(모바일 2단계 쓰기 잔해)을 본문으로 복원.
+  // 유효한 JSON 객체일 때만 복원하고 .bak 자체는 남긴다(다음 정상 쓰기가 회전).
+  // 1회성 경로라 직접 backend.writeFile 을 쓴다 — 미등록 프로젝트라
+  // persistService 큐(등록된 리소스 전용)와 경합하지 않는다.
+  private static async restoreProjectJsonFromBak(
+    dir: string,
+  ): Promise<boolean> {
+    try {
+      const raw = await backend.readFile(
+        workspacePath(dir, `${PROJECT_JSON_FILE}.bak`),
+      );
+      const parsed = JSON.parse(raw);
+      // name 문자열까지 요구 — 형태 없는 객체를 본문으로 승격하면 "목록엔
+      // 있는데 열리지 않는" 프로젝트가 되고 진단 탭의 복구 경로도 사라진다.
+      if (
+        !parsed ||
+        typeof parsed !== 'object' ||
+        Array.isArray(parsed) ||
+        typeof parsed.name !== 'string' ||
+        !parsed.name
+      ) {
+        return false;
+      }
+      // 판정 이후 본문이 생겼으면(쓰기 교체 창 통과 등) 복원하지 않는다 —
+      // 최신 본문을 스테일 .bak 으로 되돌리는 역주행 방지.
+      // 휴지통 프로젝트(project.json.deleted 있음)도 복원하지 않는다 — 판정 뒤 그 사이에
+      // 삭제된 경우까지 막는다(2026-10-02 S2, isWorkspaceBakHealCandidate).
+      const nowState = {
+        hasJson: await backend.existFile(workspacePath(dir, PROJECT_JSON_FILE)),
+        hasDeleted: await backend.existFile(
+          workspacePath(dir, `${PROJECT_JSON_FILE}.deleted`),
+        ),
+      };
+      if (!isWorkspaceBakHealCandidate(nowState)) {
+        return false;
+      }
+      await backend.writeFile(workspacePath(dir, PROJECT_JSON_FILE), raw);
+      console.warn(`[workspace 스캔] project.json 을 .bak 에서 복원: ${dir}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // 깨진 프로젝트 폴더(project.json·.deleted 부재) 수동 복구 — 저장소 진단 탭 전용.
+  // .bak 이 유효하면 본문 복원(완전 복구), 없으면 outs/ 씬 폴더에 맞춘 빈 씬
+  // 골격으로 project.json 을 만들어 그 자리에서 입양한다(부분 복구 — 이미지는
+  // 이후 '이미지 복구'가 재연결). 씬 골격을 outs 에 맞추는 것은 UX 만이 아니라
+  // 씬 유실 가드(붕괴 판정: 누락>보유 시 저장 드롭)를 첫 저장이 통과하기 위한
+  // 필수 조건이다. 폴더 이동 없음: 기존 물리 폴더를 그대로 등록한다.
+  async repairBrokenWorkspaceFolder(
+    dir: string,
+  ): Promise<{ name: string; fromBak: boolean }> {
+    if (!isWorkspaceLayout()) {
+      throw new Error('신 배치(workspace)가 아닙니다.');
+    }
+    // 방어 재확인 — 진단 시점과 실행 시점 사이에 상태가 변했을 수 있다.
+    const hasActive = await backend.existFile(
+      workspacePath(dir, PROJECT_JSON_FILE),
+    );
+    const hasDeleted = await backend.existFile(
+      workspacePath(dir, `${PROJECT_JSON_FILE}.deleted`),
+    );
+    if (hasActive || hasDeleted) {
+      throw new Error('이미 정상 또는 휴지통 상태입니다. 다시 진단해 주세요.');
+    }
+    // 이 물리 폴더가 이미 어떤 이름으로든 등록돼 있으면(방금 복구 직후 재클릭
+    // 등) 같은 폴더에 '_복구N' 이름이 이중 등록되어 두 인스턴스가 한 파일을
+    // 번갈아 덮어쓰게 된다 — 진입 자체를 중단한다.
+    if (nameOfPhysicalDir(dir) !== undefined) {
+      throw new Error(
+        '이미 앱이 인식한 프로젝트입니다. 잠시 후 다시 진단해 주세요.',
+      );
+    }
+
+    // 이름 결정: meta.json → 폴더명 유추 → 최후 기본값. 등록/로드 충돌은 '_복구N'.
+    let meta: WorkspaceProjectMeta | undefined;
+    try {
+      const parsed = JSON.parse(
+        await backend.readFile(workspacePath(dir, PROJECT_META_FILE)),
+      );
+      if (parsed && typeof parsed.name === 'string' && parsed.name) {
+        meta = parsed;
+      }
+    } catch {
+      // Manual repair can derive a name from the physical folder when meta is unusable.
+    }
+    let base = meta?.name || SessionService.nameFromWorkspaceDir(dir);
+    if (!base || invalidProjectName(base)) base = '복구된 프로젝트';
+    let name = base;
+    for (
+      let n = 2;
+      physicalDirOf(name) !== undefined || this.isLoaded(name);
+      n++
+    ) {
+      name = `${base}_복구${n}`;
+    }
+
+    // .bak 이 유효(name 보유 객체)하면 그 내용 전체가 복구본(완전 복구).
+    let json: ISession | undefined;
+    try {
+      const raw = await backend.readFile(
+        workspacePath(dir, `${PROJECT_JSON_FILE}.bak`),
+      );
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        typeof parsed.name === 'string' &&
+        parsed.name
+      ) {
+        json = parsed as ISession;
+      }
+    } catch {
+      // Without a readable backup, the explicit repair operation builds a partial skeleton.
+    }
+    const fromBak = !!json;
+    if (!json) {
+      // 부분 복구 골격: outs/ 의 씬 폴더 이름대로 빈 씬을 만든다(폴더가 하나도
+      // 없으면 기본 씬 1개). 항목 판별은 recoverProjectImages 와 동일한 규칙
+      // (점 미포함 = 디렉터리).
+      let scenes: any;
+      try {
+        const entries = await backend.listFiles(workspacePath(dir, 'outs'));
+        const sceneDirs = entries.filter(
+          (e) => !e.startsWith('.') && !e.includes('.'),
+        );
+        if (sceneDirs.length > 0) {
+          scenes = Object.fromEntries(
+            sceneDirs.map((s) => [
+              s,
+              {
+                type: 'scene' as const,
+                name: s,
+                resolution: 'portrait',
+                slots: [[{ prompt: '', characterPrompts: [], id: v4() }]],
+                game: undefined,
+                round: undefined,
+                meta: {},
+                imageMap: [],
+                mains: [],
+              },
+            ]),
+          );
+        }
+      } catch (error) {
+        console.warn(
+          '부분 복구의 이미지 씬 목록을 읽지 못했습니다:',
+          dir,
+          error,
+        );
+      }
+      if (!scenes) scenes = SessionService.defaultScenesJSON();
+      json = {
+        name,
+        version: 1,
+        presets: {},
+        inpaints: {},
+        scenes,
+        library: {},
+        presetShareds: {},
+        characterPresets: {},
+      } as ISession;
+    }
+    json.name = name;
+    if (!json.id) json.id = meta?.id || v4();
+
+    // 기존 물리 폴더를 그 자리에서 등록(이동 없음) + meta 정합화 후 정식
+    // 생성 seam(createFrom)으로 project.json 을 기록·목록 갱신한다.
+    registerProjectDir(name, dir);
+    try {
+      const newMeta: WorkspaceProjectMeta = {
+        version: 1,
+        id: json.id,
+        name,
+        folder: meta?.folder ?? '',
+      };
+      await backend.writeFile(
+        workspacePath(dir, PROJECT_META_FILE),
+        JSON.stringify(newMeta),
+      );
+      await this.createFrom(name, json);
+    } catch (e) {
+      // createFrom 이 attach(로드) 이후 단계(목록 재스캔 등)에서 실패한 경우
+      // 등록을 되돌리면 로드 인스턴스의 경로 해석이 영구 실패하는 좀비가 된다
+      // — 로드까지 갔으면 등록을 유지하고(다음 스캔이 수습), 그 전이면 롤백.
+      if (!this.isLoaded(name)) unregisterProjectDir(name);
+      throw e;
+    }
+    // 부분 복구는 빈 프로젝트와 동일하게 기본 프리셋을 시딩해 바로 생성 가능
+    // 상태로 만든다(.bak 복구본은 프리셋을 이미 갖고 있으므로 제외).
+    if (!fromBak) {
+      const created = await this.get(name);
+      if (created) {
+        try {
+          await importDefaultPresets(created);
+        } catch (e) {
+          console.error('부분 복구 기본 프리셋 시딩 실패(치명적 아님):', e);
+        }
+      }
+    }
+    return { name, fromBak };
+  }
+
+  // 복구까지 실패해 목록에서 스킵된 폴더 — 세션당 1회만 사용자에게 고지한다.
+  private announcedMetaSkips = new Set<string>();
+
+  private noteMetaSkip(dir: string): void {
+    console.warn(
+      `[workspace 스캔] meta.json 읽기/복구 실패 — 폴더 스킵: ${dir}`,
+    );
+    if (this.announcedMetaSkips.has(dir)) return;
+    this.announcedMetaSkips.add(dir);
+    getAppState().pushMessage(
+      `프로젝트 폴더를 목록에 불러오지 못했습니다: ${dir}`,
+    );
+  }
+
+  async loadFavorites() {
+    this.metaLoadFailed.delete('favorites.json');
+    const previousFavorites = this.favorites;
+    try {
+      if (!(await backend.existFile('favorites.json'))) {
+        // Migrate only an acknowledged readable legacy store.
+        if (await backend.existFile('projects/favorites.json')) {
+          const oldStr = await backend.readFile('projects/favorites.json');
+          const arr = JSON.parse(oldStr);
+          if (!Array.isArray(arr))
+            throw new Error('즐겨찾기 형식이 올바르지 않습니다.');
+          this.favorites = new Set(arr);
+          await this.saveFavorites();
+          await backend.renameFile(
+            'projects/favorites.json',
+            'projects/favorites.json.migrated',
+          );
+          return;
+        }
+        this.favorites = new Set();
+        return;
+      }
+      const str = await backend.readFile('favorites.json');
+      const arr = JSON.parse(str);
+      if (!Array.isArray(arr))
+        throw new Error('즐겨찾기 형식이 올바르지 않습니다.');
+      this.favorites = new Set(arr);
+    } catch (error) {
+      // Failed reads never turn an existing library into an empty writable one.
+      this.favorites = previousFavorites;
+      this.markMetaLoadError('favorites.json', error);
+      throw error;
+    }
+  }
+
+  async saveFavorites() {
+    if (this.metaSaveBlocked('favorites.json')) return;
+    await persistService.write(
+      backend,
+      'favorites.json',
+      JSON.stringify([...this.favorites]),
+    );
+    // 전역 저장소 동기화(W6 P2): 다른 창들이 공유 메타를 재로드하도록 알림
+    backend.notifyGlobalStoreChanged('session-meta').catch(() => {});
+  }
+
+  async toggleFavorite(name: string) {
+    if (this.favorites.has(name)) {
+      this.favorites.delete(name);
+    } else {
+      this.favorites.add(name);
+    }
+    await this.saveFavorites();
+    await this.update();
+  }
+
+  isFavorite(name: string): boolean {
+    return this.favorites.has(name);
+  }
+
+  // ===== 폴더 API (중첩 폴더 지원, 실제 디렉토리) =====
+
+  private static folderDirPath(folder: string): string {
+    return projectFolderPath(folder);
+  }
+
+  // 폴더 경로에서 마지막 세그먼트만 추출 (표시용)
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the instance folder API used by view and injected-service callers.
+  folderLeafName(path: string): string {
+    if (typeof path !== 'string') return '';
+    const parts = path.split('/');
+    return parts[parts.length - 1];
+  }
+
+  // 부모 폴더 경로 반환 (없으면 null)
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the instance folder API used by view and injected-service callers.
+  folderParentPath(path: string): string | null {
+    if (typeof path !== 'string') return null;
+    const idx = path.lastIndexOf('/');
+    return idx >= 0 ? path.substring(0, idx) : null;
+  }
+
+  // 특정 폴더의 직계 자식 폴더 목록
+  getChildFolders(parentPath: string): string[] {
+    if (!parentPath) {
+      // 루트: / 가 없는 폴더들
+      return this.folderList.filter((f) => !f.includes('/'));
+    }
+    const prefix = `${parentPath}/`;
+    return this.folderList.filter(
+      (f) => f.startsWith(prefix) && f.indexOf('/', prefix.length) === -1,
+    );
+  }
+
+  // 폴더와 그 하위에 속한 프로젝트 목록
+  getProjectsInFolder(folder: string): string[] {
+    return Object.keys(this.folderMap).filter((n) => {
+      const f = this.folderMap[n];
+      return f === folder || (f !== null && f.startsWith(`${folder}/`));
+    });
+  }
+
+  // 중첩 폴더를 포함한 하위 폴더 목록
+  private getDescendantFolders(folder: string): string[] {
+    const prefix = `${folder}/`;
+    return this.folderList.filter((f) => f === folder || f.startsWith(prefix));
+  }
+
+  async createFolder(requestedFolder: string): Promise<void> {
+    if (typeof requestedFolder !== 'string')
+      throw new Error('올바른 폴더 이름을 입력하세요.');
+    const folder = requestedFolder.trim();
+    if (!folder || folder.startsWith('.')) {
+      throw new Error('올바른 폴더 이름을 입력하세요.');
+    }
+    // 각 세그먼트 검증
+    const segments = folder.split('/');
+    for (const seg of segments) {
+      if (!seg || seg.startsWith('.')) {
+        throw new Error(`폴더 이름은 .으로 시작할 수 없습니다: ${seg}`);
+      }
+    }
+    if (this.folderList.includes(folder)) {
+      throw new Error('이미 존재하는 폴더입니다.');
+    }
+    if (this.resourceList.includes(segments[segments.length - 1])) {
+      throw new Error('같은 이름의 프로젝트가 있어 폴더를 만들 수 없습니다.');
+    }
+    // 신 배치엔 폴더 디렉터리가 없다 — folderOrder.json 을 빈 폴더의 진실 원천으로
+    // 사용한다(scanResources 가 folderList 에 병합). 조상 경로도 함께 기록. §A-4.
+    if (isWorkspaceLayout()) {
+      const toAdd: string[] = [];
+      let cur: string | null = folder;
+      while (cur) {
+        if (!this.folderOrder.includes(cur) && !this.folderList.includes(cur)) {
+          toAdd.unshift(cur);
+        }
+        cur = this.folderParentPath(cur);
+      }
+      for (const f of toAdd) {
+        if (!this.folderOrder.includes(f)) this.folderOrder.push(f);
+      }
+      await this.saveFolderOrder();
+      await this.update();
+      return;
+    }
+    // 부모 폴더가 존재하는지 확인 (루트가 아닌 경우)
+    const parent = this.folderParentPath(folder);
+    if (parent !== null) {
+      // 부모 폴더 경로를 따라가며 없는 중간 폴더는 자동 생성
+      const ancestors: string[] = [];
+      let cur: string | null = parent;
+      while (cur) {
+        if (!this.folderList.includes(cur)) {
+          ancestors.unshift(cur);
+        }
+        cur = this.folderParentPath(cur);
+      }
+      for (const anc of ancestors) {
+        await backend.writeFile(
+          `${SessionService.folderDirPath(anc)}/.keep`,
+          '',
+        );
+      }
+    }
+    await backend.writeFile(
+      `${SessionService.folderDirPath(folder)}/.keep`,
+      '',
+    );
+    await this.update();
+  }
+
+  async renameFolder(oldName: string, requestedName: string): Promise<void> {
+    const newName = requestedName.trim();
+    if (!newName || newName.startsWith('.')) {
+      throw new Error('올바른 폴더 이름을 입력하세요.');
+    }
+    if (!this.folderList.includes(oldName)) {
+      throw new Error('폴더를 찾을 수 없습니다.');
+    }
+    if (oldName === newName) return;
+
+    // 새 경로가 기존 폴더와 충돌하는지 확인
+    if (this.folderList.includes(newName)) {
+      throw new Error('이미 존재하는 폴더입니다.');
+    }
+    if (this.resourceList.includes(this.folderLeafName(newName))) {
+      throw new Error('같은 이름의 프로젝트가 있습니다.');
+    }
+
+    // 리네임 범위 결정: oldName이 부모 폴더면 자식들도 경로 변경
+    const oldPrefix = `${oldName}/`;
+    const affectedProjects = Object.keys(this.folderMap).filter((n) => {
+      const f = this.folderMap[n];
+      return f === oldName || (f !== null && f.startsWith(oldPrefix));
+    });
+    const affectedFolders = this.folderList.filter(
+      (f) => f === oldName || f.startsWith(oldPrefix),
+    );
+
+    if (isWorkspaceLayout()) {
+      // 신 배치: 물리 폴더 이동 없음 — 영향 프로젝트의 meta.folder + folderMap 갱신.
+      for (const [name, f] of Object.entries(this.folderMap)) {
+        let nf: string | null = null;
+        if (f === oldName) nf = newName;
+        else if (f !== null && f.startsWith(oldPrefix))
+          nf = newName + f.substring(oldName.length);
+        if (nf !== null) {
+          await this.updateWorkspaceMeta(name, { folder: nf });
+          this.folderMap[name] = nf;
+        }
+      }
+    } else {
+      await this.withLock(affectedProjects, async () => {
+        // busy 전환 전에 큐에 들어간 각 프로젝트 파일의 잔여 쓰기를 먼저 소진
+        // (디렉터리 이동 뒤에 옛 경로로 파일이 되살아나는 것을 방지)
+        for (const n of affectedProjects) {
+          await persistService.flushPath(this.getPath(n)).catch(() => {});
+        }
+        await backend.renameDir(
+          SessionService.folderDirPath(oldName),
+          SessionService.folderDirPath(newName),
+        );
+        // 폴더맵 즉시 반영: oldName → newName, oldName/child → newName/child
+        for (const [name, f] of Object.entries(this.folderMap)) {
+          if (f === oldName) {
+            this.folderMap[name] = newName;
+          } else if (f !== null && f.startsWith(oldPrefix)) {
+            this.folderMap[name] = newName + f.substring(oldName.length);
+          }
+        }
+      });
+    }
+
+    // 폴더 색상 마이그레이션
+    for (const f of affectedFolders) {
+      const newKey = newName + f.substring(oldName.length);
+      if (this.folderColors[f]) {
+        this.folderColors[newKey] = this.folderColors[f];
+        delete this.folderColors[f];
+      }
+    }
+    await this.saveFolderColors();
+
+    // 폴더 순서 마이그레이션
+    for (let i = 0; i < this.folderOrder.length; i++) {
+      const f = this.folderOrder[i];
+      if (f === oldName) {
+        this.folderOrder[i] = newName;
+      } else if (f.startsWith(oldPrefix)) {
+        this.folderOrder[i] = newName + f.substring(oldName.length);
+      }
+    }
+    await this.saveFolderOrder();
+
+    // 폴더 기본 템플릿 키 마이그레이션 (프로젝트 상속 안 A — 캐스케이드 편승)
+    await templateService.renameFolder(oldName, newName);
+
+    await this.update();
+  }
+
+  // 비파괴적 삭제: 안의 프로젝트는 루트(미분류)로 옮기고 폴더만 제거한다.
+  // 하위 폴더가 있으면 먼저 자식 폴더들을 삭제한다.
+  async deleteFolder(folder: string): Promise<void> {
+    if (!this.folderList.includes(folder)) {
+      throw new Error('폴더를 찾을 수 없습니다.');
+    }
+    // 하위 폴더 먼저 삭제 (깊은 순서로)
+    const descendants = this.getDescendantFolders(folder)
+      .filter((f) => f !== folder)
+      .sort((a, b) => b.split('/').length - a.split('/').length);
+    for (const child of descendants) {
+      await this.deleteFolder(child);
+    }
+    // 해당 폴더 및 하위 폴더에 있는 프로젝트를 루트로
+    const projectsInFolder = Object.keys(this.folderMap).filter((n) => {
+      const f = this.folderMap[n];
+      return f === folder || (f !== null && f.startsWith(`${folder}/`));
+    });
+    for (const name of projectsInFolder) {
+      await this.moveToFolder(name, null);
+    }
+    // moveToFolder 는 다른 창에서 열린 프로젝트면 조용히 반환한다. 그대로 진행하면 구 배치는
+    // 아래 deleteDir 가 그 프로젝트 파일까지 지운다 — 남은 프로젝트가 있으면 폴더를 지우지 않는다(2026-10-02 B2).
+    const remaining = this.getProjectsInFolder(folder);
+    if (remaining.length > 0) {
+      throw new Error(
+        `미분류로 옮기지 못한 프로젝트가 있어 폴더를 삭제하지 않았습니다(다른 창에서 열려 있을 수 있습니다): ${remaining.join(', ')}`,
+      );
+    }
+    // 신 배치엔 폴더 디렉터리가 없다 — 물리 삭제는 건너뛰고 사이드카(색상/순서)만 정리.
+    if (!isWorkspaceLayout()) {
+      await backend.deleteDir(SessionService.folderDirPath(folder));
+    }
+    // 폴더 색상 정리
+    if (this.folderColors[folder]) {
+      delete this.folderColors[folder];
+      await this.saveFolderColors();
+    }
+    // 폴더 순서 정리
+    if (this.folderOrder.includes(folder)) {
+      this.folderOrder = this.folderOrder.filter((f) => f !== folder);
+      await this.saveFolderOrder();
+    }
+    // 폴더 기본 템플릿 지정 정리 (프로젝트 상속 안 A — 캐스케이드 편승)
+    await templateService.removeFolder(folder);
+    await this.update();
+  }
+
+  // 프로젝트를 폴더로 이동 (null = 루트/미분류). 실제 .json 파일을 옮긴다.
+  // 다른 창에서 열려 있는 프로젝트의 경로/존재를 바꾸는 작업 차단 (W6 P1).
+  // 열려 있는 창의 in-memory 세션과 디스크가 어긋나 저장 시 유실로 이어질 수 있다.
+  // 모바일/단일 창은 backend 기본 구현이 {locked:false}라 항상 통과.
+  // public: 씬 제거/이름변경 등 다른 서비스(TrashService)·모듈 함수(renameScene)도
+  // 같은 창 간 락 가드를 재사용한다.
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Other services share this instance lock guard; keep their public contract.
+  async guardCrossWindowLock(
+    name: string,
+    actionLabel: string,
+  ): Promise<boolean> {
+    try {
+      const q = await backend.queryProjectLock(name);
+      if (q.locked && !q.mine) {
+        // 안내 토스트는 포커스가 넘어가는 소유 창에 표시(요청 창에 남기면
+        // 돌아왔을 때 낡은 메시지만 남음 — 2026-07-17 실기 피드백).
+        backend
+          .focusProjectLockOwner(
+            name,
+            `"${name}" 프로젝트가 이 창에서 열려 있어 다른 창의 ${actionLabel} 요청을 차단했습니다`,
+          )
+          .catch(() => {});
+        return false;
+      }
+    } catch (e) {
+      console.error('프로젝트 락 조회 실패:', e);
+      throw e;
+    }
+    return true;
+  }
+
+  async moveToFolder(name: string, targetFolder: string | null): Promise<void> {
+    if (!(await this.guardCrossWindowLock(name, '폴더 이동'))) {
+      throw new Error('다른 창에서 사용 중인 프로젝트를 이동할 수 없습니다.');
+    }
+    const current = this.folderMap[name] ?? null;
+    if (current === targetFolder) return;
+    if (targetFolder !== null) {
+      if (!this.folderList.includes(targetFolder)) {
+        throw new Error('대상 폴더가 없습니다.');
+      }
+    }
+    // 신 배치: 폴더는 meta.json 의 논리 필드 — 물리 이동 없이 필드+맵만 갱신.
+    if (isWorkspaceLayout()) {
+      await this.updateWorkspaceMeta(name, { folder: targetFolder ?? '' });
+      this.folderMap[name] = targetFolder;
+      await this.update();
+      return;
+    }
+    const srcPath = this.getPath(name);
+    await this.withLock([name], async () => {
+      // busy 전환 전에 큐에 들어간 옛 경로 쓰기를 먼저 소진
+      await persistService.flushPath(srcPath).catch(() => {});
+      const destPath = targetFolder
+        ? `${this.resourceDir}/${targetFolder}/${name}.json`
+        : `${this.resourceDir}/${name}.json`;
+      await backend.renameFile(srcPath, destPath);
+      this.folderMap[name] = targetFolder;
+    });
+    await this.update();
+  }
+
+  // ===== 폴더 복제 (재귀적: 하위 폴더/프로젝트 모두 복제) =====
+  async cloneFolder(
+    sourceFolder: string,
+    requestedFolder: string,
+    withImages: boolean = false,
+  ): Promise<void> {
+    if (!this.folderList.includes(sourceFolder)) {
+      throw new Error('원본 폴더를 찾을 수 없습니다.');
+    }
+    const targetFolder = requestedFolder.trim();
+    if (!targetFolder || targetFolder.startsWith('.')) {
+      throw new Error('올바른 폴더 이름을 입력하세요.');
+    }
+    if (this.folderList.includes(targetFolder)) {
+      throw new Error('이미 존재하는 폴더입니다.');
+    }
+
+    // 재귀적으로 모든 프로젝트 수집 (하위 폴더 포함)
+    const projectNames = this.getProjectsInFolder(sourceFolder);
+    if (projectNames.length === 0) {
+      throw new Error('원본 폴더에 복제할 프로젝트가 없습니다.');
+    }
+
+    // 하위 폴더 구조 파악 및 대상에 미리 생성
+    const subFolders = new Set<string>();
+    for (const name of projectNames) {
+      const f = this.folderMap[name];
+      if (f && f !== sourceFolder && f.startsWith(`${sourceFolder}/`)) {
+        subFolders.add(f);
+      }
+    }
+    // 상위부터 정렬해 createFolder가 부모→자식 순으로 생성되도록
+    const sortedSubFolders = Array.from(subFolders).sort();
+
+    // 대상 루트 폴더 생성
+    await this.createFolder(targetFolder);
+
+    // 하위 폴더 생성 (경로 치환)
+    for (const sub of sortedSubFolders) {
+      const rel = sub.substring(sourceFolder.length + 1);
+      const targetSub = `${targetFolder}/${rel}`;
+      if (!this.folderList.includes(targetSub)) {
+        await this.createFolder(targetSub);
+      }
+    }
+
+    const failures: string[] = [];
+    for (const origName of projectNames) {
+      const session = await this.get(origName);
+      if (!session) {
+        failures.push(`${origName}: 프로젝트를 읽을 수 없습니다.`);
+        continue;
+      }
+
+      const existing = this.list();
+      let newName = origName;
+      if (existing.includes(newName)) {
+        let i = 2;
+        while (existing.includes(`${origName} (${i})`)) {
+          i++;
+        }
+        newName = `${origName} (${i})`;
+      }
+
+      // 대상 하위 폴더 결정
+      const origFolder = this.folderMap[origName];
+      const destFolder =
+        origFolder && origFolder !== sourceFolder
+          ? targetFolder + origFolder.substring(sourceFolder.length)
+          : targetFolder;
+
+      try {
+        const proj = await this.exportSessionShallow(session);
+        await this.importSessionShallow(proj, newName);
+        await this.moveToFolder(newName, destFolder);
+
+        // 이미지 포함 복사 (휴지통 제외). projectPath 경유 — 신 배치 활성 시
+        // 원본/대상 모두 각자의 물리 폴더로 분기(대상은 importSessionShallow 가
+        // 이미 등록 완료).
+        if (withImages) {
+          const imgCopyDirs: { src: string; dst: string }[] = [];
+          // outs/<project>/<scene>/  +  inpaints/<project>/<scene>/
+          for (const dirPrefix of ['outs', 'inpaints'] as const) {
+            const sceneDirs = await backend.listFiles(
+              projectPath(dirPrefix, origName),
+            );
+            for (const sd of sceneDirs) {
+              if (sd === '.trash' || sd.startsWith('.')) continue;
+              imgCopyDirs.push({
+                src: projectPath(dirPrefix, origName, sd),
+                dst: projectPath(dirPrefix, newName, sd),
+              });
+            }
+          }
+          // inpaint_orgs, inpaint_masks, vibes, references
+          for (const flatDir of [
+            'inpaint_orgs',
+            'inpaint_masks',
+            'vibes',
+            'references',
+          ] as const) {
+            const files = await backend.listFiles(
+              projectPath(flatDir, origName),
+            );
+            for (const f of files) {
+              if (f.startsWith('.')) continue;
+              await backend.copyFile(
+                projectPath(flatDir, origName, f),
+                projectPath(flatDir, newName, f),
+              );
+            }
+          }
+          // scene/inpaint directories
+          for (const { src, dst } of imgCopyDirs) {
+            const files = await backend.listFiles(src);
+            for (const f of files) {
+              if (f.startsWith('.')) continue;
+              await backend.copyFile(`${src}/${f}`, `${dst}/${f}`);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('폴더 복제 중 프로젝트 실패:', origName, error);
+        failures.push(
+          `${origName}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    // Some files may already be durable. Keep them available for inspection/retry,
+    // but do not present a partial copy as a completed folder duplication.
+    if (failures.length > 0) {
+      throw new Error(
+        `폴더 복제를 완료하지 못했습니다: ${failures.join('; ')}`,
+      );
+    }
+  }
+
+  // ===== 폴더 색상 (사이드카: folderColors.json) =====
+  // 폴더 이름 → 색상(hex 문자열). 미지정 폴더는 undefined.
+  private folderColors: Record<string, string> = {};
+
+  async loadFolderColors() {
+    this.metaLoadFailed.delete('folderColors.json');
+    if (!(await backend.existFile('folderColors.json'))) {
+      this.folderColors = {};
+      return;
+    }
+    try {
+      const str = await backend.readFile('folderColors.json');
+      this.folderColors = JSON.parse(str) || {};
+    } catch (e) {
+      this.folderColors = {};
+      this.markMetaLoadError('folderColors.json', e);
+    }
+  }
+
+  async saveFolderColors() {
+    if (this.metaSaveBlocked('folderColors.json')) return;
+    await persistService.write(
+      backend,
+      'folderColors.json',
+      JSON.stringify(this.folderColors),
+    );
+    // 전역 저장소 동기화(W6 P2)
+    backend.notifyGlobalStoreChanged('session-meta').catch(() => {});
+  }
+
+  getFolderColor(folder: string): string | undefined {
+    return this.folderColors[folder];
+  }
+
+  // ===== 폴더 정렬 순서 (사이드카: folderOrder.json) =====
+  // 드로어/그리드가 공유하는 사용자 지정 폴더 순서.
+  private folderOrder: string[] = [];
+
+  async loadFolderOrder() {
+    this.metaLoadFailed.delete('folderOrder.json');
+    if (!(await backend.existFile('folderOrder.json'))) {
+      this.folderOrder = [];
+      return;
+    }
+    try {
+      const str = await backend.readFile('folderOrder.json');
+      this.folderOrder = JSON.parse(str) || [];
+    } catch (e) {
+      this.folderOrder = [];
+      this.markMetaLoadError('folderOrder.json', e);
+    }
+  }
+
+  async saveFolderOrder() {
+    if (this.metaSaveBlocked('folderOrder.json')) return;
+    await persistService.write(
+      backend,
+      'folderOrder.json',
+      JSON.stringify(this.folderOrder),
+    );
+    // 전역 저장소 동기화(W6 P2)
+    backend.notifyGlobalStoreChanged('session-meta').catch(() => {});
+  }
+
+  // 저장된 순서를 우선 적용하고, 순서에 없는 폴더는 뒤에 자연정렬로 덧붙인다.
+  getOrderedFolders(): string[] {
+    const all = this.folderList.slice();
+    const known = this.folderOrder.filter((f) => all.includes(f));
+    const knownSet = new Set(known);
+    const rest = all
+      .filter((f) => !knownSet.has(f))
+      .sort((a, b) =>
+        a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }),
+      );
+    return [...known, ...rest];
+  }
+
+  async setFolderOrder(order: string[]) {
+    // 실제 존재하는 폴더만, 중복 제거하여 저장 + 빠진 폴더는 뒤에 덧붙임
+    const all = new Set(this.folderList);
+    const seen = new Set<string>();
+    const cleaned: string[] = [];
+    for (const f of order) {
+      if (all.has(f) && !seen.has(f)) {
+        seen.add(f);
+        cleaned.push(f);
+      }
+    }
+    for (const f of this.folderList) if (!seen.has(f)) cleaned.push(f);
+    this.folderOrder = cleaned;
+    await this.saveFolderOrder();
+    this.dispatchEvent(new CustomEvent('listupdated', {}));
+  }
+
+  async setFolderColor(folder: string, color: string | null) {
+    if (color) this.folderColors[folder] = color;
+    else delete this.folderColors[folder];
+    await this.saveFolderColors();
+    // listupdated 디스패치로 드로어/브라우저가 즉시 재렌더되도록 한다.
+    this.dispatchEvent(new CustomEvent('listupdated', {}));
+  }
+
+  // 북마크 기능
+  private bookmarkData: {
+    scenes: Record<string, { name: string; type: string }>;
+    images: Record<string, string>;
+  } = { scenes: {}, images: {} };
+
+  async loadBookmarks() {
+    this.metaLoadFailed.delete('bookmarks.json');
+    if (!(await backend.existFile('bookmarks.json'))) {
+      this.bookmarkData = { scenes: {}, images: {} };
+      return;
+    }
+    try {
+      const str = await backend.readFile('bookmarks.json');
+      const data = JSON.parse(str);
+      this.bookmarkData = {
+        scenes: data?.scenes || {},
+        images: data?.images || {},
+      };
+    } catch (e) {
+      this.bookmarkData = { scenes: {}, images: {} };
+      this.markMetaLoadError('bookmarks.json', e);
+    }
+  }
+
+  async saveBookmarks() {
+    if (this.metaSaveBlocked('bookmarks.json')) return;
+    await persistService.write(
+      backend,
+      'bookmarks.json',
+      JSON.stringify(this.bookmarkData),
+    );
+    this.dispatchEvent(new CustomEvent('bookmark-updated'));
+  }
+
+  getSceneBookmark(
+    projectName: string,
+  ): { name: string; type: string } | undefined {
+    return this.bookmarkData.scenes[projectName];
+  }
+
+  isSceneBookmarked(projectName: string, sceneName: string): boolean {
+    return this.bookmarkData.scenes[projectName]?.name === sceneName;
+  }
+
+  async toggleSceneBookmark(
+    projectName: string,
+    sceneName: string,
+    sceneType: string,
+  ) {
+    const current = this.bookmarkData.scenes[projectName];
+    if (current?.name === sceneName) {
+      delete this.bookmarkData.scenes[projectName];
+    } else {
+      this.bookmarkData.scenes[projectName] = {
+        name: sceneName,
+        type: sceneType,
+      };
+    }
+    await this.saveBookmarks();
+  }
+
+  getImageBookmark(projectName: string, sceneName: string): string | undefined {
+    return this.bookmarkData.images[`${projectName}:${sceneName}`];
+  }
+
+  isImageBookmarked(
+    projectName: string,
+    sceneName: string,
+    imageFilename: string,
+  ): boolean {
+    return (
+      this.bookmarkData.images[`${projectName}:${sceneName}`] === imageFilename
+    );
+  }
+
+  async toggleImageBookmark(
+    projectName: string,
+    sceneName: string,
+    imageFilename: string,
+  ) {
+    const key = `${projectName}:${sceneName}`;
+    if (this.bookmarkData.images[key] === imageFilename) {
+      delete this.bookmarkData.images[key];
+    } else {
+      this.bookmarkData.images[key] = imageFilename;
+    }
+    await this.saveBookmarks();
+  }
+
+  // ===== 썸네일 캐시 (사이드카: thumbnails.json) =====
+  // 프로젝트 카드 썸네일을 (씬, 파일명) 참조로 캐시해, 탐색 시 세션 풀로딩을 피한다.
+  private thumbnailData: Record<string, { scene: string; image: string }> = {};
+
+  private thumbnailSaveTimer: any = null;
+
+  async loadThumbnails() {
+    this.metaLoadFailed.delete('thumbnails.json');
+    if (!(await backend.existFile('thumbnails.json'))) {
+      this.thumbnailData = {};
+      return;
+    }
+    try {
+      const str = await backend.readFile('thumbnails.json');
+      this.thumbnailData = JSON.parse(str) || {};
+    } catch (e) {
+      this.thumbnailData = {};
+      this.markMetaLoadError('thumbnails.json', e);
+    }
+  }
+
+  async saveThumbnails() {
+    if (this.metaSaveBlocked('thumbnails.json')) return;
+    await persistService.write(
+      backend,
+      'thumbnails.json',
+      JSON.stringify(this.thumbnailData),
+    );
+  }
+
+  private scheduleThumbnailSave() {
+    if (this.thumbnailSaveTimer) clearTimeout(this.thumbnailSaveTimer);
+    this.thumbnailSaveTimer = setTimeout(() => {
+      this.saveThumbnails().catch(() => {});
+    }, 1000);
+  }
+
+  getThumbnailRef(
+    project: string,
+  ): { scene: string; image: string } | undefined {
+    return this.thumbnailData[project];
+  }
+
+  setThumbnailRef(project: string, scene: string, image: string) {
+    this.thumbnailData[project] = { scene, image };
+    this.scheduleThumbnailSave();
+  }
+
+  clearThumbnailRef(project: string) {
+    if (project in this.thumbnailData) {
+      delete this.thumbnailData[project];
+      this.scheduleThumbnailSave();
+    }
+  }
+
+  private static async firstOutputImage(
+    project: string,
+    sceneName: string,
+  ): Promise<string | undefined> {
+    try {
+      const files = await backend.listFiles(
+        projectPath('outs', project, sceneName),
+      );
+      return (files || []).find(isOutputImageFile);
+    } catch {
+      return undefined;
+    }
+  }
+
+  // 캐시 미스 시 1회 해석. 로드된 세션이면 인메모리 정보를, 아니면 원본 JSON을
+  // 직접 읽어(메모리에 상주시키지 않음) 첫 씬의 대표/첫 이미지를 찾는다.
+  async resolveThumbnail(
+    name: string,
+  ): Promise<{ scene: string; image: string } | undefined> {
+    const loaded = this.getLoaded(name);
+    if (loaded) {
+      const scenes = Array.from(loaded.scenes.values());
+      if (!scenes.length) return undefined;
+      const scene = scenes[0];
+      if (scene.mains && scene.mains.length) {
+        return { scene: scene.name, image: scene.mains[0] };
+      }
+      const images = imageService.getOutputs(loaded, scene);
+      if (images && images.length) {
+        return { scene: scene.name, image: images[0] };
+      }
+      const png = await SessionService.firstOutputImage(name, scene.name);
+      return png ? { scene: scene.name, image: png } : undefined;
+    }
+    try {
+      const raw = JSON.parse(await backend.readFile(this.getPath(name)));
+      const sceneKeys = Object.keys(raw.scenes || {});
+      if (!sceneKeys.length) return undefined;
+      const sceneName = sceneKeys[0];
+      const mains = raw.scenes[sceneName]?.mains || [];
+      if (mains.length) return { scene: sceneName, image: mains[0] };
+      const png = await SessionService.firstOutputImage(name, sceneName);
+      return png ? { scene: sceneName, image: png } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // 종료 시: 로드된(작업한) 세션의 자동 썸네일만 재해석해 갱신
+  async refreshLoadedThumbnails() {
+    for (const name of this.loadedNames()) {
+      try {
+        const ref = await this.resolveThumbnail(name);
+        if (ref) this.thumbnailData[name] = ref;
+      } catch (error) {
+        console.warn('프로젝트 썸네일 갱신 실패(기존 캐시 유지):', name, error);
+      }
+    }
+  }
+
+  async init() {
+    // 신 배치 루트 보장(.keep): 모바일은 없는 디렉터리의 목록 조회가 예외라
+    // workspace/ 부재만으로 초기 스캔이 통째로 실패한다 — 구 배치 projects/.keep
+    // 과 같은 이유(ResourceSyncService.init 주석 참조). 점 파일이라 스캔은 무시.
+    if (isWorkspaceLayout()) {
+      try {
+        if (!(await backend.existFile(`${WORKSPACE_ROOT}/.keep`))) {
+          await backend.writeFile(`${WORKSPACE_ROOT}/.keep`, '');
+        }
+      } catch (e) {
+        console.error('workspace 루트 준비 실패:', e);
+      }
+    }
+    // 사전 로드(즐겨찾기/북마크/휴지통 등)가 어떤 이유로 실패하더라도
+    // super.init()(초기 스캔 + 백그라운드 진입 시 강제 저장 훅)에는
+    // 반드시 도달해야 한다. 여기서 죽으면 앱은 멀쩡해 보여도 이후 편집이
+    // 디스크에 저장되지 않아 통째로 유실된다.
+    try {
+      await this.loadFavorites();
+      await this.loadBookmarks();
+      await this.loadThumbnails();
+      await this.loadFolderColors();
+      await this.loadFolderOrder();
+      await trashService.loadTrash();
+
+      // 만료 프로젝트 감지 → UI 다이얼로그에 전달 (가볍게 체크만)
+      const expired = await trashService.getExpiredProjects();
+      if (expired.length > 0) {
+        getAppState().pendingExpiredProjects = expired;
+      }
+
+      // autoCleanup은 앱 시작을 블로킹하지 않도록 지연 실행
+      setTimeout(() => {
+        trashService.autoCleanup().catch((e) => {
+          console.error('휴지통 자동 정리 실패:', e);
+        });
+      }, 10000);
+    } catch (e) {
+      console.error('세션 서비스 사전 로드 실패(초기화는 계속 진행):', e);
+    }
+
+    await super.init();
+  }
+
+  async delete(name: string) {
+    // 다른 창에서 열려 있으면 삭제 금지 (W6 P1 — 토스트+소유 창 포커스)
+    if (!(await this.guardCrossWindowLock(name, '삭제'))) return;
+    // 미로드 프로젝트(이번 실행에서 열지 않은 것)는 기본 delete 가 아무것도 하지 않고 반환해,
+    // 파일은 남는데 아래 휴지통 기록·즐겨찾기 정리만 실행되던 결함(2026-10-02 B2)이 있었다.
+    // 먼저 불러오고, 불러오지 못하면 어떤 부수 효과도 내기 전에 실패로 알린다.
+    if (!this.isLoaded(name)) {
+      await this.get(name);
+      if (!this.isLoaded(name)) {
+        throw new Error(
+          `프로젝트 "${name}"을(를) 불러오지 못해 삭제하지 않았습니다.`,
+        );
+      }
+    }
+    // 구 배치: 같은 이름의 기존 휴지통 항목을 먼저 정리 (동명 프로젝트 재삭제 시 충돌/덮어쓰기 방지).
+    // 이렇게 해야 super.delete 의 .json → .deleted rename 대상이 비어 있어 플랫폼 무관하게 안전.
+    // 신 배치(2026-10-02 S2): 프로젝트마다 고유 폴더(이름__id)라 .deleted 가 폴더별로 따로 있어
+    // 충돌하지 않는다 — 동명 휴지통 항목을 지우지 않고 공존시킨다. 휴지통 기록에는 이
+    // 폴더를 함께 남겨(moveProjectToTrash) 목록·복원·영구 삭제가 폴더 단위로 대상을 고른다.
+    const trashDir = isWorkspaceLayout() ? physicalDirOf(name) : undefined;
+    if (!isWorkspaceLayout()) {
+      await trashService.purgeDeletedProject(name);
+    }
+    // 실제 삭제(파일 rename)를 먼저 수행 — 여기서 실패하면 프로젝트가 남으므로
+    // 즐겨찾기/북마크/썸네일 등 메타데이터도 건드리지 않고 그대로 보존한다.
+    await super.delete(name);
+    // 신 배치: 소프트 삭제(project.json→project.json.deleted)로 물리 폴더는
+    // 남지만, 레지스트리에서는 내려 동명 새 프로젝트가 삭제 폴더를 재사용하지
+    // 않게 한다(복원 시 TrashService 가 다시 등록). 스펙 §A-4.
+    if (isWorkspaceLayout()) {
+      unregisterProjectDir(name);
+    }
+    // 이하 메타데이터 정리 (프로젝트는 이미 삭제 완료)
+    this.favorites.delete(name);
+    await this.saveFavorites();
+    // 썸네일 캐시 정리
+    this.clearThumbnailRef(name);
+    // 북마크 정리 (hadSceneBookmarks: 삭제 전에 존재 여부를 기억해야 저장 조건이 맞음)
+    const hadSceneBookmarks = !!this.bookmarkData.scenes[name];
+    delete this.bookmarkData.scenes[name];
+    const keysToDelete = Object.keys(this.bookmarkData.images).filter((k) =>
+      k.startsWith(`${name}:`),
+    );
+    keysToDelete.forEach((k) => delete this.bookmarkData.images[k]);
+    if (keysToDelete.length > 0 || hadSceneBookmarks) {
+      await this.saveBookmarks();
+    }
+    // 휴지통에 삭제 시점 기록 (신 배치는 폴더별 시각도 함께)
+    await trashService.moveProjectToTrash(name, trashDir);
+  }
+
+  // 프로젝트 이름변경의 단일 관문 — 이미지 6루트 이동 → 세션 json·메타 이관.
+  // 과거에는 호출부(BackupService·ProjectDrawer)가 onRenameSession 을 각자 선행
+  // 호출해야 했고, 빼먹으면 이미지 루트가 통째로 고아가 됐다(트랙1 조사 §1-2).
+  // 이제 이름변경은 반드시 이 메서드만 사용할 것.
+  async renameProject(oldName: string, newName: string): Promise<void> {
+    // 신 배치: 물리 폴더는 불변(정제이름__id) — 이미지 6루트 이동도 json rename 도
+    // 없다. meta.json name 갱신 + 레지스트리 키 이관 + 사이드카 키 이관 + 메모리
+    // 갱신뿐. onRenameSession(이미지 이동)은 호출하지 않는다. 스펙 §A-4.
+    if (isWorkspaceLayout()) {
+      await this.renameProjectWorkspace(oldName, newName);
+      return;
+    }
+    // 1) 이미지 루트 이동 — 실패 시 내부에서 롤백 후 throw (원 상태 보존)
+    await imageService.onRenameSession(oldName, newName);
+    // 2) 세션 json + 메타 이관 — 실패 시 이미지 루트를 되돌려 갈라짐 방지
+    try {
+      await this.rename(oldName, newName);
+    } catch (e) {
+      try {
+        await imageService.onRenameSession(newName, oldName);
+      } catch (e2) {
+        console.error(
+          '이름변경 역롤백 실패 — 이미지가 새 이름에 남아 있을 수 있음:',
+          oldName,
+          newName,
+          e2,
+        );
+      }
+      throw e;
+    }
+  }
+
+  // 신 배치 이름변경: 물리 이동 없음. meta.json name 갱신 + 레지스트리 키 이관 +
+  // 메모리(entries/folderMap/reaction/세션 name) 갱신 + 사이드카 키 이관.
+  // json 파일은 workspace/<dir>/project.json 그대로(물리 폴더 불변) — 경로가
+  // 바뀌지 않으므로 flushPath/파일 rename 이 불필요하다.
+  private async renameProjectWorkspace(
+    oldName: string,
+    newName: string,
+  ): Promise<void> {
+    const e = this.entries.get(oldName);
+    if (!e?.instance) throw new Error('Resource not found');
+    if (this.entries.get(newName)?.instance)
+      throw new Error('Resource already exists');
+    if (physicalDirOf(oldName) === undefined) {
+      throw new Error(
+        `신 배치 이름변경 대상 미등록: ${JSON.stringify(oldName)}`,
+      );
+    }
+    await this.withLock([oldName, newName], async () => {
+      // meta.json name 갱신(폴더는 유지). 실패 시 여기서 throw → 아래 메모리 갱신
+      // 미실행으로 원 상태 보존.
+      await this.updateWorkspaceMeta(oldName, { name: newName });
+      renameProjectDirKey(oldName, newName);
+      // 메모리 이동 (base rename 의 파일 rename 제외판)
+      this.entries.delete(oldName);
+      this.entries.set(newName, e);
+      e.instance!.name = newName;
+      e.dispose?.();
+      e.dispose = this.watch(newName, e.instance!);
+      if (oldName in this.folderMap) {
+        this.folderMap[newName] = this.folderMap[oldName];
+        delete this.folderMap[oldName];
+      }
+    });
+    await this.migrateRenameSidecars(oldName, newName);
+    await this.update();
+  }
+
+  async rename(oldName: string, newName: string) {
+    // 다른 창에서 열려 있으면 이름변경 금지 (W6 P1 — 토스트+소유 창 포커스)
+    if (!(await this.guardCrossWindowLock(oldName, '이름 변경'))) return;
+    // 실제 이름변경(파일 rename)을 먼저 수행 — 여기서 실패하면 이름이 그대로이므로
+    // 즐겨찾기/북마크/썸네일 등 메타데이터도 건드리지 않고 그대로 보존한다.
+    await super.rename(oldName, newName);
+    await this.migrateRenameSidecars(oldName, newName);
+  }
+
+  // 이름변경 시 사이드카(즐겨찾기·썸네일·북마크·휴지통·용량·템플릿) 키 이관.
+  // 구/신 배치 공통 — 사이드카는 논리 이름(키) 기준이라 배치와 무관하다.
+  private async migrateRenameSidecars(oldName: string, newName: string) {
+    // 실행 중 예약의 씬 통계 키 이관 — 안 하면 씬 카드 예약 배지가 0으로 사라짐
+    taskQueueService.onRenameProject(oldName, newName);
+    // 이하 메타데이터 마이그레이션 (이름변경은 이미 완료)
+    if (this.favorites.has(oldName)) {
+      this.favorites.delete(oldName);
+      this.favorites.add(newName);
+      await this.saveFavorites();
+    }
+    // 썸네일 캐시 마이그레이션
+    if (this.thumbnailData[oldName]) {
+      this.thumbnailData[newName] = this.thumbnailData[oldName];
+      delete this.thumbnailData[oldName];
+      this.scheduleThumbnailSave();
+    }
+    // 북마크 마이그레이션
+    let bmChanged = false;
+    if (this.bookmarkData.scenes[oldName]) {
+      this.bookmarkData.scenes[newName] = this.bookmarkData.scenes[oldName];
+      delete this.bookmarkData.scenes[oldName];
+      bmChanged = true;
+    }
+    const imageKeys = Object.keys(this.bookmarkData.images).filter((k) =>
+      k.startsWith(`${oldName}:`),
+    );
+    imageKeys.forEach((k) => {
+      const sceneName = k.substring(oldName.length + 1);
+      this.bookmarkData.images[`${newName}:${sceneName}`] =
+        this.bookmarkData.images[k];
+      delete this.bookmarkData.images[k];
+      bmChanged = true;
+    });
+    if (bmChanged) await this.saveBookmarks();
+    // 휴지통 씬 키('<이름>:<씬>')·프로젝트 항목 이관 — 이미지 디렉터리가 새 이름으로
+    // 이동한 뒤이므로 키를 함께 옮기지 않으면 삭제 씬 복원이 영구 불가해진다.
+    await trashService.renameProjectKeys(oldName, newName);
+    // 용량 캐시 키 이관 (재계산 가능 — 실패해도 무해)
+    await projectSizeService.renameProject(oldName, newName);
+    // 템플릿 지정 이관 (지정된 프로젝트가 이름을 바꿔도 지정 유지)
+    await templateService.renameProject(oldName, newName);
+  }
+
+  // 종료 시 빠른 저장: saveAll()은 로드된 세션이 많으면(프로젝트 탐색을 열면
+  // 전체가 로드됨) 10~20초가 걸린다. 편집은 사실상 현재 세션에서만 일어나므로
+  // dirty(변경 표시)된 것 + 현재 세션만 저장한다. (디바운스로 아직 dirty 표시가
+  // 안 된 현재 세션의 마지막 편집분도 현재 세션을 항상 포함해 보존됨)
+  async flushOnClose() {
+    const names = new Set<string>(this.dirtyNames());
+    try {
+      const cur = getAppState().curSession?.name;
+      if (cur && this.isLoaded(cur)) names.add(cur);
+    } catch {
+      // Bootstrap may not have an app state yet; all known dirty sessions still flush below.
+    }
+    const targets = [...names];
+    const results = await Promise.allSettled(
+      targets.map((name) => this.writeResource(name)),
+    );
+    const failed = targets.filter((name, index) => {
+      const result = results[index];
+      if (result.status === 'fulfilled' && result.value !== 'retry')
+        return false;
+      this.markDirty(name);
+      return true;
+    });
+    if (failed.length > 0) {
+      throw new Error(
+        `프로젝트 저장을 완료하지 못했습니다: ${failed.join(', ')}`,
+      );
+    }
+    // 종료 시 작업한 세션의 자동 썸네일 갱신
+    try {
+      await this.refreshLoadedThumbnails();
+      await this.saveThumbnails();
+    } catch (error) {
+      // Project writes above already succeeded; a derived thumbnail cache must not undo them.
+      console.warn('종료 시 썸네일 캐시 저장 실패:', error);
+    }
+  }
+
+  // 한 프로젝트의 현재 메모리 상태를 지금 디스크에 반영하고 그 경로의 쓰기 큐를
+  // 비운다(디바운스 대기 중인 편집 포함). 디스크 project.json 을 읽는 작업(프로젝트
+  // 덮어쓰기 전 임시 백업 — 드라이브 동기화 ⑤) 직전에 쓴다. 쓰기는 기존 단일 지점
+  // writeResource(손실 방지 가드·상태 재확인 포함)를 그대로 거친다. 저장소 불안정으로
+  // 보류('retry')되면 최신 상태를 보장할 수 없으므로 throw 한다.
+  async flushProjectNow(name: string): Promise<void> {
+    if (this.isLoaded(name)) {
+      const r = await this.writeResource(name);
+      if (r === 'retry') {
+        throw new Error('저장소가 불안정해 프로젝트를 저장하지 못했습니다.');
+      }
+    }
+    await persistService.flushPath(this.getPath(name));
+  }
+
+  // 같은 앱 실행 중 같은 프로젝트에 손실 경고를 한 번만 띄우기 위한 집합
+  #lossGuardWarned = new Set<string>();
+
+  // 저장소 건강 프로브 결과의 짧은 캐시(같은 flush 안에서 중복 listFiles 방지)
+  #storageProbe: { at: number; unstable: boolean } | null = null;
+
+  // 불안정 상태 전이 시에만 로깅하기 위한 플래그(로그 스팸 방지)
+  #storageUnstableActive = false;
+
+  // 손실 방지 가드(차단 + 자동 백업).
+  // 저장하려는 세션이, 디스크의 outs/inpaints 폴더(실제 씬 흔적 — 강제 종료에도
+  // 살아남음)에 비해 "이미지가 있는 씬"을 잃어버렸으면, 그 쓰기를 차단하고 기존
+  // 파일을 .bak 으로 백업한다. 강제 종료 후 기본(default) 세션이 실제 프로젝트를
+  // 덮어쓰는 등의 유실로부터 보호한다.
+  // 주의: 정상 삭제/이름변경/병합은 모두 outs 폴더를 .trash 로 옮기거나 함께
+  // 이동하므로(아래 점(.) 제외 규칙), 오탐이 발생하지 않는다.
+  protected async guardResourceWrite(
+    name: string,
+    payload: string,
+  ): Promise<'ok' | 'skip' | 'skip-keep'> {
+    // 서킷 브레이커(토글 ON, 기본): 저장소 접근이 불안정하면 이번 쓰기를 보류한다.
+    // 'skip-keep' 은 dirty 를 유지하므로 접근이 회복되면 자동으로 재시도된다.
+    try {
+      const appState = getAppState();
+      if (appState.storageWriteGuard && (await this.checkStorageUnstable())) {
+        return 'skip-keep';
+      }
+    } catch {
+      // App state can be unavailable during bootstrap; hard ownership/loss guards still run.
+    }
+
+    // ── 락 소유 쓰기 불변식 (P0, 하드 가드) — 두 목적을 겸한다 ──
+    //  1) 읽기 전용 미러(같은 프로젝트 중복 열기): 미러 창은 락을 보유하지 않으므로
+    //     어떤 편집도 디스크에 쓰지 못하게 막는다 — 소유 창만 저장한다.
+    //  2) 창 간 race 봉합: 히스토리 탐색 등으로 타 창 소유 프로젝트를 sessionService.get
+    //     으로 로드해 변이→자동저장하던 기존 창 간 경합 엣지도 함께 차단한다.
+    // 즉 각 창은 "자기가 락을 보유했거나 아무도 열지 않은" 세션만 디스크에 쓴다.
+    // 조회 실패는 소유권을 확인할 수 없으므로 dirty 를 유지하고 쓰기를 보류한다.
+    // 미러 플래그는 락과 별개로 항상 차단한다 — 소유 창이 닫혀 락이 비어도 미러의
+    // 낡은 스냅샷이 소유 창의 마지막 저장을 덮어쓰면 안 된다(미러는 재열기 전까지
+    // 영원히 읽기 전용 — 다이얼로그·문서에 명시된 의미론).
+    if (this.isMirror(name)) return 'skip';
+    try {
+      const q = await backend.queryProjectLock(name);
+      if (q.locked && !q.mine) return 'skip';
+    } catch (error) {
+      console.warn('프로젝트 락 조회 실패로 저장 보류:', name, error);
+      return 'skip-keep';
+    }
+
+    let json: ISession;
+    try {
+      json = JSON.parse(payload);
+    } catch {
+      return 'ok'; // 파싱 불가 시 가드 미적용(정상 저장 방해 안 함)
+    }
+    const sceneNames = new Set(Object.keys(json.scenes || {}));
+    const inpaintNames = new Set(Object.keys(json.inpaints || {}));
+
+    const missing = [
+      ...(await SessionService.findScenesWithImagesMissing(
+        'outs',
+        name,
+        sceneNames,
+      )),
+      ...(await SessionService.findScenesWithImagesMissing(
+        'inpaints',
+        name,
+        inpaintNames,
+      )),
+    ];
+    if (missing.length === 0) return 'ok';
+
+    // outs 에 있지만 세션에 없는 이미지 씬 발견. 두 경우를 구분한다:
+    //  - "찌꺼기": 세션은 멀쩡한데 안 쓰는 고아 폴더 몇 개 → 차단하면 과잉(앱 사용 막음).
+    //  - "붕괴": 세션이 default 수준으로 무너져 디스크의 풀 프로젝트를 덮어쓸 위험
+    //           (지킬 씬보다 잃을 씬이 더 많음) → 이때만 차단 + 백업.
+    const presentCount = sceneNames.size + inpaintNames.size;
+    const isCollapse = missing.length > presentCount;
+
+    // 안내 토스트(프로젝트당 1회): 차단/허용 공통. 복구 기능으로 유도(겁주지 않음).
+    if (!this.#lossGuardWarned.has(name)) {
+      this.#lossGuardWarned.add(name);
+      try {
+        getAppState().pushMessage(
+          '복구 가능한 이미지가 감지되었습니다. 이미지 복구 기능을 사용해 보세요.',
+        );
+      } catch (error) {
+        console.warn(
+          '복구 가능한 이미지 안내를 표시하지 못했습니다:',
+          name,
+          error,
+        );
+      }
+    }
+
+    if (!isCollapse) {
+      // 찌꺼기 수준 → 차단하지 않고 정상 저장(앱 사용을 막지 않음). 진단 로그만.
+      SessionService.addSystemLog(
+        'info',
+        `"${name}" 세션에 연결되지 않은 이미지 폴더 감지: ${missing.join(', ')} (복구 탭으로 재연결 가능)`,
+      );
+      return 'ok';
+    }
+
+    // 붕괴 의심 → 백업(클로버 방지) 후 차단(드롭). 디스크의 풀 프로젝트 보존.
+    console.error(
+      `[유실 방지] "${name}" 자동 저장 차단(세션 붕괴 의심): 세션 ${presentCount}개 / 누락 ${missing.length}개`,
+      missing,
+    );
+    // ④ 백업 클로버 방지: 현재 main 이 기존 .bak 보다 "빈약"하면(씬 수가 적으면)
+    // 덮어쓰지 않는다. 이미 축소된 main 이 멀쩡한 복구본(.bak)을 덮어쓰는 사고를 막는다.
+    try {
+      const path = this.getPath(name);
+      if (await backend.existFile(path)) {
+        const bakPath = `${path}.bak`;
+        const mainCount = SessionService.countResourceScenes(
+          await backend.readFile(path),
+        );
+        let bakCount = -1;
+        if (await backend.existFile(bakPath)) {
+          // An unreadable backup may be the only recovery copy; never overwrite it.
+          bakCount = SessionService.countResourceScenes(
+            await backend.readFile(bakPath),
+          );
+        }
+        if (mainCount >= bakCount) {
+          await backend.copyFile(path, bakPath);
+        } else {
+          SessionService.addSystemLog(
+            'warn',
+            `"${name}" 기존 백업(.bak)이 더 풍부하여 덮어쓰기를 건너뜀(복구본 보존)`,
+          );
+        }
+      }
+    } catch (error) {
+      // The pending destructive write remains blocked even when the extra backup fails.
+      console.error('유실 방지용 프로젝트 백업 실패:', name, error);
+    }
+
+    SessionService.addSystemLog(
+      'error',
+      `데이터 유실 의심(세션 붕괴) — "${name}" 자동 저장 차단(세션 ${presentCount}개 / 누락: ${missing.join(', ')})`,
+    );
+    return 'skip';
+  }
+
+  // 저장소(프로젝트 디렉터리)가 일시적으로 접근 불가인지 휴리스틱 판단.
+  // 메모리엔 프로젝트가 있는데 디스크의 목록을 못 읽거나(throw) 0개면 불안정으로 본다.
+  // 같은 flush 사이클 내 중복 listFiles 를 막기 위해 1초간 결과를 캐시한다.
+  private async checkStorageUnstable(): Promise<boolean> {
+    const now = Date.now();
+    let unstable: boolean;
+    if (this.#storageProbe && now - this.#storageProbe.at < 1000) {
+      unstable = this.#storageProbe.unstable;
+    } else {
+      const loadedCount = this.loadedNames().length;
+      if (loadedCount === 0) {
+        unstable = false; // 비교 기준 없음 → 판단 보류(정상 취급)
+      } else {
+        try {
+          // 신 배치 활성 시 진실 디렉터리는 workspace/(projects/ 는 비어 있음).
+          const probeDir = isWorkspaceLayout()
+            ? WORKSPACE_ROOT
+            : this.resourceDir;
+          const onDisk = await backend.listFiles(probeDir);
+          // 메모리엔 프로젝트가 있는데 디스크 목록이 0개 = 접근 이상
+          unstable = onDisk.length === 0;
+        } catch {
+          unstable = true; // 디렉터리 자체를 못 읽음 = 접근 이상
+        }
+      }
+      this.#storageProbe = { at: now, unstable };
+    }
+    // 상태 전이 시에만 로깅(스팸 방지)
+    if (unstable && !this.#storageUnstableActive) {
+      this.#storageUnstableActive = true;
+      SessionService.addSystemLog(
+        'warn',
+        '저장소 접근이 불안정하여 자동 저장을 일시정지합니다(접근 회복 시 재개).',
+      );
+    } else if (!unstable && this.#storageUnstableActive) {
+      this.#storageUnstableActive = false;
+      SessionService.addSystemLog(
+        'info',
+        '저장소 접근이 회복되어 자동 저장을 재개합니다.',
+      );
+    }
+    return unstable;
+  }
+
+  // JSON 문자열에서 씬+인페인트 개수를 센다. 파싱 불가(손상)면 -1(가장 빈약하게 취급).
+  private static countResourceScenes(raw: string): number {
+    try {
+      const j = JSON.parse(raw);
+      return (
+        Object.keys(j.scenes || {}).length +
+        Object.keys(j.inpaints || {}).length
+      );
+    } catch {
+      return -1;
+    }
+  }
+
+  // 환경설정의 작업 로그 뷰어에 기록(저장소 관련 진단). 동적 import 로 순환 의존 회피.
+  private static async addSystemLog(
+    level: 'info' | 'warn' | 'error',
+    message: string,
+  ) {
+    try {
+      taskQueueService.addLog(level, '저장소', message);
+    } catch (error) {
+      console.warn('저장소 작업 로그 기록 실패:', error);
+    }
+  }
+
+  // dir(outs|inpaints)/project 의 실제 씬 폴더 중, present 에 없고 이미지(.png)가
+  // 있는 폴더 이름들을 반환한다. 점(.)으로 시작하는 항목(.trash 등 삭제/시스템
+  // 폴더)은 제외해 정상 삭제로 인한 오탐을 막는다.
+  private static async findScenesWithImagesMissing(
+    dir: 'outs' | 'inpaints',
+    project: string,
+    present: Set<string>,
+  ): Promise<string[]> {
+    // projectPath 경유 — 신 배치 활성 시 workspace/<물리폴더>/<dir> 로 자동 분기.
+    let entries: string[];
+    try {
+      entries = await backend.listFiles(projectPath(dir, project));
+    } catch {
+      return []; // 폴더 없음 = 비교 대상 없음
+    }
+    const missing: string[] = [];
+    for (const entry of entries) {
+      if (entry.startsWith('.')) continue;
+      if (present.has(entry)) continue;
+      try {
+        const files = await backend.listFiles(projectPath(dir, project, entry));
+        if (files.some(isOutputImageFile)) missing.push(entry);
+      } catch {
+        // 폴더가 아니거나 접근 불가 → 보수적으로 무시(오탐 방지)
+      }
+    }
+    return missing;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- ResourceSyncService invokes this instance lifecycle override.
+  async getHook(rc: Session, name: string) {
+    rc.name = name;
+  }
+
+  // Legacy migration accepts several historical resource shapes before normalization.
+  async migrate(source: any) {
+    let rc = source;
+    if (!rc.version) {
+      // 폴더 소속 프로젝트도 손상 복구(readResourceJSON)가 찾는 위치와 같은
+      // 경로(getPath + .bak)에 백업해야 실제 복구에 쓰일 수 있다.
+      await backend.writeFile(
+        `${this.getPath(rc.name)}.bak`,
+        JSON.stringify(rc),
+      );
+      rc = await legacy.migrateSession(rc);
+    }
+    if (Array.isArray(rc.presets)) {
+      await legacy.recoverSession(rc);
+    }
+    await this.migrateSession(rc);
+    // 트랙1 (b): 세션 uuid 지연 발급 — 로드/생성(createFrom) 경로가 모두 이 seam 을
+    // 통과한다. 없으면 발급하고, 로드 경로는 메모리 반영만(다음 자연 저장 시 기록),
+    // createFrom 경로는 뒤이은 markDirty 로 즉시 기록된다. 복제·유래 생성은
+    // 호출부에서 json.id 를 지워 여기서 새 uuid 를 받게 한다. 스펙 §5.
+    if (!rc.id) {
+      rc.id = v4();
+    }
+    return rc;
+  }
+
+  // 새 프로젝트의 초기 씬 구성(빈 default 씬 1개) — createDefault 와
+  // createSessionFromTemplate(씬 리셋)이 공유하는 단일 출처.
+  private static defaultScenesJSON() {
+    return Object.fromEntries([
+      [
+        'default',
+        {
+          type: 'scene' as const,
+          name: 'default',
+          resolution: 'portrait',
+          slots: [[{ prompt: '', characterPrompts: [], id: v4() }]],
+          game: undefined,
+          round: undefined,
+          meta: {},
+          imageMap: [],
+          mains: [],
+        },
+      ],
+    ]);
+  }
+
+  async createDefault(name: string) {
+    const newSession = Session.fromJSON({
+      name,
+      version: 1,
+      presets: {},
+      inpaints: {},
+      scenes: SessionService.defaultScenesJSON(),
+      library: {},
+      presetShareds: {},
+    });
+    // dummy 는 역직렬화 템플릿(fromJSON 용)으로만 쓰이므로 프리셋 시딩이 불필요.
+    // 시딩하면 매 부팅 기본 에셋을 fetch 하고 vibes/dummy/ 에 쓰레기 PNG 가
+    // 무한 누적되며 부팅도 느려진다.
+    if (name !== 'dummy') {
+      // 신 배치: importDefaultPresets 가 vibes 를 projectPath 로 쓰기 전에 물리
+      // 폴더를 선등록해야 한다(등록 seam 은 onAttached 이지만 그건 attach 이후 —
+      // createDefault 안의 vibe 쓰기보다 늦다). dummy 는 실제 프로젝트가 아니므로 제외.
+      if (isWorkspaceLayout()) {
+        newSession.id = v4();
+        await this.ensureWorkspaceProject(name, {
+          id: newSession.id,
+          folder: this.folderMap[name] ?? '',
+        });
+      }
+      await importDefaultPresets(newSession);
+    }
+    return newSession;
+  }
+
+  // 프로젝트 템플릿(ProjectTemplateService 엔티티)으로 새 프로젝트를 만든다
+  // (프로젝트 상속 v2 — 2026-07-16 합의).
+  //
+  // 적용: 템플릿의 스타일 프리셋·캐릭터 프리셋(이미지 포함 복사)·씬 구성.
+  //       템플릿에 씬이 없으면 빈 default 씬 1개, 스타일 프리셋이 없으면
+  //       빈 프로젝트와 동일한 기본 프리셋 시딩(전역 default 포함).
+  // 전부 스냅샷 — 생성 후 템플릿을 바꿔도 기존 프로젝트는 영향 없음.
+  async createSessionFromProjectTemplate(
+    templateId: string,
+    newName: string,
+    opts?: {
+      inherited?: boolean;
+      // 일괄 생성(배치 R2, 스펙 2·6항): 베이스 템플릿의 캐릭터 프리셋·씬을
+      // 전면 무시하고 축(전역 캐릭터 프리셋/씬 템플릿)을 대신 적용하며,
+      // 적용 기록에 보호 플래그(protectAreas)를 남긴다.
+      batchAxes?: { charPresetId?: string; sceneTemplateName?: string };
+    },
+  ) {
+    if (this.isLoaded(newName)) {
+      throw new Error('Resource already exists');
+    }
+    await projectTemplateService.ensureLoaded();
+    const entry = projectTemplateService.get(templateId);
+    if (!entry) {
+      throw new Error('템플릿을 찾을 수 없습니다.');
+    }
+    const batch = opts?.batchAxes;
+    // 씬 구성: 이름은 템플릿 내에서 이미 유일 (임포트 시 번호 부여).
+    // 배치 모드는 템플릿 자체 씬을 무시 — 씬 축(씬 템플릿) 또는 기본 빈 씬.
+    const scenes = batch
+      ? batch.sceneTemplateName
+        ? await this.buildScenesFromSceneTemplate(batch.sceneTemplateName)
+        : SessionService.defaultScenesJSON()
+      : entry.scenes.length > 0
+        ? Object.fromEntries(
+            entry.scenes.map((s) => [s.name, JSON.parse(JSON.stringify(s))]),
+          )
+        : SessionService.defaultScenesJSON();
+    const json: ISession = {
+      name: newName,
+      version: 1,
+      presets: {},
+      inpaints: {},
+      scenes: scenes as any,
+      library: {},
+      presetShareds: {},
+      characterPresets: {},
+    };
+    // 신 배치: 물리 폴더 선등록 (createDefault 와 동일 — 이후 이미지 쓰기가
+    // projectPath 를 쓰기 전에 등록돼 있어야 한다).
+    if (isWorkspaceLayout()) {
+      json.id = v4();
+      await this.ensureWorkspaceProject(newName, {
+        id: json.id,
+        folder: this.folderMap[newName] ?? '',
+      });
+    }
+    try {
+      await this.createFrom(newName, json);
+      const created = await this.get(newName);
+      if (!created) {
+        throw new Error('프로젝트 생성에 실패했습니다.');
+      }
+      // 프리셋(1벌)/캐릭터 프리셋/수동 바이브·레퍼런스 인스턴스화
+      // (이미지: 템플릿 디렉터리 → 세션). 배치 모드는 베이스의 캐릭터 스킵.
+      const result = await projectTemplateService.instantiateIntoSession(
+        created,
+        templateId,
+        { skipCharacterPresets: !!batch },
+      );
+      if (result.presetInstance) {
+        // 템플릿 프리셋을 시작 프리셋으로 선택
+        created.selectedWorkflow = {
+          workflowType: result.presetInstance.type,
+          presetName: result.presetInstance.name,
+        };
+      } else {
+        // 프리셋 없는 템플릿 → 빈 프로젝트와 동일한 기본 시딩
+        await importDefaultPresets(created);
+      }
+      // 배치 축: 전역 캐릭터 프리셋 적용 (기존 전역→세션 관문, 이미지 복사)
+      if (batch?.charPresetId) {
+        const axisPreset =
+          await globalCharacterPresetService.instantiateIntoSession(
+            created,
+            batch.charPresetId,
+          );
+        // 목록 추가만으로는 효과가 없다 — UI의 "프리셋 적용"과 동일한 코어로
+        // 즉시 적용해야 캐릭터 프롬프트/바이브/레퍼런스가 실제 동작한다.
+        // (2026-07-16 실기 버그: 적용 단계 누락으로 자식에 아무것도 반영 안 됨)
+        const wfType =
+          created.selectedWorkflow?.workflowType ?? 'SDImageGenEasy';
+        getAppState().applyCharacterPresetToSession(
+          created,
+          wfType,
+          axisPreset,
+          wfType === 'SDImageGenEasy' ? 'easy' : 'character',
+        );
+      }
+      // 적용 기록 저장 (교체 의미론·♟ 상속 링크). 폴더 자동 적용이면 inherited.
+      // 배치: 축 캐릭터 인스턴스는 기록에 넣지 않고(이 템플릿 소유물 아님 —
+      // 이중 안전), 캐릭터·씬 영역을 보호로 마킹한다 (스펙 6항).
+      try {
+        await templateService.recordApplication(newName, templateId, {
+          inherited: opts?.inherited ?? false,
+          presets: result.presets,
+          characterPresetNames: batch ? [] : result.characterPresetNames,
+          vibePaths: result.vibePaths,
+          referencePaths: result.referencePaths,
+          ...(batch
+            ? {
+                protectAreas: [
+                  'characterPresets',
+                  'scenes',
+                ] as TemplateProtectArea[],
+              }
+            : {}),
+        });
+      } catch (e) {
+        console.warn('템플릿 적용 기록 저장 실패:', e);
+      }
+      this.markDirty(newName);
+    } catch (e) {
+      // 신 배치: 선등록 물리 폴더 통째 정리 + 레지스트리 해제.
+      if (isWorkspaceLayout() && !this.isLoaded(newName)) {
+        const wdir = physicalDirOf(newName);
+        if (wdir !== undefined) {
+          try {
+            await backend.deleteDir(workspacePath(wdir));
+          } catch (cleanupError) {
+            console.warn(
+              '실패한 프로젝트의 임시 작업 폴더 정리 실패:',
+              wdir,
+              cleanupError,
+            );
+          }
+          unregisterProjectDir(newName);
+        }
+      }
+      throw e;
+    }
+  }
+
+  // 기존 프로젝트에 프로젝트 템플릿을 적용한다 (프로젝트 상속 마감 —
+  // "출처 마킹 후 교체", 씬 제외 확정).
+  //
+  // 규칙(교체 의미론): 이 템플릿으로 이전에 만든 인스턴스(적용 기록)만 제거하고
+  //       새로 인스턴스화한다. 사용자가 직접 만든 프리셋·캐릭터·바이브·씬·생성
+  //       이미지는 절대 건드리지 않는다.
+  // 빈 영역 스킵: 템플릿에서 내용이 있는 영역만 "제거+재적용"한다. preset null →
+  //       프리셋 영역 통째 스킵(기존 기록 인스턴스도 유지), characterPresets 0개 →
+  //       스킵, vibes/references 0개 → 각각 스킵.
+  // 불변: 씬·인페인트·생성 이미지·시드·미러 불가침.
+  // opts.inherited: 지정 시 기록의 inherited 를 덮어씀(폴더 전파=유지). 미지정 시
+  //       기존 기록 값을 유지, 기록이 없으면 false.
+  async applyProjectTemplateToSession(
+    templateId: string,
+    targetName: string,
+    opts?: { inherited?: boolean },
+  ) {
+    await projectTemplateService.ensureLoaded();
+    const entry = projectTemplateService.get(templateId);
+    if (!entry) {
+      throw new Error('템플릿을 찾을 수 없습니다.');
+    }
+    const target = await this.get(targetName);
+    if (!target) {
+      throw new Error(`대상 프로젝트를 찾을 수 없습니다: ${targetName}`);
+    }
+    const hasPreset = !!entry.preset;
+    const hasChars = entry.characterPresets.length > 0;
+    const hasVibes = (entry.vibes?.length ?? 0) > 0;
+    const hasRefs = (entry.characterReferences?.length ?? 0) > 0;
+    if (!hasPreset && !hasChars && !hasVibes && !hasRefs) {
+      throw new Error('이 템플릿에는 적용할 구성이 없습니다.');
+    }
+
+    const prev = templateService.getApplication(targetName, templateId);
+    // 보호 영역(배치 생성 자식, 스펙 6항): 템플릿에 내용이 있어도 캐릭터
+    // 프리셋 영역은 제거도 추가도 하지 않는다. (씬은 재적용이 원래 불가침)
+    const protectChars = !!prev?.protectAreas?.includes('characterPresets');
+    const applyChars = hasChars && !protectChars;
+
+    // 1) 기록된 기존 인스턴스 제거 — 단, 템플릿에 내용이 있는 영역만.
+    let selectedRemoved = false;
+    if (prev) {
+      const r = projectTemplateService.removeRecordedInstances(target, prev, {
+        removePresets: hasPreset,
+        removeChars: applyChars,
+        removeVibes: hasVibes,
+        removeRefs: hasRefs,
+      });
+      selectedRemoved = r.selectedRemoved;
+    }
+
+    // 2) 새로 인스턴스화 (비어 있는 영역은 빈 결과, 보호 영역은 스킵)
+    const result = await projectTemplateService.instantiateIntoSession(
+      target,
+      templateId,
+      { skipCharacterPresets: protectChars },
+    );
+
+    // 3) selectedWorkflow 재선택 — 제거된 프리셋을 가리켰거나 최초 적용이면
+    //    새 프리셋 인스턴스로.
+    if (result.presetInstance && (!prev || selectedRemoved)) {
+      target.selectedWorkflow = {
+        workflowType: result.presetInstance.type,
+        presetName: result.presetInstance.name,
+      };
+    }
+
+    // 4) 기록 갱신 — 스킵/보호한 영역은 기존 기록을 보존(그 영역 인스턴스는
+    //    남아 있음). protectAreas 는 그대로 유지된다.
+    const inherited = opts?.inherited ?? prev?.inherited ?? false;
+    await templateService.recordApplication(targetName, templateId, {
+      inherited,
+      presets: hasPreset ? result.presets : (prev?.presets ?? []),
+      characterPresetNames: applyChars
+        ? result.characterPresetNames
+        : (prev?.characterPresetNames ?? []),
+      vibePaths: hasVibes ? result.vibePaths : (prev?.vibePaths ?? []),
+      referencePaths: hasRefs
+        ? result.referencePaths
+        : (prev?.referencePaths ?? []),
+      ...(prev?.protectAreas?.length
+        ? { protectAreas: prev.protectAreas }
+        : {}),
+    });
+
+    this.markDirty(targetName);
+  }
+
+  // 씬 템플릿(이미지 없는 일반 프로젝트)의 일반 씬 전체를 새 프로젝트의 초기
+  // 씬 구성 JSON 으로 변환한다 — TemplateService.importSceneTemplate 의 씬 복사
+  // 규칙(이미지·토너먼트 흔적 제거) 재사용. 새 프로젝트가 대상이라 충돌 정책이
+  // 필요 없고, 씬이 하나도 없으면 기본 빈 씬으로 폴백한다.
+  private async buildScenesFromSceneTemplate(
+    tplName: string,
+  ): Promise<Record<string, any>> {
+    const tpl = await this.get(tplName);
+    if (!tpl) {
+      throw new Error(`씬 템플릿 프로젝트를 불러올 수 없습니다: ${tplName}`);
+    }
+    const scenes = tpl.getScenes('scene');
+    if (scenes.length === 0) return SessionService.defaultScenesJSON();
+    const out: Record<string, any> = {};
+    for (const src of scenes) {
+      const json: any = JSON.parse(JSON.stringify(src.toJSON()));
+      json.imageMap = [];
+      json.mains = [];
+      json.game = undefined;
+      json.round = undefined;
+      out[json.name] = json;
+    }
+    return out;
+  }
+
+  // 프로젝트 일괄 생성 (배치 생성 R2, 2026-07-16 확정 스펙).
+  //
+  // 항목별 순차 처리: 이름 충돌 해소(기존+배치 내, `_n` 접미) → 대상 폴더
+  // 확보(folderOrder 매핑 — 서브폴더 포함) → createSessionFromProjectTemplate
+  // (batchAxes: 베이스의 캐릭터·씬 무시, 축 적용, 보호 기록) → 폴더 이동.
+  // 실패 항목은 수집만 하고 계속(롤백 없음 — 생성분 유지, data_root_guard 정신).
+  // shouldCancel 이 true 면 현재 항목 완료 후 중단.
+  async batchCreateFromTemplate(plan: {
+    templateId: string;
+    folder: string; // 부모 폴더 경로 (진입점 = 폴더 템플릿이므로 자동 확정)
+    items: IBatchPlanItem[];
+    onProgress?: (done: number, total: number, currentName: string) => void;
+    shouldCancel?: () => boolean;
+  }): Promise<{
+    created: string[];
+    failed: { name: string; error: string }[];
+    cancelled: boolean;
+  }> {
+    await projectTemplateService.ensureLoaded();
+    const created: string[] = [];
+    const failed: { name: string; error: string }[] = [];
+    let cancelled = false;
+    // 충돌 해소 풀: 기존 프로젝트 전체 + 이번 배치에서 확정된 이름
+    const taken = new Set<string>(this.list());
+    const total = plan.items.length;
+    let done = 0;
+    for (const item of plan.items) {
+      if (plan.shouldCancel?.()) {
+        cancelled = true;
+        break;
+      }
+      const name = resolveBatchName(item.name, taken);
+      plan.onProgress?.(done, total, name);
+      try {
+        // 대상 폴더 확보 — 서브폴더는 매핑(folderOrder/.keep)만으로 생성된다
+        const target = item.subfolder
+          ? (plan.folder ? `${plan.folder}/` : '') + item.subfolder
+          : plan.folder;
+        if (target && !this.folderList.includes(target)) {
+          await this.createFolder(target);
+        }
+        await this.createSessionFromProjectTemplate(plan.templateId, name, {
+          inherited: true,
+          batchAxes: {
+            charPresetId: item.charPresetId,
+            sceneTemplateName: item.sceneTemplateName,
+          },
+        });
+        if (target) {
+          // Keep the created project on failure, but report the unfinished placement.
+          await this.moveToFolder(name, target);
+        }
+        created.push(name);
+      } catch (e: any) {
+        failed.push({ name, error: e?.message || String(e) });
+      }
+      done++;
+      plan.onProgress?.(done, total, name);
+    }
+    return { created, failed, cancelled };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Preserve the path capability on the injectable session service.
+  getInpaintOrgPath(session: Session, inpaint: InpaintScene) {
+    return projectPath('inpaint_orgs', session.name, `${inpaint.name}.png`);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Preserve the path capability on the injectable session service.
+  getInpaintMaskPath(session: Session, inpaint: InpaintScene) {
+    return projectPath('inpaint_masks', session.name, `${inpaint.name}.png`);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Import/export callers depend on the injectable instance service API.
+  async exportSessionShallow(session: Session) {
+    const sess: ISession = session.toJSON();
+    if (sess.presetShareds.SDImageGenEasy) {
+      sess.presetShareds.SDImageGenEasy.vibes = [];
+    }
+    if (sess.presetShareds.SDImageGen) {
+      sess.presetShareds.SDImageGen.vibes = [];
+    }
+    for (const scene of Object.values(sess.scenes)) {
+      scene.game = undefined;
+      scene.round = undefined;
+      scene.imageMap = [];
+      scene.mains = [];
+    }
+    sess.inpaints = {};
+
+    for (const presetSet of Object.values(sess.presets)) {
+      for (const preset of presetSet) {
+        if (preset.profile) {
+          const data = await imageService.fetchVibeImage(
+            session,
+            preset.profile,
+          );
+          if (!data)
+            throw new Error(
+              `프리셋 이미지를 읽을 수 없습니다: ${preset.profile}`,
+            );
+          preset.profile = dataUriToBase64(data);
+        }
+      }
+    }
+    return sess;
+  }
+
+  // 프로젝트 깊은 백업에 포함할 파일 엔트리 목록을 만든다.
+  // prefix를 주면 아카이브 내부 경로 앞에 붙는다 (폴더 백업에서 프로젝트별 네임스페이스용).
+  async buildSessionDeepEntries(
+    session: Session,
+    prefix: string = '',
+  ): Promise<FileEntry[]> {
+    // Platform listFiles returns [] for absent optional folders; other IO failures
+    // must abort a backup instead of producing a silently incomplete archive.
+    // 폴더에 속한 프로젝트는 projects/<폴더>/<이름>.json 이므로 폴더 인식 경로 사용
+    const projFile = this.getPath(session.name);
+    const entries: FileEntry[] = [];
+
+    // 모든 디렉토리를 병렬로 스캔
+    const sceneNames = Array.from(session.scenes.values()).map((s) => s.name);
+    const inpaintNames = Array.from(session.inpaints.values()).map(
+      (s) => s.name,
+    );
+
+    const [
+      sceneResults,
+      inpaintResults,
+      inpaintOrgs,
+      inpaintMasks,
+      vibes,
+      references,
+    ] = await Promise.all([
+      // 씬별 이미지 (병렬)
+      Promise.all(
+        sceneNames.map(async (name) => ({
+          name,
+          files: await backend.listFiles(
+            projectPath('outs', session.name, name),
+          ),
+        })),
+      ),
+      // 인페인트별 이미지 (병렬)
+      Promise.all(
+        inpaintNames.map(async (name) => ({
+          name,
+          files: await backend.listFiles(
+            projectPath('inpaints', session.name, name),
+          ),
+        })),
+      ),
+      backend.listFiles(projectPath('inpaint_orgs', session.name)),
+      backend.listFiles(projectPath('inpaint_masks', session.name)),
+      backend.listFiles(projectPath('vibes', session.name)),
+      backend.listFiles(projectPath('references', session.name)),
+    ]);
+
+    for (const { name, files } of sceneResults) {
+      for (const image of files) {
+        if (!isOutputImageFile(image)) continue;
+        entries.push({
+          path: projectPath('outs', session.name, name, image),
+          name: `${prefix}outs/${name}/${image}`,
+        });
+      }
+    }
+    for (const image of inpaintOrgs) {
+      if (!image.endsWith('.png')) continue;
+      entries.push({
+        path: projectPath('inpaint_orgs', session.name, image),
+        name: `${prefix}inpaint_orgs/${image}`,
+      });
+    }
+    for (const image of inpaintMasks) {
+      if (!image.endsWith('.png')) continue;
+      entries.push({
+        path: projectPath('inpaint_masks', session.name, image),
+        name: `${prefix}inpaint_masks/${image}`,
+      });
+    }
+    for (const { name, files } of inpaintResults) {
+      for (const image of files) {
+        if (!isOutputImageFile(image)) continue;
+        entries.push({
+          path: projectPath('inpaints', session.name, name, image),
+          name: `${prefix}inpaints/${name}/${image}`,
+        });
+      }
+    }
+    for (const vibe of vibes) {
+      if (!vibe.endsWith('.png')) continue;
+      entries.push({
+        path: projectPath('vibes', session.name, vibe),
+        name: `${prefix}vibes/${vibe}`,
+      });
+    }
+    for (const ref of references) {
+      if (!ref.endsWith('.png')) continue;
+      entries.push({
+        path: projectPath('references', session.name, ref),
+        name: `${prefix}references/${ref}`,
+      });
+    }
+    entries.push({ path: projFile, name: `${prefix}project.json` });
+    return entries;
+  }
+
+  async exportSessionDeep(session: Session, outPath: string) {
+    const entries = await this.buildSessionDeepEntries(session, '');
+    if (zipService.isZipping) {
+      throw new Error('Already zipping');
+    }
+    await zipService.zipFiles(entries, outPath);
+  }
+
+  async importSessionShallow(session: ISession, name: string) {
+    if (this.isLoaded(name)) {
+      throw new Error('Resource already exists');
+    }
+    session.name = name;
+    // 유래 생성(복제·씬템플릿·백업 복원·순환) — 원본 id 를 버려 migrate 가 새 uuid 를
+    // 발급하게 한다(트랙1 (b): 물리 폴더 유일성). 순수 로드가 아닌 신규 프로젝트 생성.
+    delete session.id;
+    // 신 배치: vibes 쓰기가 createFrom(→등록) 보다 앞서므로, 복사 시작 전에 물리
+    // 폴더를 선등록한다. id 를 확정해 두면 createFrom 의 migrate 가 그대로 유지한다.
+    if (isWorkspaceLayout()) {
+      session.id = v4();
+      await this.ensureWorkspaceProject(name, {
+        id: session.id,
+        folder: this.folderMap[name] ?? '',
+      });
+    }
+    if (Array.isArray(session.presets)) {
+      for (const preset of session.presets) {
+        if (preset.type === 'style') {
+          const path = projectPath('vibes', name, `${v4()}.png`);
+          await backend.writeDataFile(path, preset.profile);
+          preset.profile = path.split('/').pop()!;
+        }
+      }
+    } else if (session.presets) {
+      for (const presetSet of Object.values(session.presets)) {
+        for (const preset of presetSet) {
+          if (preset.profile) {
+            const path = projectPath('vibes', name, `${v4()}.png`);
+            await backend.writeDataFile(path, preset.profile);
+            preset.profile = path.split('/').pop()!;
+          }
+        }
+      }
+    }
+    await this.createFrom(name, session);
+  }
+
+  async importSessionDeep(tarpath: string, name: string) {
+    if (this.isLoaded(name)) {
+      throw new Error('Resource already exists');
+    }
+    const path = `tmp/${v4()}`;
+    await backend.unzipFiles(tarpath, path);
+    try {
+      await this.importSessionDeepFromDir(path, name);
+    } finally {
+      // 복사 방식이므로 성공/실패와 무관하게 임시 추출물을 정리한다.
+      try {
+        await backend.deleteDir(path);
+      } catch (cleanupError) {
+        console.warn(
+          '프로젝트 가져오기 임시 추출물 정리 실패:',
+          path,
+          cleanupError,
+        );
+      }
+    }
+  }
+
+  // 이미 추출된 디렉터리(project.json + outs/vibes/... 하위 포함)로부터 프로젝트를 복원한다.
+  // 폴더 백업 불러오기에서 한 아카이브를 1회 추출한 뒤 프로젝트별로 재사용한다.
+  async importSessionDeepFromDir(dir: string, name: string) {
+    if (this.isLoaded(name)) {
+      throw new Error('Resource already exists');
+    }
+    // 목록에 이미 있는 이름(이번 실행에서 열지 않은 미로드 프로젝트 포함)이면 어떤 파일도
+    // 건드리기 전에 거부한다. 그대로 진행하면 신 배치는 살아 있는 프로젝트 물리 폴더에
+    // 이미지가 병합되고, 복사 실패 시 아래 롤백이 그 기존 폴더를 통째로 지울 수 있다
+    // (2026-10-02 S4). 호출부는 모두 목록에 없는 이름만 넘긴다(isProjectNameTaken 과 같은 기준).
+    if (this.list().includes(name)) {
+      throw new Error(`이미 같은 이름의 프로젝트가 있습니다: ${name}`);
+    }
+    const session: Session = JSON.parse(
+      await backend.readFile(`${dir}/project.json`),
+    );
+    session.name = name;
+    // 백업 아카이브로부터 새 프로젝트 생성 — 원본 id 를 버려 새 uuid 발급 유도(위와 동일).
+    delete (session as any).id;
+    // 신 배치: 이미지 복사가 createFrom(→등록) 보다 앞서므로 복사 대상 물리 폴더를
+    // 선등록한다(projectPath(r, name) 이 복사 시작 전에 이미 해석되어야 함).
+    if (isWorkspaceLayout()) {
+      (session as any).id = v4();
+      await this.ensureWorkspaceProject(name, {
+        id: (session as any).id,
+        folder: this.folderMap[name] ?? '',
+      });
+    }
+    // 이동(renameDir) 대신 복사 후 검증: 원본(임시 디렉터리)을 보존하므로 중간에
+    // 실패해도 데이터가 흩어지거나 유실되지 않는다(부분 복원 방지).
+    const copies = PROJECT_IMAGE_ROOTS.map(
+      (r) => [`${dir}/${r}`, projectPath(r, name)] as const,
+    );
+    const createdDests: string[] = [];
+    try {
+      for (const [src, dest] of copies) {
+        // The backend returns [] for genuinely absent optional roots. Let the
+        // strict copy propagate real access failures before project registration.
+        // strict=true: 실제 복사 실패 시 예외를 던져 반쪽짜리 임포트를 막는다.
+        await this.copyDirRecursive(src, dest, true);
+        createdDests.push(dest);
+      }
+      await this.createFrom(name, session);
+    } catch (e) {
+      // 부분 실패 롤백: 이번에 만든 대상 이미지 디렉터리를 정리한다.
+      // (원본 임시 디렉터리는 호출부가 정리한다)
+      for (const dest of createdDests) {
+        try {
+          await backend.deleteDir(dest);
+        } catch (cleanupError) {
+          console.warn('부분 복사 대상 정리 실패:', dest, cleanupError);
+        }
+      }
+      // 신 배치: 선등록한 물리 폴더(meta.json 포함) 통째 정리 + 레지스트리 해제.
+      if (isWorkspaceLayout() && !this.isLoaded(name)) {
+        const wdir = physicalDirOf(name);
+        if (wdir !== undefined) {
+          try {
+            await backend.deleteDir(workspacePath(wdir));
+          } catch (cleanupError) {
+            console.warn(
+              '실패한 프로젝트의 임시 작업 폴더 정리 실패:',
+              wdir,
+              cleanupError,
+            );
+          }
+          unregisterProjectDir(name);
+        }
+      }
+      throw e;
+    }
+  }
+
+  // 디렉터리를 하위까지 재귀 복사한다. (copyFile + listFiles 재사용, 새 IPC 불필요)
+  // Backend-confirmed absence is []; strict transfers never reinterpret IO errors as absence.
+  // strict=true 이면 복사 실패 시 예외를 던진다(부분 복원 방지용). 기본은 기존처럼 무시.
+  private async copyDirRecursive(
+    srcDir: string,
+    destDir: string,
+    strict = false,
+  ) {
+    let entries: string[] = [];
+    try {
+      entries = await backend.listFiles(srcDir);
+    } catch (e) {
+      if (strict) throw e;
+      return;
+    }
+    if (!entries || entries.length === 0) return;
+    // listFiles(파일+디렉토리) vs listFilesWithStats(파일만) → 디렉터리 구분
+    let fileStats: any[] = [];
+    try {
+      fileStats = await backend.listFilesWithStats(srcDir);
+    } catch (e) {
+      if (strict) throw e;
+      fileStats = [];
+    }
+    const fileSet = new Set(fileStats.map((s: any) => s.name));
+    for (const entry of entries) {
+      if (fileSet.has(entry)) {
+        try {
+          await backend.copyFile(`${srcDir}/${entry}`, `${destDir}/${entry}`);
+        } catch (e) {
+          if (strict) throw e;
+        }
+      } else {
+        // 하위 디렉터리 → 재귀
+        await this.copyDirRecursive(
+          `${srcDir}/${entry}`,
+          `${destDir}/${entry}`,
+          strict,
+        );
+      }
+    }
+  }
+
+  // 프로젝트를 이미지 포함하여 앱 내에서 복제한다.
+  // (프로젝트 백업 내보내기 → 재임포트와 동일한 결과: JSON + 모든 이미지 디렉터리)
+  async duplicateSessionDeep(session: Session, newName: string) {
+    if (this.isLoaded(newName)) {
+      throw new Error('Resource already exists');
+    }
+    // 이미지 디렉터리는 이름 기준(outs/<이름> 등)이므로 이름만 바꿔 통째 복사
+    // 루트별 복사는 상호 독립이라 순서(PROJECT_IMAGE_ROOTS)는 결과에 영향 없음.
+    // 부분 실패 롤백: importSessionDeepFromDir 와 동일하게 만든 대상만 추적해
+    // 정리한다 — 과거에는 롤백이 없어 반쪽 복사본(고아 이미지)이 남았다(트랙1 B4).
+    // 신 배치: 복사 대상(dest = projectPath(dir, newName)) 이 복사 시작 전에
+    // 해석되어야 하므로 물리 폴더를 선등록한다. 폴더 매핑도 meta 와 일치시켜 반영.
+    const dupFolder = this.getFolderOf(session.name) || '';
+    let dupPreId: string | undefined;
+    if (isWorkspaceLayout()) {
+      dupPreId = v4();
+      if (dupFolder) this.folderMap[newName] = dupFolder;
+      await this.ensureWorkspaceProject(newName, {
+        id: dupPreId,
+        folder: dupFolder,
+      });
+    }
+    const createdDests: string[] = [];
+    try {
+      for (const dir of PROJECT_IMAGE_ROOTS) {
+        const src = projectPath(dir, session.name);
+        // The backend returns [] for genuinely absent optional roots. Let the
+        // strict copy propagate real access failures before project registration.
+        const dest = projectPath(dir, newName);
+        // strict=true: 파일 복사 실패를 삼키지 않고 던져 반쪽 복제를 막는다.
+        await this.copyDirRecursive(src, dest, true);
+        createdDests.push(dest);
+      }
+      const json = session.toJSON();
+      json.name = newName;
+      if (isWorkspaceLayout() && dupPreId) {
+        json.id = dupPreId; // 선등록 id 유지(migrate 가 그대로 둠)
+      } else {
+        delete json.id; // 복제본은 새 uuid 발급(트랙1 (b))
+        const folder = this.getFolderOf(session.name);
+        if (folder) {
+          this.folderMap[newName] = folder;
+        }
+      }
+      await this.createFrom(newName, json);
+    } catch (e) {
+      for (const dest of createdDests) {
+        try {
+          await backend.deleteDir(dest);
+        } catch (cleanupError) {
+          console.warn('부분 복사 대상 정리 실패:', dest, cleanupError);
+        }
+      }
+      delete this.folderMap[newName]; // 선반영한 폴더 매핑 정리
+      // 신 배치: 선등록 물리 폴더 통째 정리 + 레지스트리 해제.
+      if (isWorkspaceLayout() && !this.isLoaded(newName)) {
+        const wdir = physicalDirOf(newName);
+        if (wdir !== undefined) {
+          try {
+            await backend.deleteDir(workspacePath(wdir));
+          } catch (cleanupError) {
+            console.warn(
+              '실패한 프로젝트의 임시 작업 폴더 정리 실패:',
+              wdir,
+              cleanupError,
+            );
+          }
+          unregisterProjectDir(newName);
+        }
+      }
+      throw e;
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the instance migration seam used by loaders and callers.
+  async migrateSession(session: ISession) {
+    const types = ['SDImageGen', 'SDImageGenEasy'];
+    for (const type of types) {
+      if (session.presetShareds[type]) {
+        for (const vibe of session.presetShareds[type].vibes) {
+          if (vibe.path) vibe.path = vibe.path.split('/').pop()!;
+        }
+      }
+    }
+  }
+
+  async saveInpaintImages(
+    seesion: Session,
+    inpaint: InpaintScene,
+    image: string,
+    mask: string,
+  ) {
+    await backend.writeDataFile(
+      this.getInpaintOrgPath(seesion, inpaint),
+      image,
+    );
+    await backend.writeDataFile(
+      this.getInpaintMaskPath(seesion, inpaint),
+      mask,
+    );
+    await imageService.invalidateCache(
+      this.getInpaintOrgPath(seesion, inpaint),
+    );
+    await imageService.invalidateCache(
+      this.getInpaintMaskPath(seesion, inpaint),
+    );
+  }
+
+  styleEdit(preset: any, container: any) {
+    this.dispatchEvent(
+      new CustomEvent('style-edit', { detail: { preset, container } }),
+    );
+  }
+
+  configChanged(): void {
+    this.dispatchEvent(new CustomEvent('config-changed', {}));
+  }
+
+  // 다른 창의 공유 메타(즐겨찾기·폴더색·폴더순서) 변경 반영(W6 P2) —
+  // 디스크 재로드 후 listupdated 로 드로어/브라우저를 재렌더시킨다.
+  async reloadSharedMeta(): Promise<void> {
+    await this.loadFavorites();
+    await this.loadFolderColors();
+    await this.loadFolderOrder();
+    this.dispatchEvent(new CustomEvent('listupdated', {}));
+  }
+
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this -- Keep the shared instance service entry point for the native piece index.
+  async reloadPieceLibraryDB(session: Session) {
+    const res: string[] = [];
+    const localKeys = new Set<string>();
+    for (const [k, v] of session.library.entries()) {
+      for (const piece of v.pieces) {
+        const key = `${k}.${piece.name}`;
+        res.push(key);
+        localKeys.add(key);
+      }
+    }
+    // 전역 조각 추가 (로컬과 동명인 경우 스킵)
+    try {
+      for (const [k, v] of globalPieceService.library.entries()) {
+        for (const piece of v.pieces) {
+          const key = `${k}.${piece.name}`;
+          if (!localKeys.has(key)) {
+            res.push(key);
+          }
+        }
+      }
+    } catch (error) {
+      // The local piece index is still usable while the optional global library is unavailable.
+      console.warn('전역 조각 목록을 읽지 못해 로컬 조각만 색인합니다:', error);
+    }
+    await backend.loadPiecesDB(res);
+  }
+}
+
+export async function importDefaultPresets(session: Session) {
+  // 글로벌 프리셋 서비스에서 "기본" 플래그 지정된 것들을 먼저 시도
+  // 순환 임포트 방지를 위해 동적 import 사용
+  try {
+    if (globalPresetService) {
+      if (!globalPresetService.loaded) {
+        await globalPresetService.load();
+      }
+      const easyDefaults = globalPresetService.getDefaults('SDImageGenEasy');
+      const genDefaults = globalPresetService.getDefaults('SDImageGen');
+      for (const entry of [...easyDefaults, ...genDefaults]) {
+        try {
+          await globalPresetService.instantiateIntoSession(session, entry.id);
+        } catch (e) {
+          console.warn(
+            'Failed to instantiate global default preset:',
+            entry?.name,
+            e,
+          );
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('GlobalPresetService unavailable during session init:', e);
+  }
+
+  // Fallback: SDImageGenEasy 프리셋이 비어있으면 기존 defaultassets 시드
+  // (신규 설치 첫 실행 UX 보존)
+  const hasEasyPresets =
+    session.presets.has('SDImageGenEasy') &&
+    session.presets.get('SDImageGenEasy')!.length > 0;
+  if (!hasEasyPresets) {
+    if (!session.presets.has('SDImageGenEasy')) {
+      session.presets.set('SDImageGenEasy', []);
+    }
+    const images = await Promise.all(
+      defaultassets.map((x) => fetch(x).then((res) => res.blob())),
+    );
+    for (const image of images) {
+      const datauri = await blobToDataUri(image);
+      await importPreset(session, dataUriToBase64(datauri));
+    }
+  }
+}
+function blobToDataUri(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.onerror = (e) => reject(e);
+    reader.readAsDataURL(blob);
+  });
+}
+
+export async function importPreset(session: Session, base64: string) {
+  let json = readJSONFromPNG(base64);
+  if (!json || !json.type || !json.name) {
+    return undefined;
+  }
+  json = normalizePresetJson(json);
+  const path = await imageService.storeVibeImage(session, base64);
+  json.profile = path;
+  const preset = workFlowService.presetFromJSON(json);
+  session.addPreset(preset);
+  return preset;
+}
+
+export const getResultDirectory = (session: Session, scene: GenericScene) => {
+  if (scene.type === 'scene') {
+    return imageService.getImageDir(session, scene);
+  }
+  return imageService.getInPaintDir(session, scene);
+};
+
+export const renameScene = async (
+  session: Session,
+  oldName: string,
+  requestedName: string,
+) => {
+  // 씬 이름변경은 outs 폴더 rename 을 동반하는 구조 변경 — 다른 창이 소유(=이 창이
+  // 미러)한 프로젝트에서는 차단하고 소유 창에 토스트를 띄운다(P3, W6 후속).
+  if (!(await sessionService.guardCrossWindowLock(session.name, '씬 이름변경')))
+    return;
+  const newName = requestedName.trimEnd();
+  // 폴더 이동(onRenameScene)과 Map 갱신 사이에 주기 flush 가 끼면, 손실 방지 가드가
+  // "newName 폴더는 있는데 세션엔 없다"고 오인할 수 있다. 작업 동안 세션을 in-flight 로
+  // 표시해 그 사이 자동 저장이 해당 세션을 건너뛰게 한다.
+  await sessionService.withLock([session.name], async () => {
+    await imageService.onRenameScene(session, oldName, newName);
+    const scene = session.scenes.get(oldName)!;
+    scene.name = newName;
+    // 순서 보존: Map은 삽입 순서를 유지하므로 delete→set 하면 새 이름이 맨 뒤로 밀린다.
+    // 기존 키 자리에 새 이름을 끼워 Map을 재구성해 원래 위치를 지킨다(moveScene 재구성 패턴).
+    const rebuilt = new Map();
+    for (const [key, value] of session.scenes) {
+      rebuilt.set(key === oldName ? newName : key, value);
+    }
+    session.scenes = rebuilt as any;
+  });
+  // 실행 중 예약의 씬 통계 키 이관 — 안 하면 씬 카드 예약 배지가 0으로 사라짐
+  taskQueueService.onRenameScene(session.name, 'scene', oldName, newName);
+};
+
+// 변형(인페인트) 씬 이름 변경(2026-10-03 X15a). 예전 변형 씬 편집 창은 매 키 입력마다
+// scene.name 만 바꿔 Map 키·inpaints 폴더·예약 통계가 옛 이름에 남았다(새 이미지는 새 이름 폴더로,
+// 기존 이미지는 옛 폴더에 고아로 — 다시 열면 Map 키와 이름이 어긋남). 일반 씬 renameScene 과 같은
+// 관문(다른 창 잠금·withLock)을 쓰되, 파일 이동이 실패하면 이름을 바꾸지 않는다.
+// 반환: true=바뀜, false=다른 창 잠금으로 차단(안내는 소유 창에). 동명·이동 실패는 throw.
+export const renameInpaintScene = async (
+  session: Session,
+  oldName: string,
+  requestedName: string,
+): Promise<boolean> => {
+  const newName = requestedName.trimEnd();
+  if (!newName || newName === oldName) return false;
+  if (!(await sessionService.guardCrossWindowLock(session.name, '씬 이름변경')))
+    return false;
+  await sessionService.withLock([session.name], async () => {
+    const scene = session.inpaints.get(oldName);
+    if (!scene) throw new Error(`변형 씬 "${oldName}"을(를) 찾을 수 없습니다.`);
+    if (session.inpaints.has(newName)) {
+      throw new Error(`같은 이름의 변형 씬 "${newName}"이(가) 이미 있습니다.`);
+    }
+    await imageService.renameInpaintSceneFiles(session, oldName, newName);
+    scene.name = newName;
+    // 순서 보존(renameScene 과 같은 재구성)
+    const rebuilt = new Map();
+    for (const [key, value] of session.inpaints) {
+      rebuilt.set(key === oldName ? newName : key, value);
+    }
+    session.inpaints = rebuilt as any;
+  });
+  taskQueueService.onRenameScene(session.name, 'inpaint', oldName, newName);
+  return true;
+};
+
+// 씬 병합: sourceName 씬을 기존 targetName 씬으로 합친다.
+// - 이미지: source → target 폴더로 이동(파일명 충돌 시 재지정, 손실 없음)
+// - 프롬프트/설정: 기존(target) 씬 것을 유지하고 source 씬은 제거한다.
+export const mergeScene = async (
+  session: Session,
+  sourceName: string,
+  targetName: string,
+) => {
+  if (sourceName === targetName) return;
+  const assertGenerationIdle = () => {
+    // Stop can precede the last provider result/save. Queued tasks still own
+    // their original scene object, which a successful merge would remove.
+    if (taskQueueService.hasPendingExecution() || !taskQueueService.isEmpty()) {
+      throw new Error(
+        '이미지 생성 또는 예약 작업이 남아 있어 씬을 병합할 수 없습니다. ' +
+          '결과 저장이 끝나고 예약 목록이 비워진 뒤 다시 시도해주세요.',
+      );
+    }
+  };
+  assertGenerationIdle();
+  if (!(await sessionService.guardCrossWindowLock(session.name, '씬 병합'))) {
+    throw new Error('다른 창에서 사용 중인 프로젝트는 병합할 수 없습니다.');
+  }
+  await sessionService.withLock([session.name], async () => {
+    assertGenerationIdle();
+    const source = session.scenes.get(sourceName);
+    const target = session.scenes.get(targetName);
+    if (!source || !target) {
+      throw new Error('병합할 씬을 찾을 수 없습니다.');
+    }
+    // Auto-save cannot publish a half-moved scene, and a failed transfer keeps
+    // its source identity so the user can inspect the preserved files and retry.
+    await imageService.mergeSceneImages(session, sourceName, targetName);
+    session.scenes.delete(sourceName);
+    await imageService.refresh(session, target);
+  });
+};

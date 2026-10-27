@@ -1,0 +1,3780 @@
+import {
+  type Fragment,
+  type ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useCallback,
+} from 'react';
+import {
+  FaCheck,
+  FaChevronDown,
+  FaPen,
+  FaSearch,
+  FaStar,
+  FaTimes,
+  FaToggleOn,
+} from 'react-icons/fa';
+import { createPortal } from 'react-dom';
+import { useDrag, useDrop } from 'react-dnd';
+import { getEmptyImage } from 'react-dnd-html5-backend';
+import { useContextMenu } from 'react-contexify';
+import { v4 } from 'uuid';
+import { observer } from 'mobx-react-lite';
+import { reaction } from 'mobx';
+import { ActionIcon } from './ActionIcon';
+import SceneQueueMenu from './SceneQueueMenu';
+import {
+  isSceneSelected,
+  selectedCountForType,
+} from '../models/sceneSelection';
+import {
+  canStartSelectionBox,
+  mainSceneDragSurface,
+  isOnNativeScrollbar,
+} from '../models/dragSelection';
+import { useSceneNavigationHost } from './sceneNavigationHost';
+import { FloatView } from './FloatView';
+
+import SceneEditor from './SceneEditor';
+
+import ResultViewer from './ResultViewer';
+import { type SceneQueueProps } from './sceneQueueTypes';
+import InPaintEditor from './InPaintEditor';
+import ImageReview from './ImageReview';
+import ShortcutCheatsheet from './ShortcutCheatsheet';
+import SceneQuickPromptModal from './SceneQuickPromptModal';
+
+import SceneSelector from './SceneSelector';
+import Tooltip from './Tooltip';
+import { HScrollHintArrow, useHScrollHint } from './HScrollHint';
+
+import {
+  isMobile,
+  gameService,
+  sessionService,
+  imageService,
+  taskQueueService,
+  backend,
+  workFlowService,
+  promptService,
+} from '../models';
+import {
+  getMainImage,
+  dataUriToBase64,
+  deleteImageFiles,
+  setImageMain,
+  toggleImageMain,
+} from '../models/ImageService';
+import { queueWorkflow } from '../models/TaskQueueService';
+import {
+  addScenesToQueue,
+  createMissingPiecesForSession,
+  queueArtistBreakdown,
+  applyArtistPrefixBatch,
+  queueScene,
+} from '../models/sceneQueueActions';
+import {
+  type GenericScene,
+  ContextMenuType,
+  Scene,
+  InpaintScene,
+  type Session,
+} from '../models/types';
+import { extractPromptDataFromBase64 } from '../models/util';
+import {
+  applyImageResolution,
+  inpaintSceneResolutionFields,
+  paidResolutionNotice,
+  resolutionFromImage,
+  workflowUsesImageResolution,
+} from '../models/inpaintResolution';
+import { IMPORT_IMAGE_ACCEPT } from '../models/imageFormats';
+import { platform } from '../models/platform';
+import {
+  TOOLBAR_GROUP_OTHER,
+  TOOLBAR_GROUP_OTHER_HINT,
+  TOOLBAR_VIEW_MAIN,
+  groupToolbarIds,
+  resolveToolbarView,
+} from '../models/uiLayout';
+import { companionAssignedIds } from '../models/companionSlots';
+import ToolbarOverflowMenu from './ToolbarOverflowMenu';
+import { V2MainRow, type V2SlotDef, V2TierRows } from './MobileV2Bars';
+import { useV2Slot } from './useV2Slot';
+import { isV2, V2_TOP_PIECE_SLOT_ID, V2_TOP_SLOT_ID } from '../models/mobileV2';
+import {
+  DraggableToolbarButton,
+  ToolbarHideZone,
+  ToolbarMenuDropTarget,
+  toolbarDndType,
+  toolbarRowHighlightClass,
+  useToolbarDragState,
+  useToolbarRowDrop,
+} from './ToolbarDnd';
+import { portableToolbarButtons } from './PortableToolbarButtons';
+import { appState, type SceneSelectorItem } from '../models/AppService';
+import { registerSceneSelectorHost } from '../models/sceneSelectorHost';
+import { splitNameLines, validateNameLines } from '../models/nameInput';
+import { prepareMirrorCanvas } from '../models/workflows/SDWorkFlow';
+import { oneTimeFlowMap, oneTimeFlows } from '../models/workflows/OneTimeFlows';
+import {
+  getSceneSeedGroupInfo,
+  MAX_NAI_SEED,
+  setSceneSeedGroupSeed,
+} from '../models/sceneSeedGroups';
+import {
+  activeCombinationPieceKeys,
+  allCombinationPieceKeys,
+  applyCombinationPieceSelection,
+  combinationCountForSelection,
+  selectionHasEveryCombinationColumn,
+} from '../models/combinationSelection';
+import CompactCombinationPieces from './CompactCombinationPieces';
+import { backStackService } from '../models/BackStackService';
+
+// createMissingPiecesForSession / queueScene 는 models/sceneQueueActions.ts 로 이전
+// (AppContextMenu 우클릭 메뉴와 공유 — 중복 제거)
+
+// 드래그 중인 카드와 같은 종류(탭)의 선택만, 그 탭의 표시 순서로 돌려준다.
+// 일반/변형 씬은 이름이 겹칠 수 있어 종류를 섞어 조회하지 않는다(sceneSelection.ts).
+function getSelectedSceneNames(
+  session: Session,
+  type: 'scene' | 'inpaint',
+): string[] {
+  if (appState.selectedScenesType !== type) return [];
+  return session
+    .getScenes(type)
+    .filter((s) => appState.selectedScenes.has(s.name))
+    .map((s) => s.name);
+}
+
+interface SceneSeedGroupBadgeProps {
+  session: Session;
+  scene: Scene;
+}
+
+const SCENE_SEED_GROUP_COLOR_CLASSES = [
+  'btn-solid-sky',
+  'btn-solid-purple',
+  'btn-solid-green',
+  'btn-solid-orange',
+  'btn-solid-indigo',
+  'btn-solid-red',
+  'btn-solid-yellow',
+] as const;
+
+const SceneSeedGroupBadge = observer(
+  ({ session, scene }: SceneSeedGroupBadgeProps) => {
+    const group = getSceneSeedGroupInfo(session, scene);
+    const [open, setOpen] = useState(false);
+    const [value, setValue] = useState('');
+    const cancelSaveRef = useRef(false);
+
+    useEffect(() => {
+      if (!open) return;
+      cancelSaveRef.current = false;
+      setValue(group?.seed?.toString() ?? '');
+    }, [open, group?.id, group?.seed]);
+
+    if (!group) return null;
+    const colorClass =
+      SCENE_SEED_GROUP_COLOR_CLASSES[
+        group.displayIndex % SCENE_SEED_GROUP_COLOR_CLASSES.length
+      ];
+
+    const save = () => {
+      const trimmed = value.trim();
+      const seed = trimmed === '' ? undefined : Number(trimmed);
+      if (
+        seed !== undefined &&
+        (!Number.isInteger(seed) || seed < 0 || seed > MAX_NAI_SEED)
+      ) {
+        appState.pushMessage(
+          `시드는 0~${MAX_NAI_SEED} 사이의 정수여야 합니다.`,
+        );
+        setValue(group.seed?.toString() ?? '');
+        return;
+      }
+      if (setSceneSeedGroupSeed(session, group.id, seed)) {
+        sessionService.markDirty(session.name);
+      }
+    };
+
+    return (
+      <div
+        role="presentation"
+        className={`absolute ${isMobile ? 'right-10' : 'right-9'} top-1 z-30`}
+        onClick={(event) => event.stopPropagation()}
+        onContextMenu={(event) => event.stopPropagation()}
+      >
+        <button
+          type="button"
+          className={`relative touch-hit w-7 h-7 p-0 rounded-full btn ${colorClass} opacity-80 hover:opacity-100 text-xs font-bold shadow clickable flex items-center justify-center`}
+          title={`시드 그룹 ${group.label}`}
+          onClick={() => setOpen((current) => !current)}
+        >
+          {group.label}
+        </button>
+        {open && (
+          <input
+            // This seed field mounts only after the user opens the seed editor.
+            // eslint-disable-next-line jsx-a11y/no-autofocus
+            autoFocus
+            data-esc-cancel
+            type="text"
+            inputMode="numeric"
+            value={value}
+            placeholder="그룹 시드"
+            className="absolute right-0 top-8 w-40 gray-input text-sm"
+            onChange={(event) => setValue(event.target.value)}
+            onBlur={() => {
+              if (!cancelSaveRef.current) save();
+              setOpen(false);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') event.currentTarget.blur();
+              if (event.key === 'Escape') {
+                cancelSaveRef.current = true;
+                setOpen(false);
+              }
+            }}
+          />
+        )}
+      </div>
+    );
+  },
+);
+
+interface CombinationQuickToggleProps {
+  session: Session;
+  scene: Scene;
+  isHovered: boolean;
+}
+
+const CombinationQuickToggle = observer(
+  ({ session, scene, isHovered }: CombinationQuickToggleProps) => {
+    const [open, setOpen] = useState(false);
+    const [selected, setSelected] = useState<Set<string>>(new Set());
+    const [position, setPosition] = useState<{
+      left: number;
+      top: number;
+    } | null>(null);
+    const buttonRef = useRef<HTMLButtonElement>(null);
+    const panelRef = useRef<HTMLDivElement>(null);
+    const mouseDownOnBackdrop = useRef(false);
+
+    const openPopover = () => {
+      setSelected(activeCombinationPieceKeys(scene));
+      setPosition(null);
+      setOpen(true);
+    };
+
+    useLayoutEffect(() => {
+      if (!open || !buttonRef.current || !panelRef.current) return;
+      const anchor = buttonRef.current.getBoundingClientRect();
+      const panel = panelRef.current.getBoundingClientRect();
+      let left = anchor.right - panel.width;
+      let top = anchor.bottom + 4;
+      if (top + panel.height > window.innerHeight - 8) {
+        top = anchor.top - panel.height - 4;
+      }
+      left = Math.max(8, Math.min(left, window.innerWidth - panel.width - 8));
+      top = Math.max(8, Math.min(top, window.innerHeight - panel.height - 8));
+      setPosition({ left, top });
+    }, [open]);
+
+    useEffect(() => {
+      if (!open) return undefined;
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
+          event.stopPropagation();
+          setOpen(false);
+        }
+      };
+      window.addEventListener('keydown', handleKeyDown, true);
+      return () => window.removeEventListener('keydown', handleKeyDown, true);
+    }, [open]);
+
+    useEffect(() => {
+      if (!open) return undefined;
+      const handle = backStackService.push(() => setOpen(false));
+      return () => handle.remove();
+    }, [open]);
+
+    const togglePiece = (key: string) => {
+      setSelected((current) => {
+        const next = new Set(current);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    };
+
+    const valid = selectionHasEveryCombinationColumn(scene, selected);
+    const combinationTotal = combinationCountForSelection(scene, selected);
+    const portalHost =
+      buttonRef.current?.closest<HTMLElement>('[data-app-theme-root]') ??
+      document.body;
+
+    const popover = open
+      ? createPortal(
+          <div
+            role="presentation"
+            className="fixed inset-0"
+            style={{ zIndex: 'var(--z-modal)' }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => {
+              event.stopPropagation();
+              mouseDownOnBackdrop.current =
+                event.target === event.currentTarget;
+            }}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (
+                event.target === event.currentTarget &&
+                mouseDownOnBackdrop.current
+              ) {
+                setOpen(false);
+              }
+              mouseDownOnBackdrop.current = false;
+            }}
+            onContextMenu={(event) => event.stopPropagation()}
+          >
+            <div
+              role="presentation"
+              ref={panelRef}
+              className="fixed w-80 max-w-[calc(100vw-16px)] max-h-[60vh] rounded-lg r-popover border line-color bg-[var(--c-zone)] shadow-2xl flex flex-col overflow-hidden"
+              style={{
+                left: position?.left ?? 8,
+                top: position?.top ?? 8,
+                visibility: position ? 'visible' : 'hidden',
+              }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex-none px-3 py-2 border-b line-color">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-bold text-default">
+                    조합 퀵 토글
+                  </span>
+                  <span className="text-xs text-muted">
+                    선택 결과 {combinationTotal}종
+                  </span>
+                </div>
+                {!valid && (
+                  <div className="mt-1 text-xs text-red-500 dark:text-red-400">
+                    각 열에서 한 조각 이상 선택해 주세요.
+                  </div>
+                )}
+              </div>
+              <div className="flex-1 min-h-0 overflow-auto p-2 space-y-2">
+                <CompactCombinationPieces
+                  scene={scene}
+                  selected={selected}
+                  onSelect={togglePiece}
+                />
+              </div>
+              <div className="flex-none flex items-center justify-end gap-2 px-3 py-2 border-t line-color">
+                <button
+                  type="button"
+                  className="btn rounded px-3 py-1.5 btn-neutral text-sm"
+                  onClick={() => setSelected(allCombinationPieceKeys(scene))}
+                >
+                  초기화
+                </button>
+                <button
+                  type="button"
+                  className="btn rounded px-3 py-1.5 btn-solid-sky text-sm"
+                  disabled={!valid}
+                  onClick={() => {
+                    const changed = applyCombinationPieceSelection(
+                      scene,
+                      selected,
+                    );
+                    if (changed > 0) sessionService.markDirty(session.name);
+                    setOpen(false);
+                  }}
+                >
+                  확인
+                </button>
+              </div>
+            </div>
+          </div>,
+          portalHost,
+        )
+      : null;
+
+    return (
+      <>
+        <div
+          role="presentation"
+          className={`absolute right-1 ${isMobile ? 'top-10' : 'top-9'} z-30`}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.stopPropagation()}
+        >
+          <Tooltip content="조합 에디터 퀵 토글">
+            <button
+              ref={buttonRef}
+              type="button"
+              className={`relative touch-hit w-7 h-7 rounded-full bg-black/55 hover:bg-black/80 text-white clickable flex items-center justify-center transition-opacity duration-200${
+                !isMobile && !isHovered && !open ? ' opacity-0' : ''
+              }`}
+              onClick={() => {
+                if (open) setOpen(false);
+                else openPopover();
+              }}
+            >
+              <FaToggleOn size={13} />
+            </button>
+          </Tooltip>
+        </div>
+        {popover}
+      </>
+    );
+  },
+);
+
+interface SceneCellProps {
+  scene: GenericScene;
+  sceneIndex?: number;
+  isActive?: boolean;
+  curSession: Session;
+  cellSize: number;
+  getImage: (scene: GenericScene) => Promise<string | null>;
+  setDisplayScene?: (scene: GenericScene) => void;
+  setEditingScene?: (scene: GenericScene) => void;
+  moveScene?: (scene: GenericScene, index: number) => void;
+  moveScenes?: (scenes: GenericScene[], targetIndex: number) => void;
+  style?: React.CSSProperties;
+  isBookmarked?: boolean;
+  onToggleBookmark?: () => void;
+  disableHover?: boolean;
+  isFocused?: boolean;
+  // 프롬프트 퀵 수정(W2) — 일반 씬 전용, 이미지 우상단 오버레이 버튼.
+  // anchor = 씬 카드 사각형 (모달을 카드 위에 띄우는 인라인 느낌용)
+  onQuickPrompt?: (scene: GenericScene, anchor?: DOMRect) => void;
+  onReview?: (scene: GenericScene) => void;
+}
+
+export const SceneCell = observer(
+  ({
+    scene,
+    sceneIndex,
+    isActive = true,
+    getImage,
+    setDisplayScene,
+    moveScene,
+    moveScenes,
+    setEditingScene,
+    curSession,
+    cellSize,
+    style,
+    isBookmarked,
+    onToggleBookmark,
+    disableHover,
+    isFocused,
+    onQuickPrompt,
+    onReview,
+  }: SceneCellProps) => {
+    const { show, hideAll } = useContextMenu({
+      id: ContextMenuType.Scene,
+    });
+    const [image, setImage] = useState<string | undefined>(undefined);
+    const [previewIndex, setPreviewIndex] = useState(-1);
+    const [previewImage, setPreviewImage] = useState<string | null>(null);
+    const [isHovered, setIsHovered] = useState(false);
+    const activeRef = useRef(isActive);
+    activeRef.current = isActive;
+    const getImageRef = useRef(getImage);
+    getImageRef.current = getImage;
+    let emoji = '';
+    if (scene.type === 'inpaint') {
+      const def = workFlowService.getDef(scene.workflowType);
+      if (def) {
+        emoji = def.emoji ?? '';
+      }
+    }
+
+    const isClassic = appState.classicSceneCard;
+    const tabType = scene.type === 'inpaint' ? 'inpaint' : 'scene';
+    const cardStyle = curSession.sceneCardStyle?.[tabType] ?? 'portrait';
+    const aspectMap: Record<string, string> = {
+      portrait: 'aspect-[3/4]',
+      square: 'aspect-square',
+      landscape: 'aspect-[4/3]',
+    };
+    const aspectClass = aspectMap[cardStyle];
+    // 모바일: 반응형 그리드(QueueControl 의 gridTemplateColumns)가 열 폭을 정하므로 카드는
+    // 셀을 채우는 정사각형이다(과거 w-36 h-36 고정 → 오른쪽 빈 띠·폭 불변 문제, 2026-09-20).
+    const cellSizes = isMobile
+      ? ['w-full aspect-square', 'w-full aspect-square', 'w-full aspect-square']
+      : aspectClass
+        ? [
+            `w-full ${aspectClass}`,
+            `w-full ${aspectClass}`,
+            `w-full ${aspectClass}`,
+          ]
+        : ['w-full h-48', 'w-full h-64', 'w-full h-96'];
+    const cellSizes3 = ['', '', ''];
+
+    const outputs = gameService.getOutputs(curSession!, scene);
+    const totalImages = outputs.length;
+    const currentPreviewIsFavorite =
+      previewIndex >= 0 && previewIndex < totalImages
+        ? scene.mains.includes(outputs[previewIndex])
+        : scene.mains.length > 0;
+
+    const isInputFocusedLocal = useCallback(() => {
+      const el = document.activeElement;
+      if (!el) return false;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'input' || tag === 'textarea') return true;
+      if ((el as HTMLElement).isContentEditable) return true;
+      return false;
+    }, []);
+
+    useEffect(() => {
+      if (!isActive) return undefined;
+      let cancelled = false;
+      if (previewIndex >= 0 && previewIndex < totalImages) {
+        const filename = outputs[previewIndex];
+        const dir = imageService.getOutputDir(curSession!, scene);
+        imageService
+          .fetchImageSmall(`${dir}/${filename}`, platform.sceneThumbSize)
+          .then((loadedImage) => {
+            if (!cancelled && activeRef.current) setPreviewImage(loadedImage);
+
+            return undefined;
+          })
+          .catch(() => {
+            if (!cancelled && activeRef.current) setPreviewImage(null);
+          });
+      } else {
+        setPreviewImage(null);
+      }
+      return () => {
+        cancelled = true;
+      };
+    }, [isActive, previewIndex, totalImages, outputs, curSession, scene]);
+
+    useEffect(() => {
+      if (!isActive || !isHovered) return undefined;
+      const handler = (e: KeyboardEvent) => {
+        if (isInputFocusedLocal()) return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+        if (e.key === 'a' || e.key === 'A' || e.key === ',') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (totalImages === 0) return;
+          setPreviewIndex((prev) => {
+            if (prev <= 0) return totalImages - 1;
+            return prev - 1;
+          });
+        } else if (e.key === 'd' || e.key === 'D' || e.key === '.') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (totalImages === 0) return;
+          setPreviewIndex((prev) => {
+            if (prev < 0 || prev >= totalImages - 1) return 0;
+            return prev + 1;
+          });
+        } else if (e.key === 'f' || e.key === 'F') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (previewIndex < 0 || previewIndex >= totalImages) return;
+          const filename = outputs[previewIndex];
+          toggleImageMain(curSession!, scene, filename);
+        }
+      };
+      window.addEventListener('keydown', handler, true);
+      return () => window.removeEventListener('keydown', handler, true);
+    }, [
+      isActive,
+      isHovered,
+      previewIndex,
+      totalImages,
+      outputs,
+      scene,
+      curSession,
+      isInputFocusedLocal,
+    ]);
+
+    // 키보드 포커스된 씬의 이미지 넘기기/즐겨찾기.
+    // 부모(SceneQueueControl)가 A/D/F 를 이 이벤트로 디스패치한다. 마우스 호버 셀은
+    // 위의 capture 핸들러가 stopPropagation 으로 선점하므로, 호버가 항상 우선된다.
+    useEffect(() => {
+      if (!isActive) return undefined;
+      const handler = (e: Event) => {
+        const { detail } = e as CustomEvent;
+        if (!detail) return;
+        if (detail.sceneName !== scene.name || detail.sceneType !== scene.type)
+          return;
+        if (detail.action === 'prev') {
+          if (totalImages === 0) return;
+          setPreviewIndex((prev) => (prev <= 0 ? totalImages - 1 : prev - 1));
+        } else if (detail.action === 'next') {
+          if (totalImages === 0) return;
+          setPreviewIndex((prev) =>
+            prev < 0 || prev >= totalImages - 1 ? 0 : prev + 1,
+          );
+        } else if (detail.action === 'fav') {
+          if (previewIndex < 0 || previewIndex >= totalImages) return;
+          const filename = outputs[previewIndex];
+          toggleImageMain(curSession!, scene, filename);
+        }
+      };
+      window.addEventListener('scene-image-nav', handler);
+      return () => window.removeEventListener('scene-image-nav', handler);
+    }, [isActive, scene, totalImages, outputs, previewIndex, curSession]);
+
+    // 키보드 포커스가 떠나고 호버도 아니면 미리보기를 초기화한다.
+    // (포커스가 다른 씬으로 이동했을 때 이전 미리보기 잔상이 남지 않도록)
+    useEffect(() => {
+      if (isActive && !isFocused && !isHovered) setPreviewIndex(-1);
+    }, [isActive, isFocused, isHovered]);
+
+    useEffect(() => {
+      if (!isActive) setIsHovered(false);
+    }, [isActive]);
+
+    // 검색으로 걸러진 표시 순서 대신 원래 씬 순서를 DnD에 전달한다.
+    const curIndex =
+      sceneIndex ?? curSession.getScenes(scene.type).indexOf(scene);
+    const cardElRef = useRef<HTMLDivElement | null>(null);
+    const [{ isDragging }, drag, preview] = useDrag(
+      () => ({
+        type: 'scene',
+        item: () => {
+          const cardWidth = cardElRef.current?.offsetWidth;
+          const isSelected = isSceneSelected(
+            {
+              names: appState.selectedScenes,
+              type: appState.selectedScenesType,
+            },
+            scene,
+          );
+          const selectedSceneNames = isSelected
+            ? getSelectedSceneNames(curSession, scene.type)
+            : [];
+          return {
+            scene,
+            curIndex,
+            getImage,
+            curSession,
+            cellSize,
+            cardWidth,
+            selectedSceneNames,
+          };
+        },
+        collect: (monitor) => {
+          const diff = monitor.getDifferenceFromInitialOffset();
+          if (diff) {
+            const dist = Math.sqrt(diff.x ** 2 + diff.y ** 2);
+            if (dist > 20) {
+              hideAll();
+            }
+          }
+          return {
+            isDragging: monitor.isDragging(),
+          };
+        },
+        end: (item, monitor) => {
+          // if (!isMobile) return;
+          const { scene: droppedScene, curIndex: droppedIndex } = item;
+          const didDrop = monitor.didDrop();
+          if (!didDrop) {
+            moveScene!(droppedScene, droppedIndex);
+          }
+        },
+      }),
+      [curIndex, scene, cellSize],
+    );
+
+    useEffect(() => {
+      preview(getEmptyImage(), { captureDraggingState: true });
+    }, [preview]);
+
+    const [{ isOver }, drop] = useDrop<any, any, any>(
+      () => ({
+        accept: 'scene',
+        canDrop: () => true,
+        collect: (monitor) => {
+          if (monitor.isOver()) {
+            return {
+              isOver: true,
+            };
+          }
+          return { isOver: false };
+        },
+        hover({
+          scene: _draggedScene,
+          curIndex: _draggedIndex,
+        }: {
+          scene: GenericScene;
+          curIndex: number;
+        }) {},
+        drop: (item: any, _monitor) => {
+          const overIndex = curSession.getScenes(scene.type).indexOf(scene);
+          if (
+            item.selectedSceneNames &&
+            item.selectedSceneNames.length > 1 &&
+            moveScenes
+          ) {
+            const selectedScenes: GenericScene[] = [];
+            for (const name of item.selectedSceneNames) {
+              // 드롭 대상과 같은 종류에서만 조회 — 이름이 같은 다른 탭 씬을 옮기지 않는다
+              const s = curSession.getScene(scene.type, name);
+              if (s) selectedScenes.push(s);
+            }
+            if (selectedScenes.length > 0) {
+              moveScenes(selectedScenes, overIndex);
+              return;
+            }
+          }
+          const { scene: droppedScene } = item;
+          moveScene!(droppedScene, overIndex);
+        },
+      }),
+      [curSession, scene, moveScene, moveScenes],
+    );
+
+    const addToQueue = async (targetScene: GenericScene) => {
+      try {
+        const missing = promptService.findMissingPieces(
+          curSession,
+          targetScene,
+        );
+        if (missing.length > 0) {
+          const list = missing
+            .map((m) => `<${m.library}.${m.piece}>`)
+            .join(', ');
+          appState.pushDialog({
+            type: 'confirm',
+            text: `존재하지 않는 프롬프트조각이 발견되었습니다:\n${list}\n\n로컬 프롬프트조각으로 새로 만들까요?\n(빈 조각이 생성되며, 내용은 직접 채워주세요)`,
+            callback: async () => {
+              createMissingPiecesForSession(curSession, missing);
+              try {
+                await queueScene(curSession, targetScene, appState.samples);
+              } catch (e: any) {
+                appState.pushMessage(`프롬프트 에러: ${e.message}`);
+              }
+            },
+          });
+          return;
+        }
+        await queueScene(curSession, targetScene, appState.samples);
+      } catch (e: any) {
+        appState.pushMessage(`프롬프트 에러: ${e.message}`);
+      }
+    };
+
+    const [, rerender] = useState<{}>({});
+
+    const removeFromQueue = (targetScene: GenericScene) => {
+      taskQueueService.removeTasksFromScene(targetScene);
+    };
+
+    const getSceneQueueCount = (targetScene: GenericScene) => {
+      const stats = taskQueueService.statsTasksFromScene(
+        curSession!,
+        targetScene,
+      );
+      // 표시 방어: 통계가 일시적으로 어긋나도 음수 배지는 만들지 않는다.
+      return Math.max(0, stats.total - stats.done);
+    };
+
+    useEffect(() => {
+      if (!isActive) return undefined;
+      let cancelled = false;
+      let request = 0;
+      const onUpdate = () => {
+        if (activeRef.current) rerender({});
+      };
+      const refreshImage = async () => {
+        if (!activeRef.current) return;
+        const currentRequest = ++request;
+        try {
+          const base64 = await getImageRef.current(scene);
+          if (cancelled || !activeRef.current || currentRequest !== request)
+            return;
+          setImage(base64 ?? undefined);
+        } catch {
+          if (cancelled || !activeRef.current || currentRequest !== request)
+            return;
+          setImage(undefined);
+        }
+        rerender({});
+      };
+      refreshImage();
+      gameService.addEventListener('updated', refreshImage);
+      taskQueueService.addEventListener('progress', onUpdate);
+      imageService.addEventListener('image-cache-invalidated', refreshImage);
+      const dispose = reaction(
+        () => scene.mains.join(''),
+        () => {
+          refreshImage();
+        },
+      );
+      const dispose2 = reaction(
+        () => scene.type === 'inpaint' && scene.preset?.image,
+        () => {
+          refreshImage();
+        },
+      );
+      return () => {
+        cancelled = true;
+        gameService.removeEventListener('updated', refreshImage);
+        taskQueueService.removeEventListener('progress', onUpdate);
+        imageService.removeEventListener(
+          'image-cache-invalidated',
+          refreshImage,
+        );
+        dispose();
+        dispose2();
+      };
+    }, [isActive, scene, curSession]);
+
+    const cardRef = (node: any) => {
+      cardElRef.current = node;
+      drag(drop(appState.sceneSelectionMode ? null : node));
+    };
+    const onContext = (e: any) => {
+      // 메뉴 라벨의 "선택한 씬(N)" 수는 우클릭한 씬과 같은 종류의 선택만 센다
+      appState.contextSceneType = scene.type;
+      show({ event: e, props: { ctx: { type: 'scene', scene } } });
+    };
+    const onClickCard = (event: any) => {
+      if (isDragging) return;
+      // 선택 모드에서는 데스크톱/모바일 모두 카드 클릭으로 선택을 토글한다.
+      if (event.ctrlKey || appState.sceneSelectionMode) {
+        appState.toggleSceneSelection(scene.name, scene.type);
+        return;
+      }
+      appState.clearSceneSelection();
+      setDisplayScene?.(scene);
+    };
+
+    // 공통 버튼 렌더
+    const renderButtons = (overlay?: boolean) => {
+      const btnClass = overlay
+        ? 'round-button scene-btn'
+        : 'round-button scene-btn';
+      const green = overlay ? 'bg-green-500 text-white' : 'back-green';
+      const gray = overlay ? 'bg-gray-500 text-white' : 'back-gray';
+      const orange = overlay ? 'bg-orange-500 text-white' : 'back-orange';
+      return (
+        <>
+          <Tooltip content="예약 추가">
+            <button
+              type="button"
+              className={`${btnClass} ${green}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                addToQueue(scene);
+              }}
+            >
+              <ActionIcon id="queue-add" />
+            </button>
+          </Tooltip>
+          <Tooltip content="예약 제거">
+            <button
+              type="button"
+              className={`${btnClass} ${gray}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                removeFromQueue(scene);
+              }}
+            >
+              <ActionIcon id="queue-remove" />
+            </button>
+          </Tooltip>
+          <Tooltip content="씬 편집">
+            <button
+              type="button"
+              className={`${btnClass} ${orange}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditingScene?.(scene);
+              }}
+            >
+              <ActionIcon id="edit" />
+            </button>
+          </Tooltip>
+          <Tooltip content="씬 북마크">
+            <button
+              type="button"
+              className={`${btnClass} ${isBookmarked ? `${orange} scene-btn-on` : gray}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleBookmark?.();
+              }}
+            >
+              <ActionIcon id="bookmark" />
+            </button>
+          </Tooltip>
+        </>
+      );
+    };
+
+    const focusRing = isFocused
+      ? ' outline outline-4 outline-sky-400 outline-offset-2'
+      : '';
+    const isSelected = isSceneSelected(
+      { names: appState.selectedScenes, type: appState.selectedScenesType },
+      scene,
+    );
+    const seedGroupBadge =
+      scene.type === 'scene' ? (
+        <SceneSeedGroupBadge session={curSession} scene={scene} />
+      ) : null;
+    const combinationQuickToggle =
+      scene.type === 'scene' ? (
+        <CombinationQuickToggle
+          session={curSession}
+          scene={scene}
+          isHovered={isHovered}
+        />
+      ) : null;
+
+    // 프롬프트 퀵 수정 버튼(W2) — 이미지 우상단 오버레이(클래식/신규 공용).
+    // 하단 버튼 행은 4개가 상한(스몰 뷰·모바일 그리드 보전)이라 행에 넣지 않는다.
+    // 모바일 오버레이 버튼(시드 배지·연필·조합 토글·R)은 28px 외형 유지+touch-hit 로 판정 36px,
+    // 판정이 겹치지 않도록 서로 8px 간격(top-1/top-10/top-[4.75rem], 배지 right-10)을 둔다.
+    const quickPromptButton =
+      onQuickPrompt && scene.type === 'scene' ? (
+        <Tooltip content="중간 프롬프트 퀵 수정">
+          <button
+            type="button"
+            className={`touch-hit absolute right-1 top-1 z-20 w-7 h-7 rounded-full bg-black/55 hover:bg-black/80 text-white clickable flex items-center justify-center transition-opacity duration-200${
+              !isMobile && !isHovered ? ' opacity-0' : ''
+            }`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onQuickPrompt(
+                scene,
+                cardElRef.current?.getBoundingClientRect() ?? undefined,
+              );
+            }}
+          >
+            <FaPen size={11} />
+          </button>
+        </Tooltip>
+      ) : null;
+    const reviewButton = onReview ? (
+      <Tooltip content="이 씬부터 이미지 검수">
+        <button
+          type="button"
+          className={`touch-hit absolute right-1 ${scene.type === 'scene' ? (isMobile ? 'top-[4.75rem]' : 'top-[4.25rem]') : 'top-1'} z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/55 hover:bg-black/80 text-white clickable text-xs font-bold transition-opacity duration-200${
+            !isMobile && !isHovered ? ' opacity-0' : ''
+          }`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onReview(scene);
+          }}
+        >
+          R
+        </button>
+      </Tooltip>
+    ) : null;
+
+    // 모바일: 오버레이 버튼(연필·조합 토글·R)을 살짝 빗나간 탭이 카드 탭(이미지 그리드 열기)으로
+    // 떨어지지 않도록 버튼 열 주변에 무반응 영역을 둔다. 크기는 버튼 터치 판정(36px) 열과
+    // 그 사이 8px 틈만 덮는 36×108px — 더 넓히면 카드 중앙 오른쪽 탭까지 먹혀 실기기에서 기각됨. 클릭만 삼키므로 길게 누르기 메뉴·드래그
+    // 정렬은 그대로이고, 선택 모드에서는 카드 어디를 눌러도 선택되도록 통과시킨다.
+    const overlayDeadZone = isMobile ? (
+      <div
+        role="presentation"
+        aria-hidden="true"
+        className={`absolute right-0 top-0 z-10 w-9 ${
+          scene.type === 'scene' ? 'h-[6.75rem]' : onReview ? 'h-9' : 'hidden'
+        }`}
+        onClick={(event) => {
+          if (appState.sceneSelectionMode) return;
+          event.stopPropagation();
+        }}
+      />
+    ) : null;
+
+    if (isClassic) {
+      // ===== 클래식 디자인 =====
+      return (
+        <div
+          id={`scene-cell-${scene.type}-${scene.name}`}
+          className={`relative z-0 ${isMobile ? 'm-[5px]' : 'm-[10.5px]'} p-1 bg-[var(--c-surface-2)] border line-color ${
+            isDragging ? 'opacity-0 no-touch ' : ''
+          }${isOver ? ' outline outline-sky-500' : ''}${
+            isSelected
+              ? ' ring-2 ring-sky-500 bg-sky-50 dark:bg-sky-900/20'
+              : ''
+          }${focusRing}`}
+          style={style}
+          ref={cardRef}
+          onContextMenu={onContext}
+          onMouseEnter={() => {
+            if (!isMobile) setIsHovered(true);
+          }}
+          onMouseLeave={() => {
+            setIsHovered(false);
+            setPreviewIndex(-1);
+          }}
+        >
+          {getSceneQueueCount(scene) > 0 && (
+            <span className="absolute right-0 bg-yellow-400 dark:bg-indigo-400 inline-block mr-3 px-2 py-1 text-center align-middle rounded-md font-bold text-white">
+              {getSceneQueueCount(scene)}
+            </span>
+          )}
+          <div className="-z-10 bg-[var(--c-surface-2)]">
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={onClickCard}
+              className={`p-2 w-full flex text-left text-lg text-default ${cellSizes3[cellSize]}`}
+            >
+              <span className="truncate flex-1">
+                {isBookmarked && (
+                  <ActionIcon
+                    id="bookmark"
+                    className="inline-block text-orange-500 mr-0.5 align-[-0.125em]"
+                    aria-label="북마크됨"
+                  />
+                )}
+                {emoji}
+                {scene.name}
+              </span>
+              <span className="flex-none text-faint">
+                {previewIndex >= 0
+                  ? `${previewIndex + 1}/${totalImages}`
+                  : totalImages}{' '}
+              </span>
+            </button>
+            <div className="relative">
+              {seedGroupBadge}
+              {combinationQuickToggle}
+              <div
+                className={`relative image-cell overflow-hidden ${cellSizes[cellSize]}`}
+              >
+                <button
+                  type="button"
+                  className="absolute inset-0 z-0 w-full h-full"
+                  aria-label={`${scene.name} ${appState.sceneSelectionMode ? '선택' : '이미지 열기'}`}
+                  aria-pressed={
+                    appState.sceneSelectionMode ? isSelected : undefined
+                  }
+                  onClick={onClickCard}
+                />
+                {(previewImage || image) && (
+                  <div className="relative w-full h-full pointer-events-none">
+                    <img
+                      alt={scene.name}
+                      src={previewImage || image}
+                      draggable={false}
+                      className={`w-full h-full object-contain z-0${
+                        currentPreviewIsFavorite
+                          ? ' border-2 border-yellow-400'
+                          : ''
+                      }`}
+                    />
+                    {currentPreviewIsFavorite && (
+                      <div className="absolute left-1 top-1 z-10 text-yellow-400 text-sm drop-shadow flex items-center gap-1">
+                        <FaStar />
+                        {scene.mains.length > 1 && (
+                          <span className="bg-black/70 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center font-bold leading-none">
+                            {scene.mains.length}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {overlayDeadZone}
+                {quickPromptButton}
+                {reviewButton}
+              </div>
+            </div>
+          </div>
+          <div className="scene-btn-row w-full flex mt-auto justify-center items-center gap-1 md:gap-2 p-1 md:p-2">
+            {renderButtons(false)}
+          </div>
+        </div>
+      );
+    }
+
+    // ===== 신규 디자인 =====
+    return (
+      <div
+        id={`scene-cell-${scene.type}-${scene.name}`}
+        className={`${disableHover ? '' : 'group '}relative z-0 ${isMobile ? 'm-[5px]' : 'm-[8.5px]'} p-1 rounded-lg bg-[var(--c-surface-2)] border-2 ${
+          currentPreviewIsFavorite
+            ? 'border-yellow-400 '
+            : isSelected
+              ? 'border-sky-500 '
+              : 'line-color '
+        }${isDragging ? 'opacity-0 no-touch ' : ''}${
+          isOver ? ' ring-2 ring-sky-500' : ''
+        }${isSelected ? ' ring-2 ring-sky-400' : ''}${focusRing}`}
+        style={style}
+        ref={cardRef}
+        onContextMenu={onContext}
+        onMouseEnter={() => {
+          if (!isMobile) setIsHovered(true);
+        }}
+        onMouseLeave={() => {
+          setIsHovered(false);
+          setPreviewIndex(-1);
+        }}
+      >
+        {/* 선택 모드: 파란 오버레이 */}
+        {isSelected && (
+          <div className="absolute inset-0 rounded-lg bg-sky-500/25 z-10 pointer-events-none" />
+        )}
+        {getSceneQueueCount(scene) > 0 && (
+          <span className="absolute left-2 top-2 z-20 bg-yellow-400 dark:bg-indigo-400 px-2 py-0.5 rounded-full text-sm font-bold text-white shadow">
+            {getSceneQueueCount(scene)}
+          </span>
+        )}
+        <div className="bg-[var(--c-surface-2)]">
+          <div className="relative">
+            {seedGroupBadge}
+            {combinationQuickToggle}
+            <div
+              className={`relative image-cell overflow-hidden rounded-md ${
+                cellSizes[cellSize]
+              }`}
+            >
+              <button
+                type="button"
+                className="absolute inset-0 z-0 w-full h-full"
+                aria-label={`${scene.name} ${appState.sceneSelectionMode ? '선택' : '이미지 열기'}`}
+                aria-pressed={
+                  appState.sceneSelectionMode ? isSelected : undefined
+                }
+                onClick={onClickCard}
+              />
+              {(previewImage || image) && (
+                <div className="relative w-full h-full pointer-events-none">
+                  <img
+                    alt={scene.name}
+                    src={previewImage || image}
+                    draggable={false}
+                    className="w-full h-full object-cover z-0"
+                  />
+                  {currentPreviewIsFavorite && (
+                    <div className="absolute left-1 top-1 z-10 text-yellow-400 text-sm drop-shadow flex items-center gap-1">
+                      <FaStar />
+                      {scene.mains.length > 1 && (
+                        <span className="bg-black/70 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center font-bold leading-none">
+                          {scene.mains.length}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* 씬 이름 + 이미지 카운트 오버레이 */}
+              <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[5] bg-gradient-to-t from-black/70 to-transparent px-2 pt-4 pb-1.5">
+                <div className="flex items-center text-sm text-white">
+                  <div className="truncate flex-1 font-medium drop-shadow">
+                    {isBookmarked && (
+                      <ActionIcon
+                        id="bookmark"
+                        className="inline-block text-orange-500 mr-0.5 align-[-0.125em]"
+                        aria-label="북마크됨"
+                      />
+                    )}
+                    {emoji}
+                    {scene.name}
+                  </div>
+                  <div className="flex-none ml-1 text-white/80 drop-shadow">
+                    {previewIndex >= 0
+                      ? `${previewIndex + 1}/${totalImages}`
+                      : totalImages}
+                  </div>
+                </div>
+              </div>
+              {overlayDeadZone}
+              {quickPromptButton}
+              {reviewButton}
+            </div>
+          </div>
+        </div>
+        {/* PC 전용: 호버 시 버튼 */}
+        {!isMobile && (
+          <div className="absolute bottom-0 left-0 right-0 flex justify-center items-center gap-1.5 z-20 py-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+            {renderButtons(true)}
+          </div>
+        )}
+        {/* 모바일 전용: 하단 버튼 */}
+        <div
+          className={`scene-btn-row w-full flex mt-auto justify-center items-center gap-1 p-1 ${isMobile ? '' : 'md:hidden'}`}
+        >
+          {renderButtons(false)}
+        </div>
+      </div>
+    );
+  },
+);
+
+// 씬 휴지통 목록은 componenets/TrashViews.tsx 의 SceneTrashView 로 이전(2026-10-02 T1).
+
+const QueueControl = observer(
+  ({
+    type,
+    isActive = true,
+    className,
+    showPannel,
+    filterFunc,
+    onClose,
+  }: SceneQueueProps) => {
+    const curSession = appState.curSession!;
+    const mainDragSurface = type === 'scene' && !!showPannel;
+    const selectionSurfaceRef = useRef<HTMLElement | null>(null);
+    const [, rerender] = useState<{}>({});
+    const [editingScene, _setEditingScene] = useState<GenericScene | undefined>(
+      undefined,
+    );
+    const [editingSceneTab, setEditingSceneTab] = useState<number | undefined>(
+      undefined,
+    );
+    const setEditingScene = useCallback(
+      (scene: GenericScene | undefined, tabIndex?: number) => {
+        _setEditingScene(scene);
+        setEditingSceneTab(tabIndex);
+      },
+      [],
+    );
+    const [inpaintEditScene, setInpaintEditScene] = useState<
+      InpaintScene | undefined
+    >(undefined);
+    const [displayScene, setDisplayScene] = useState<GenericScene | undefined>(
+      undefined,
+    );
+    const [imageReview, setImageReview] = useState<
+      { startScene?: GenericScene } | undefined
+    >(undefined);
+    // 프롬프트 퀵 수정(W2) 대상 씬 (+카드 앵커 사각형 — 카드 위에 모달 배치)
+    const [quickPromptScene, setQuickPromptScene] = useState<
+      { scene: Scene; anchor?: DOMRect } | undefined
+    >(undefined);
+    // 히스토리에서 "이 이미지가 있는 그리드 열기" 요청 시 포커스할 파일명
+    const [displayFocus, setDisplayFocus] = useState<string | undefined>(
+      undefined,
+    );
+    const [cellSize, setCellSize] = useState(1);
+    const [focusedSceneIndex, setFocusedSceneIndex] = useState<number | null>(
+      null,
+    );
+    const gridContainerRef = useRef<HTMLDivElement>(null);
+    const [sceneSearchQuery, setSceneSearchQuery] = useState('');
+    const [showSceneSearch, setShowSceneSearch] = useState(false);
+    // 모바일 V2(선택형 배치): 씬 툴바 줄 대신 하단 메인 줄, 검색·프롬프트조각은 상단 슬롯, 프롬프트 도구는 시트 슬롯으로 보낸다.
+    // 메인 탭의 씬 목록에만 적용한다(이미지 상세 안의 파생 목록=filterFunc 는 클래식 그대로). models/mobileV2.ts
+    const v2Layout = isV2('main') && !!showPannel && !filterFunc;
+    const v2TopSlot = useV2Slot(V2_TOP_SLOT_ID, v2Layout && isActive);
+    // 프롬프트조각은 어느 탭에서든 같은 자리에 있어야 하므로, 활성 여부와 무관하게 이미지생성 탭의 목록이 맡는다.
+    const v2PieceSlot = useV2Slot(
+      V2_TOP_PIECE_SLOT_ID,
+      v2Layout && type === 'scene',
+    );
+    const [v2Menu, setV2Menu] = useState<'find' | null>(null);
+    // 더보기 둘째 줄(2계층, 2026-09-24) 펼침 — 선택 모드에 들어가면 접힌다(선택 중 줄로 바뀌므로)
+    const [v2Tier, setV2Tier] = useState(false);
+    const closeV2Tier = useCallback(() => setV2Tier(false), []);
+    const { sceneSelectionMode } = appState;
+    useEffect(() => {
+      if (sceneSelectionMode) setV2Tier(false);
+    }, [sceneSelectionMode]);
+    // 씬 선택 모드 중 Android 뒤로 가기·PC Esc = 선택 모드 종료(닫기 관문, 2026-10-03 U1·X6 — 예전엔 앱 최소화).
+    // 보이는 메인 목록 하나만 등록한다(파생 목록 filterFunc·비활성 탭 제외).
+    const sceneSelectBackOn =
+      !!appState.sceneSelectionMode && isActive && !filterFunc;
+    useEffect(() => {
+      if (!sceneSelectBackOn) return undefined;
+      const handle = backStackService.push(() => {
+        appState.sceneSelectionMode = false;
+        appState.clearSceneSelection();
+      });
+      return () => handle.remove();
+    }, [sceneSelectBackOn]);
+    const { show: showSceneContextMenu } = useContextMenu({
+      id: ContextMenuType.Scene,
+    });
+    const showCheatsheet = appState.showSceneCheatsheet;
+    const sceneSearchRef = useRef<HTMLInputElement>(null);
+    const [sceneRevealRequest, setSceneRevealRequest] = useState<{
+      session: typeof curSession;
+      scene: GenericScene;
+    } | null>(null);
+    useLayoutEffect(() => {
+      if (showSceneSearch) sceneSearchRef.current?.focus();
+    }, [showSceneSearch]);
+    type SceneDragBox = {
+      x1: number;
+      y1: number;
+      x2: number;
+      y2: number;
+      deselect: boolean;
+      removeQueue: boolean;
+    };
+    const [dragBox, setDragBox] = useState<SceneDragBox | null>(null);
+    // 드래그 중 window 리스너가 최신 좌표를 읽도록 ref 로도 동기화
+    const dragBoxRef = useRef<SceneDragBox | null>(null);
+    const dragStartClientRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+    const [isSelecting, setIsSelecting] = useState(false);
+    const isDraggingRef = useRef(false);
+    const wasDraggingRef = useRef(false);
+
+    useEffect(() => {
+      if (!isActive) return undefined;
+      const onProgressUpdated = () => {
+        rerender({});
+      };
+      taskQueueService.addEventListener('progress', onProgressUpdated);
+      onProgressUpdated();
+      return () => {
+        taskQueueService.removeEventListener('progress', onProgressUpdated);
+      };
+    }, [isActive]);
+    // 씬 우클릭 메뉴의 "씬 편집기로/조합 에디터로" → 해당 타입 탭에서 에디터 열기
+    useEffect(() => {
+      const handleOpenEditor = (e: Event) => {
+        const { scene: reqScene, tabIndex } = (e as CustomEvent).detail || {};
+        if (reqScene && reqScene.type === type) {
+          if (
+            gridContainerRef.current &&
+            gridContainerRef.current.offsetParent !== null
+          ) {
+            setEditingScene(reqScene, tabIndex);
+          }
+        }
+      };
+      sessionService.addEventListener('open-scene-editor', handleOpenEditor);
+      return () => {
+        sessionService.removeEventListener(
+          'open-scene-editor',
+          handleOpenEditor,
+        );
+      };
+    }, [type, setEditingScene]);
+
+    // 히스토리 사이드바 → 해당 씬 이미지 그리드 열기 (+특정 이미지 포커스)
+    useEffect(() => {
+      const handleOpenViewer = (e: Event) => {
+        const { sceneType, sceneName, filename } =
+          (e as CustomEvent).detail || {};
+        if (sceneType !== type) return;
+        // 보이는 탭 인스턴스만 반응 (open-scene-editor와 동일한 가드)
+        if (
+          !gridContainerRef.current ||
+          gridContainerRef.current.offsetParent === null
+        )
+          return;
+        const scene =
+          type === 'scene'
+            ? curSession!.scenes.get(sceneName)
+            : curSession!.inpaints.get(sceneName);
+        if (!scene) return;
+        setDisplayFocus(filename);
+        setDisplayScene(scene);
+      };
+      sessionService.addEventListener('open-result-viewer', handleOpenViewer);
+      return () => {
+        sessionService.removeEventListener(
+          'open-result-viewer',
+          handleOpenViewer,
+        );
+      };
+    }, [type, curSession]);
+
+    // 히스토리 "해당 씬으로 이동" 등에서 열린 그리드를 외부에서 닫는 이벤트
+    // (숨은 탭 인스턴스 포함 — 가드 없이 모두 닫는다)
+    useEffect(() => {
+      const handleCloseViewer = () => {
+        setDisplayScene(undefined);
+        setDisplayFocus(undefined);
+      };
+      sessionService.addEventListener('close-result-viewer', handleCloseViewer);
+      return () => {
+        sessionService.removeEventListener(
+          'close-result-viewer',
+          handleCloseViewer,
+        );
+      };
+    }, []);
+
+    useSceneNavigationHost({
+      session: curSession,
+      type,
+      enabled: !!showPannel && !filterFunc,
+      isActive,
+      gridRef: gridContainerRef,
+      searchQuery: sceneSearchQuery,
+      clearSearch: () => setSceneSearchQuery(''),
+      viewerOpen: !!displayScene,
+      closeViewer: () => {
+        setDisplayScene(undefined);
+        setDisplayFocus(undefined);
+      },
+      openViewer: (scene, filename) => {
+        setDisplayFocus(filename);
+        setDisplayScene(scene);
+      },
+    });
+
+    const addAllToQueue = useCallback(
+      () => addScenesToQueue(curSession, type, false),
+      [curSession, type],
+    );
+    const addSelectedToQueue = useCallback(
+      () => addScenesToQueue(curSession, type, true),
+      [curSession, type],
+    );
+    // 이 탭(종류)과 일치하는 선택 수. 다른 탭의 선택은 여기서 0 으로 취급한다.
+    const selectedCount = selectedCountForType(
+      { names: appState.selectedScenes, type: appState.selectedScenesType },
+      type,
+    );
+
+    // 단축키는 활성 탭의 현재 선택만 예약한다. 숨겨진 탭은 이 이벤트를 소유하지 않는다.
+    useEffect(() => {
+      if (!isActive) return undefined;
+      const handler = (e: Event) => {
+        const action = (e as CustomEvent).detail?.action;
+        if (action === 'queue-all-scenes') {
+          if (selectedCount > 0) {
+            addSelectedToQueue();
+          } else {
+            addAllToQueue();
+          }
+        }
+      };
+      window.addEventListener('shortcut-action', handler);
+      return () => window.removeEventListener('shortcut-action', handler);
+    }, [isActive, selectedCount, addAllToQueue, addSelectedToQueue]);
+
+    // --- 씬 카드 키보드 네비게이션 ---
+    const getFilteredScenes = useCallback(() => {
+      return curSession
+        .getScenes(type)
+        .filter((x) => !filterFunc || filterFunc(x))
+        .filter(
+          (x) =>
+            !sceneSearchQuery ||
+            x.name.toLowerCase().includes(sceneSearchQuery.toLowerCase()),
+        );
+    }, [curSession, type, filterFunc, sceneSearchQuery]);
+
+    const findScene = async () => {
+      const input = await appState.pushDialogAsync({
+        type: 'input-confirm',
+        text: '찾을 씬 이름을 입력하세요',
+      });
+      if (input === undefined || !input.trim()) return;
+      const query = input.trim().toLowerCase();
+      const scenes = curSession.getScenes(type);
+      const found =
+        scenes.find((scene) => scene.name.toLowerCase() === query) ||
+        scenes.find((scene) => scene.name.toLowerCase().includes(query));
+      if (!found) {
+        appState.pushMessage(`일치하는 씬을 찾지 못했습니다: ${input.trim()}`);
+        return;
+      }
+      setSceneSearchQuery('');
+      setShowSceneSearch(false);
+      setSceneRevealRequest({ session: curSession, scene: found });
+    };
+
+    useLayoutEffect(() => {
+      if (
+        !sceneRevealRequest ||
+        sceneRevealRequest.session !== curSession ||
+        sceneRevealRequest.scene.type !== type
+      )
+        return undefined;
+      const found = sceneRevealRequest.scene;
+      const element = document.getElementById(
+        `scene-cell-${found.type}-${found.name}`,
+      );
+      if (!element) {
+        appState.pushMessage(`씬을 표시하지 못했습니다: ${found.name}`);
+        return undefined;
+      }
+      element.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+        inline: 'center',
+      });
+      const animation = element.animate(
+        [
+          { boxShadow: '0 0 0 4px var(--c-sky-bg)' },
+          { boxShadow: '0 0 0 0 transparent' },
+        ],
+        { duration: 1400, easing: 'ease-out' },
+      );
+      return () => animation.cancel();
+    }, [sceneRevealRequest, curSession, type]);
+
+    // clientX/Y → 그리드 콘텐츠 좌표(스크롤 포함). 뷰포트 범위로 클램프해서
+    // 그리드를 벗어나도 박스가 가장자리에 머물고 드래그가 유지되게 한다.
+    const toGridContentXY = useCallback(
+      (clientX: number, clientY: number) => {
+        const el = gridContainerRef.current!;
+        const r = el.getBoundingClientRect();
+        if (mainDragSurface && selectionSurfaceRef.current) {
+          const surface = selectionSurfaceRef.current.getBoundingClientRect();
+          return {
+            x:
+              Math.max(surface.left, Math.min(clientX, surface.right)) -
+              r.left +
+              el.scrollLeft,
+            y:
+              Math.max(surface.top, Math.min(clientY, surface.bottom)) -
+              r.top +
+              el.scrollTop,
+          };
+        }
+        const vx = Math.max(0, Math.min(clientX - r.left, el.clientWidth));
+        const vy = Math.max(0, Math.min(clientY - r.top, el.clientHeight));
+        return { x: vx + el.scrollLeft, y: vy + el.scrollTop };
+      },
+      [mainDragSurface],
+    );
+
+    const handleGridMouseDown = (e: React.MouseEvent | MouseEvent) => {
+      if (e.button !== 0 || !gridContainerRef.current || dragBoxRef.current) {
+        return;
+      }
+      if (
+        !canStartSelectionBox(
+          e.target,
+          appState.sceneSelectionMode,
+          '[id^="scene-cell-"]',
+        )
+      )
+        return;
+
+      const grid = gridContainerRef.current;
+      if (mainDragSurface) {
+        if (
+          !isActive ||
+          grid.offsetParent === null ||
+          appState.floatViewCount > 0 ||
+          appState.dialogs.length > 0 ||
+          appState.projectBrowserOpen
+        )
+          return;
+        const surface = mainSceneDragSurface(e.target);
+        if (
+          !surface ||
+          isOnNativeScrollbar(e.target as Element, e.clientX, e.clientY)
+        )
+          return;
+        selectionSurfaceRef.current = surface;
+      }
+      const bounds = grid.getBoundingClientRect();
+      const insideGrid =
+        e.clientX >= bounds.left &&
+        e.clientX <= bounds.right &&
+        e.clientY >= bounds.top &&
+        e.clientY <= bounds.bottom;
+      if (
+        insideGrid &&
+        (e.clientX > bounds.left + grid.clientWidth ||
+          e.clientY > bounds.top + grid.clientHeight)
+      ) {
+        return;
+      }
+      // 위쪽 툴바 아래 빈 공간은 허용하되 그리드 좌우 바깥은 시작점에서 제외한다.
+      if (
+        !mainDragSurface &&
+        !insideGrid &&
+        (e.clientX < bounds.left ||
+          e.clientX > bounds.right ||
+          e.clientY > bounds.bottom)
+      ) {
+        return;
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+      const { x, y } = toGridContentXY(e.clientX, e.clientY);
+      const start: SceneDragBox = {
+        x1: x,
+        y1: y,
+        x2: x,
+        y2: y,
+        deselect: e.shiftKey || e.ctrlKey,
+        removeQueue: e.altKey,
+      };
+      dragBoxRef.current = start;
+      dragStartClientRef.current = { x: e.clientX, y: e.clientY };
+      setDragBox(start);
+      isDraggingRef.current = false;
+      wasDraggingRef.current = false;
+      // 추적을 window 로 넘긴다(아래 useEffect): 그리드를 벗어나(프롬프트/스플리터/
+      // 스크롤 영역에 닿아도) 드래그가 끊기지 않고 실제 mouseup 에서만 끝난다.
+      setIsSelecting(true);
+    };
+
+    // 씬 박스 선택 진행: window 레벨 추적으로 영역 충돌 시 중도 취소 방지
+    useEffect(() => {
+      if (!isSelecting || !isActive || !dragBoxRef.current) return undefined;
+
+      let animationFrame = 0;
+      let pointer: { x: number; y: number } | undefined;
+
+      const updateAutoScroll = () => {
+        if (!pointer || !dragBoxRef.current || !gridContainerRef.current)
+          return;
+        const grid = gridContainerRef.current;
+        const bounds = grid.getBoundingClientRect();
+        if (
+          mainDragSurface &&
+          (pointer.x < bounds.left ||
+            pointer.x > bounds.right ||
+            pointer.y < bounds.top ||
+            pointer.y > bounds.bottom)
+        )
+          return;
+        const edgeSize = 64;
+        const maxSpeed = 24;
+        const leftRatio = (pointer.x - bounds.left) / edgeSize;
+        const rightRatio = (bounds.right - pointer.x) / edgeSize;
+        const topRatio = (pointer.y - bounds.top) / edgeSize;
+        const bottomRatio = (bounds.bottom - pointer.y) / edgeSize;
+        let dx = 0;
+        let dy = 0;
+        if (leftRatio < 1)
+          dx = -Math.ceil(maxSpeed * Math.min(1, 1 - leftRatio));
+        else if (rightRatio < 1)
+          dx = Math.ceil(maxSpeed * Math.min(1, 1 - rightRatio));
+        if (topRatio < 1) dy = -Math.ceil(maxSpeed * Math.min(1, 1 - topRatio));
+        else if (bottomRatio < 1)
+          dy = Math.ceil(maxSpeed * Math.min(1, 1 - bottomRatio));
+
+        const previousLeft = grid.scrollLeft;
+        const previousTop = grid.scrollTop;
+        if (dx || dy) {
+          grid.scrollLeft = Math.max(0, previousLeft + dx);
+          grid.scrollTop = Math.max(0, previousTop + dy);
+        }
+        if (
+          grid.scrollLeft !== previousLeft ||
+          grid.scrollTop !== previousTop
+        ) {
+          const { x, y } = toGridContentXY(pointer.x, pointer.y);
+          const next = { ...dragBoxRef.current, x2: x, y2: y };
+          dragBoxRef.current = next;
+          setDragBox(next);
+        }
+      };
+
+      const animate = () => {
+        updateAutoScroll();
+        animationFrame = window.requestAnimationFrame(animate);
+      };
+
+      const onMove = (e: MouseEvent) => {
+        const start = dragBoxRef.current;
+        if (!start || !gridContainerRef.current) return;
+        pointer = { x: e.clientX, y: e.clientY };
+        const dx = Math.abs(e.clientX - dragStartClientRef.current.x);
+        const dy = Math.abs(e.clientY - dragStartClientRef.current.y);
+        if (dx > 3 || dy > 3) isDraggingRef.current = true;
+        if (!isDraggingRef.current) return;
+        if (animationFrame === 0) {
+          animationFrame = window.requestAnimationFrame(animate);
+        }
+        const { x, y } = toGridContentXY(e.clientX, e.clientY);
+        const next: SceneDragBox = { ...start, x2: x, y2: y };
+        dragBoxRef.current = next;
+        setDragBox(next);
+      };
+
+      const onUp = () => {
+        wasDraggingRef.current = isDraggingRef.current;
+        const box = dragBoxRef.current;
+        const mainSurfaceAvailable =
+          !mainDragSurface ||
+          (isActive &&
+            gridContainerRef.current?.offsetParent !== null &&
+            appState.floatViewCount === 0 &&
+            appState.dialogs.length === 0 &&
+            !appState.projectBrowserOpen);
+        if (isDraggingRef.current && box && mainSurfaceAvailable) {
+          const left = Math.min(box.x1, box.x2);
+          const right = Math.max(box.x1, box.x2);
+          const top = Math.min(box.y1, box.y2);
+          const bottom = Math.max(box.y1, box.y2);
+          const selected: string[] = [];
+          const selectedScenes: GenericScene[] = [];
+          const scenes = getFilteredScenes();
+          const el = gridContainerRef.current;
+          if (el) {
+            const cr = el.getBoundingClientRect();
+            const sl = el.scrollLeft;
+            const st = el.scrollTop;
+            for (const scene of scenes) {
+              const cell = document.getElementById(
+                `scene-cell-${scene.type}-${scene.name}`,
+              );
+              if (!cell) continue;
+              const cc = cell.getBoundingClientRect();
+              const cx = cc.left - cr.left + sl;
+              const cy = cc.top - cr.top + st;
+              const cw = cc.width;
+              const ch = cc.height;
+              if (
+                left < cx + cw &&
+                right > cx &&
+                top < cy + ch &&
+                bottom > cy
+              ) {
+                selected.push(scene.name);
+                selectedScenes.push(scene);
+              }
+            }
+          }
+          if (selected.length > 0) {
+            if (box.removeQueue) {
+              taskQueueService.removeTasksFromScenes(
+                new Set(selectedScenes),
+                curSession,
+              );
+            } else if (box.deselect) {
+              appState.removeScenesFromSelection(selected, type);
+            } else {
+              appState.sceneSelectionMode = true;
+              appState.addScenesToSelection(selected, type);
+            }
+          }
+        }
+        dragBoxRef.current = null;
+        pointer = undefined;
+        if (animationFrame) {
+          window.cancelAnimationFrame(animationFrame);
+          animationFrame = 0;
+        }
+        setDragBox(null);
+        isDraggingRef.current = false;
+        setIsSelecting(false);
+      };
+
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+      return () => {
+        if (animationFrame) window.cancelAnimationFrame(animationFrame);
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        // A changed project, tab or filtered grid ends this gesture's ownership.
+        dragBoxRef.current = null;
+        isDraggingRef.current = false;
+        setDragBox(null);
+        setIsSelecting(false);
+      };
+    }, [
+      isSelecting,
+      isActive,
+      getFilteredScenes,
+      curSession,
+      mainDragSurface,
+      toGridContentXY,
+      type,
+    ]);
+
+    const handleGridClick = (e: React.MouseEvent | MouseEvent) => {
+      // 드래그 직후 발생하는 click은 무시 (mouseup에서 이미 선택 처리됨)
+      if (wasDraggingRef.current) {
+        wasDraggingRef.current = false;
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (
+        !appState.sceneSelectionMode &&
+        e.target === gridContainerRef.current
+      ) {
+        appState.clearSceneSelection();
+      }
+    };
+
+    useEffect(() => {
+      if (!mainDragSurface || !isActive) return undefined;
+      const click = (event: MouseEvent) => {
+        if (wasDraggingRef.current) handleGridClick(event);
+      };
+      document.addEventListener('mousedown', handleGridMouseDown, true);
+      document.addEventListener('click', click, true);
+      return () => {
+        document.removeEventListener('mousedown', handleGridMouseDown, true);
+        document.removeEventListener('click', click, true);
+      };
+    });
+
+    const getGridColumnCount = useCallback((): number => {
+      if (!gridContainerRef.current) return 1;
+      const style = window.getComputedStyle(gridContainerRef.current);
+      const cols = style.gridTemplateColumns;
+      if (!cols || cols === 'none') return 1;
+      return cols.split(' ').length;
+    }, []);
+
+    useEffect(() => {
+      if (isMobile) return undefined;
+      const sceneNavHandler = (e: Event) => {
+        const action = (e as CustomEvent).detail?.action;
+        if (!action || typeof action !== 'string') return;
+        if (
+          !action.startsWith('scene-') &&
+          action !== 'queue-run' &&
+          action !== 'queue-clear'
+        )
+          return;
+        // 비활성 탭의 QueueControl은 무시 (display:none이면 offsetParent가 null)
+        if (
+          !gridContainerRef.current ||
+          gridContainerRef.current.offsetParent === null
+        )
+          return;
+        const scenes = getFilteredScenes();
+        if (scenes.length === 0) return;
+
+        if (
+          action === 'scene-left' ||
+          action === 'scene-right' ||
+          action === 'scene-up' ||
+          action === 'scene-down'
+        ) {
+          const idx = focusedSceneIndex ?? -1;
+          if (idx < 0 || idx >= scenes.length) {
+            setFocusedSceneIndex(0);
+            return;
+          }
+          const cols = getGridColumnCount();
+          let next = idx;
+          if (action === 'scene-left') next = Math.max(0, idx - 1);
+          else if (action === 'scene-right')
+            next = Math.min(scenes.length - 1, idx + 1);
+          else if (action === 'scene-up') next = Math.max(0, idx - cols);
+          else if (action === 'scene-down')
+            next = Math.min(scenes.length - 1, idx + cols);
+          setFocusedSceneIndex(next);
+        } else if (action === 'scene-open-images') {
+          if (focusedSceneIndex != null && focusedSceneIndex < scenes.length) {
+            setDisplayScene(scenes[focusedSceneIndex]);
+          }
+        } else if (action === 'scene-open-editor') {
+          if (focusedSceneIndex != null && focusedSceneIndex < scenes.length) {
+            setEditingScene(scenes[focusedSceneIndex]);
+          }
+        } else if (action === 'scene-queue-add') {
+          // 다중 선택 상태면 선택된 씬 전체를, 아니면 포커스된 씬만 예약
+          if (selectedCount > 0) {
+            addSelectedToQueue();
+          } else if (
+            focusedSceneIndex != null &&
+            focusedSceneIndex < scenes.length
+          ) {
+            const scene = scenes[focusedSceneIndex];
+            queueScene(curSession, scene, appState.samples).catch(
+              (error: unknown) => {
+                appState.pushMessage(
+                  `프롬프트 에러: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              },
+            );
+          }
+        } else if (action === 'scene-toggle-select') {
+          // 선택 모드 진입 + 포커스된 씬을 다중 선택에 토글.
+          // 모드 진입 후엔 수정자 없는 S 키만으로 토글이 이어진다(아래 keydown 핸들러).
+          if (focusedSceneIndex != null && focusedSceneIndex < scenes.length) {
+            appState.sceneSelectionMode = true;
+            appState.toggleSceneSelection(scenes[focusedSceneIndex].name, type);
+          }
+        } else if (action === 'scene-clear-select') {
+          // 선택 모드 취소(전체 선택 해제 + 모드 종료)
+          appState.clearSceneSelection();
+          appState.sceneSelectionMode = false;
+        } else if (action === 'scene-toggle-bookmark') {
+          if (focusedSceneIndex != null && focusedSceneIndex < scenes.length) {
+            const scene = scenes[focusedSceneIndex];
+            sessionService.toggleSceneBookmark(
+              curSession.name,
+              scene.name,
+              scene.type,
+            );
+          }
+        } else if (action === 'queue-run') {
+          taskQueueService.run();
+        } else if (action === 'queue-clear') {
+          taskQueueService.removeAllTasks();
+        }
+      };
+      window.addEventListener('shortcut-action', sceneNavHandler);
+      return () =>
+        window.removeEventListener('shortcut-action', sceneNavHandler);
+    }, [
+      focusedSceneIndex,
+      getFilteredScenes,
+      getGridColumnCount,
+      setDisplayScene,
+      setEditingScene,
+      addSelectedToQueue,
+      curSession,
+      selectedCount,
+      type,
+    ]);
+
+    const isInputFocused = useCallback(() => {
+      const el = document.activeElement;
+      if (!el) return false;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'input' || tag === 'textarea') return true;
+      if ((el as HTMLElement).isContentEditable) return true;
+      return false;
+    }, []);
+
+    useEffect(() => {
+      const handler = (e: KeyboardEvent) => {
+        if (isInputFocused()) return;
+
+        // 비활성 탭(display:none)의 QueueControl 인스턴스는 무시.
+        // scene·inpaint 탭이 동시 마운트되므로 가드가 없으면 H 토글이 두 번
+        // 일어나 상쇄(열기/닫기 불능)된다. offsetParent는 display:none이면 null.
+        if (
+          !gridContainerRef.current ||
+          gridContainerRef.current.offsetParent === null
+        )
+          return;
+
+        if (
+          (e.key === 'h' || e.key === 'H') &&
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !e.altKey &&
+          !e.shiftKey
+        ) {
+          // 이미지 그리드 등 플로팅 뷰가 열려 있으면 그쪽 도움말(ResultViewer)이 담당
+          if (appState.floatViewCount > 0) return;
+          e.preventDefault();
+          appState.showSceneCheatsheet = !appState.showSceneCheatsheet;
+          return;
+        }
+
+        if (appState.floatViewCount > 0) return;
+        if (appState.dialogs.length > 0) return;
+        if (appState.configScreenOpen) return;
+        if (appState.pieceEditorOpen) return;
+        if (appState.findReplaceOpen) return;
+
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+        const scenes = getFilteredScenes();
+        if (scenes.length === 0) return;
+
+        // A/D(,/.)=현재 이미지 이전/다음, F=즐겨찾기 토글.
+        // 씬 포커스 이동은 방향키(scene-left/right/up/down) 전담이다.
+        // 키보드 포커스된 씬에 대해서만 동작하며, 마우스 호버 셀이 있으면 그 셀의
+        // capture 핸들러가 이 이벤트를 선점하므로 호버가 우선된다.
+        const hasFocus =
+          focusedSceneIndex != null &&
+          focusedSceneIndex >= 0 &&
+          focusedSceneIndex < scenes.length;
+        const dispatchImageNav = (action: 'prev' | 'next' | 'fav') => {
+          const s = scenes[focusedSceneIndex!];
+          window.dispatchEvent(
+            new CustomEvent('scene-image-nav', {
+              detail: { sceneType: s.type, sceneName: s.name, action },
+            }),
+          );
+        };
+        if (e.key === 's' || e.key === 'S') {
+          // 선택 모드(Ctrl+S로 진입)에서는 수정자 없는 S만으로 포커스 씬 선택 토글.
+          // 모드 밖에서는 실수 선택을 막기 위해 무시한다.
+          if (!appState.sceneSelectionMode || !hasFocus) return;
+          e.preventDefault();
+          appState.toggleSceneSelection(scenes[focusedSceneIndex!].name, type);
+          return;
+        }
+        if (e.key === 'a' || e.key === 'A' || e.key === ',') {
+          if (!hasFocus) return;
+          e.preventDefault();
+          dispatchImageNav('prev');
+        } else if (e.key === 'd' || e.key === 'D' || e.key === '.') {
+          if (!hasFocus) return;
+          e.preventDefault();
+          dispatchImageNav('next');
+        } else if (e.key === 'f' || e.key === 'F') {
+          if (!hasFocus) return;
+          e.preventDefault();
+          dispatchImageNav('fav');
+        }
+      };
+      window.addEventListener('keydown', handler);
+      return () => window.removeEventListener('keydown', handler);
+    }, [focusedSceneIndex, getFilteredScenes, isInputFocused, type]);
+
+    // 포커스된 씬 자동 스크롤
+    useEffect(() => {
+      if (focusedSceneIndex == null) return;
+      const scenes = getFilteredScenes();
+      const scene = scenes[focusedSceneIndex];
+      if (!scene) return;
+      const el = document.getElementById(
+        `scene-cell-${scene.type}-${scene.name}`,
+      );
+      if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }, [focusedSceneIndex, getFilteredScenes]);
+
+    const addScene = () => {
+      // 줄마다 이름 규칙(경로 안전·같은 종류 씬 중복·입력 안 중복)을 창 안에서 검사 — 실패해도 창 유지(D2)
+      const checkLines = (value: string) =>
+        validateNameLines(value, {
+          kind: 'scene',
+          pathSafe: true,
+          existing: (n) => curSession.hasScene(type, n),
+        });
+      appState.pushDialog({
+        type: 'textarea-confirm',
+        text: '신규 씬 이름을 입력해주세요\n(줄바꿈으로 여러 씬을 동시에 추가할 수 있습니다)',
+        inputValue: '씬 이름 (한 줄에 하나씩)',
+        validate: checkLines,
+        callback: async (inputValue) => {
+          if (!inputValue) return;
+          const names = splitNameLines(inputValue);
+          if (names.length === 0) return;
+          // 창이 닫힌 뒤 다시 확인(그사이 같은 이름 씬이 생겼으면 추가하지 않는다)
+          const problem = checkLines(inputValue);
+          if (problem) {
+            appState.pushMessage(problem, 'error');
+            return;
+          }
+
+          // 새 씬 기본 해상도 (프리셋 패널 하단 컨트롤, 세션 저장값) — 미지정 시 portrait
+          const defRes = curSession.newSceneResolution;
+          const defResFields = {
+            resolution: defRes?.resolution ?? 'portrait',
+            resolutionWidth:
+              defRes?.resolution === 'custom' ? defRes.width : undefined,
+            resolutionHeight:
+              defRes?.resolution === 'custom' ? defRes.height : undefined,
+          };
+          if (type === 'scene') {
+            for (const name of names) {
+              curSession.addScene(
+                Scene.fromJSON({
+                  type: 'scene',
+                  name,
+                  ...defResFields,
+                  slots: [
+                    [
+                      {
+                        id: v4(),
+                        prompt: '',
+                        characterPrompts: [],
+                        enabled: true,
+                      },
+                    ],
+                  ],
+                  mains: [],
+                  imageMap: [],
+                  meta: {},
+                  round: undefined,
+                  game: undefined,
+                }),
+              );
+            }
+          } else {
+            const menu = await appState.pushDialogAsync({
+              type: 'select',
+              text: '이미지 변형 방법을 선택해주세요',
+              items: workFlowService.i2iFlows.map((x) => ({
+                text: (x.def.emoji ?? '') + x.def.title,
+                value: x.getType(),
+              })),
+            });
+            if (!menu) return;
+            for (const name of names) {
+              curSession.addScene(
+                // 방금 buildPreset 으로 만든 프리셋이라 역직렬화 실패(null)가 불가능
+                InpaintScene.fromJSON({
+                  type: 'inpaint',
+                  name,
+                  ...defResFields,
+                  workflowType: menu,
+                  preset: workFlowService.buildPreset(menu).toJSON(),
+                  mains: [],
+                  imageMap: [],
+                  round: undefined,
+                  game: undefined,
+                })!,
+              );
+            }
+          }
+        },
+      });
+    };
+
+    const getImage = async (scene: GenericScene) => {
+      if (scene.type === 'scene') {
+        // 모바일에서 500 은 원본 로드로 우회되므로 platform 상수 사용 (씬 전체가 마운트되는 그리드)
+        const image = await getMainImage(
+          curSession!,
+          scene as Scene,
+          platform.sceneThumbSize,
+        );
+        if (!image) throw new Error('No image available');
+        return image;
+      }
+      const imgPath =
+        scene.preset?.image ||
+        (scene.workflowType === 'SDMirror'
+          ? curSession?.mirrorImage
+          : undefined);
+      if (!imgPath) throw new Error('No image available');
+      return await imageService.fetchVibeImage(curSession!, imgPath);
+    };
+
+    const cellSizes = ['스몰뷰', '미디엄뷰', '라지뷰'];
+
+    const isMainImage = (path: string) => {
+      const filename = path.split('/').pop()!;
+      return !!(displayScene && displayScene.mains.includes(filename));
+    };
+
+    const favButton = {
+      id: 'favorite',
+      text: (path: string) => {
+        return isMainImage(path) ? '즐겨찾기 해제' : '즐겨찾기 지정';
+      },
+      className: 'back-orange',
+      onClick: async (scene: Scene, path: string, _close: () => void) => {
+        const filename = path.split('/').pop()!;
+        // 절대값 설정 + 창 간 위임(읽기 전용 미러)
+        setImageMain(curSession!, scene, filename, !isMainImage(path));
+      },
+    };
+
+    const createInpaintScene = async (
+      scene: GenericScene,
+      workflowType: string,
+      path: string,
+      close: () => void,
+    ) => {
+      const sourceImage = path.split('/').pop();
+      let image = await imageService.fetchImage(path);
+      image = dataUriToBase64(image!);
+      let cnt = 0;
+      const newName = () => scene.name + cnt.toString();
+      while (curSession!.inpaints.has(newName())) {
+        cnt += 1;
+      }
+      const name = newName();
+      const job = await extractPromptDataFromBase64(image);
+      const preset = job
+        ? workFlowService.createPreset(workflowType, job)
+        : workFlowService.buildPreset(workflowType);
+
+      if (workflowType === 'SDMirror') {
+        // 미러: 세션 레벨 이미지 저장 + 합성 캔버스 생성
+        const storedPath = await imageService.storeVibeImage(
+          curSession!,
+          image,
+        );
+        curSession!.mirrorImage = storedPath;
+        const result = await prepareMirrorCanvas(
+          image,
+          curSession!.mirrorMode || 'blank',
+        );
+        preset.image = await imageService.storeVibeImage(
+          curSession!,
+          result.canvas,
+        );
+        preset.mask = await imageService.storeVibeImage(
+          curSession!,
+          result.mask,
+        );
+        const newScene = InpaintScene.fromJSON({
+          type: 'inpaint',
+          name,
+          workflowType,
+          preset,
+          resolution: 'custom',
+          resolutionWidth: result.width,
+          resolutionHeight: result.height,
+          mirrorCropX: result.cropX,
+          sceneRef: scene.type === 'scene' ? scene.name : undefined,
+          sourceImage: scene.type === 'scene' ? sourceImage : undefined,
+          imageMap: [],
+          mains: [],
+          round: undefined,
+          game: undefined,
+        });
+        if (newScene) {
+          curSession!.addScene(newScene);
+          close();
+          setInpaintEditScene(newScene);
+        }
+      } else {
+        // 해상도 = 첨부 이미지 크기(R-res, SPEC §7-3). 이미 받은 이미지로 생성 전에 정해 씬 등록 1회로 끝낸다.
+        // 크기를 모르거나 대상 아닌 워크플로우면 원본 씬 해상도(커스텀 너비·높이 포함 — 예전엔 enum 만 복사).
+        const fromImage = workflowUsesImageResolution(workflowType)
+          ? await resolutionFromImage(image)
+          : undefined;
+        preset.image = await imageService.storeVibeImage(curSession!, image);
+        const newScene = InpaintScene.fromJSON({
+          type: 'inpaint',
+          name,
+          workflowType,
+          preset,
+          ...inpaintSceneResolutionFields(workflowType, scene, fromImage),
+          sceneRef: scene.type === 'scene' ? scene.name : undefined,
+          sourceImage: scene.type === 'scene' ? sourceImage : undefined,
+          imageMap: [],
+          mains: [],
+          round: undefined,
+          game: undefined,
+        });
+        if (newScene) {
+          curSession!.addScene(newScene);
+          close();
+          setInpaintEditScene(newScene);
+          const notice = fromImage && paidResolutionNotice(fromImage);
+          if (notice) appState.pushMessage(notice, 'info');
+        }
+      }
+    };
+
+    // 기존 변형 씬의 이미지를 결과 이미지로 바꾸고 씬 해상도를 그 크기로 맞춘다(R-res ⓒ·ⓓ).
+    // 미러·이미지 수정 등 대상 아닌 워크플로우는 이미지만 바꾼다(기존 동작).
+    const replaceInpaintSceneImage = async (
+      scene: InpaintScene,
+      path: string,
+    ) => {
+      let image = await imageService.fetchImage(path);
+      image = dataUriToBase64(image!);
+      const fromImage = workflowUsesImageResolution(scene.workflowType)
+        ? await resolutionFromImage(image)
+        : undefined;
+      await imageService.writeVibeImage(curSession!, scene.preset.image, image);
+      if (fromImage) {
+        applyImageResolution(scene, fromImage);
+        const notice = paidResolutionNotice(fromImage);
+        if (notice) appState.pushMessage(notice, 'info');
+      }
+    };
+
+    const buttons: any =
+      type === 'scene'
+        ? [
+            favButton,
+            {
+              id: 'create-inpaint',
+              text: '인페인팅 씬 생성',
+              className: 'back-green',
+              onClick: async (
+                scene: Scene,
+                path: string,
+                close: () => void,
+              ) => {
+                await createInpaintScene(scene, 'SDInpaint', path, close);
+              },
+            },
+          ]
+        : [
+            favButton,
+            {
+              id: 'edit-inpaint',
+              text: '해당 이미지로 인페인트',
+              className: 'back-orange',
+              onClick: async (
+                scene: InpaintScene,
+                path: string,
+                close: () => void,
+              ) => {
+                await replaceInpaintSceneImage(scene, path);
+                close();
+                setInpaintEditScene(scene as InpaintScene);
+              },
+            },
+            {
+              id: 'copy-to-source',
+              text: '원본 씬으로 이미지 복사',
+              className: 'back-green',
+              onClick: async (
+                scene: InpaintScene,
+                path: string,
+                close: () => void,
+              ) => {
+                if (!scene.sceneRef) {
+                  appState.pushMessage('원본 씬이 없습니다.');
+                  return;
+                }
+                const orgScene = curSession!.scenes.get(scene.sceneRef);
+                if (!orgScene) {
+                  appState.pushMessage('원본 씬이 삭제되었거나 이동했습니다.');
+                  return;
+                }
+                await backend.copyFile(
+                  path,
+                  `${imageService.getImageDir(
+                    curSession!,
+                    orgScene,
+                  )}/${Date.now().toString()}.png`,
+                );
+                let sourcePath = scene.sourceImage
+                  ? `${imageService.getImageDir(curSession!, orgScene)}/${scene.sourceImage}`
+                  : undefined;
+                if (!sourcePath && scene.preset?.image) {
+                  try {
+                    const sourceData = dataUriToBase64(
+                      (await imageService.fetchVibeImage(
+                        curSession!,
+                        scene.preset.image,
+                      ))!,
+                    );
+                    for (const filename of imageService.getOutputs(
+                      curSession!,
+                      orgScene,
+                    )) {
+                      const candidate = `${imageService.getImageDir(
+                        curSession!,
+                        orgScene,
+                      )}/${filename}`;
+                      const candidateData = dataUriToBase64(
+                        (await imageService.fetchImage(candidate))!,
+                      );
+                      if (candidateData === sourceData) {
+                        sourcePath = candidate;
+                        break;
+                      }
+                    }
+                  } catch (e) {
+                    console.warn('원본 인페인트 이미지 확인 실패:', e);
+                  }
+                }
+                if (sourcePath && (await backend.existFile(sourcePath))) {
+                  await deleteImageFiles(curSession!, [sourcePath], orgScene);
+                } else {
+                  await imageService.refresh(curSession!, orgScene);
+                }
+                setDisplayScene(undefined);
+                if (onClose) onClose(0);
+                close();
+              },
+            },
+          ];
+    buttons.push({
+      id: 'transform',
+      text: '이미지 변형',
+      className: 'back-gray',
+      // @ts-ignore
+      onClick: async (scene: Scene, path: string, close: () => void) => {
+        const menu = await appState.pushDialogAsync({
+          type: 'select',
+          text: '이미지 변형 방법을 선택해주세요',
+          items: [
+            {
+              text: '이미지 변형 씬 생성',
+              value: 'create',
+            },
+          ].concat(
+            oneTimeFlows.map((x) => ({
+              text: x.text,
+              value: x.text,
+            })),
+          ),
+        });
+        if (!menu) return;
+        if (menu === 'create') {
+          const flows = workFlowService.i2iFlows;
+          const items = flows.map((x) => ({
+            text: (x.def.emoji ?? '') + x.def.title,
+            value: x.getType(),
+          }));
+          const method = await appState.pushDialogAsync({
+            type: 'select',
+            text: '변형 씬에서 사용할 방법을 선택해주세요',
+            items,
+          });
+          if (!method) return;
+          await createInpaintScene(scene, method, path, close);
+        } else {
+          let image = await imageService.fetchImage(path);
+          image = dataUriToBase64(image!);
+          const job = await extractPromptDataFromBase64(image);
+          const menuItem = oneTimeFlowMap.get(menu)!;
+          const input = menuItem.getInput
+            ? await menuItem.getInput(curSession!)
+            : undefined;
+          menuItem.handler(curSession!, scene, image, undefined, job, input);
+        }
+      },
+    });
+
+    const [adding, setAdding] = useState<boolean>(false);
+    const resultViewerRef = useRef<any>(null);
+    const panel = (() => {
+      if (type === 'scene') {
+        return (
+          <>
+            {inpaintEditScene && (
+              <FloatView
+                priority={3}
+                ownsGenControl
+                onEscape={() => setInpaintEditScene(undefined)}
+              >
+                <InPaintEditor
+                  editingScene={inpaintEditScene}
+                  onConfirm={() => {
+                    if (resultViewerRef.current)
+                      resultViewerRef.current.setInpaintTab();
+                    setInpaintEditScene(undefined);
+                  }}
+                  onDelete={() => {}}
+                />
+              </FloatView>
+            )}
+            {editingScene && (
+              <FloatView
+                priority={2}
+                onEscape={() => setEditingScene(undefined)}
+              >
+                <SceneEditor
+                  scene={editingScene as Scene}
+                  initialTab={editingSceneTab}
+                  onClosed={() => {
+                    setEditingScene(undefined);
+                  }}
+                  onDeleted={() => {
+                    if (showPannel) {
+                      setDisplayScene(undefined);
+                    }
+                  }}
+                />
+              </FloatView>
+            )}
+          </>
+        );
+      }
+      return (
+        <>
+          {inpaintEditScene && (
+            <FloatView
+              priority={3}
+              ownsGenControl
+              onEscape={() => setInpaintEditScene(undefined)}
+            >
+              <InPaintEditor
+                editingScene={inpaintEditScene}
+                onConfirm={() => {
+                  setInpaintEditScene(undefined);
+                }}
+                onDelete={() => {}}
+              />
+            </FloatView>
+          )}
+          {(editingScene || adding) && (
+            <FloatView
+              priority={2}
+              ownsGenControl
+              onEscape={() => {
+                setEditingScene(undefined);
+                setAdding(false);
+              }}
+            >
+              <InPaintEditor
+                editingScene={editingScene as InpaintScene}
+                onConfirm={() => {
+                  setEditingScene(undefined);
+                  setAdding(false);
+                }}
+                onDelete={() => {
+                  setDisplayScene(undefined);
+                }}
+              />
+            </FloatView>
+          )}
+        </>
+      );
+    })();
+
+    const onEdit = async (scene: GenericScene) => {
+      setEditingScene(scene);
+    };
+
+    const onFilenameChange = (src: string, dst: string) => {
+      if (type === 'scene') {
+        const scene = displayScene as Scene;
+        const sourceName = src.split('/').pop()!;
+        const destinationName = dst.split('/').pop()!;
+        if (
+          scene.mains.includes(sourceName) &&
+          !scene.mains.includes(destinationName)
+        ) {
+          scene.mains = scene.mains.map((name) =>
+            name === sourceName ? destinationName : name,
+          );
+        } else if (
+          !scene.mains.includes(sourceName) &&
+          scene.mains.includes(destinationName)
+        ) {
+          scene.mains = scene.mains.map((name) =>
+            name === destinationName ? sourceName : name,
+          );
+        }
+      }
+    };
+
+    const [sceneSelector, setSceneSelector] = useState<
+      SceneSelectorItem | undefined
+    >(undefined);
+    const resultViewer = (() => {
+      if (displayScene) {
+        // 씬 탭 이동(W1): 그리드 표시 순서(검색/필터 반영)대로 이전/다음 씬 계산.
+        // Read the current observed scene order and callbacks on every parent render.
+        const navScenes = getFilteredScenes();
+        const navIdx = navScenes.findIndex((s) => s.name === displayScene.name);
+        const goScene = (delta: number) => {
+          const next = navIdx >= 0 ? navScenes[navIdx + delta] : undefined;
+          if (!next) return;
+          gameService.refreshList(curSession!, displayScene);
+          setDisplayFocus(undefined);
+          setDisplayScene(next);
+        };
+        return (
+          <FloatView
+            // 씬 고유 key: 열린 채 다른 씬으로 바뀔 때 리마운트시켜 마운트 refresh·탭 상태를 초기화
+            key={`${displayScene.type}-${displayScene.name}`}
+            priority={2}
+            showToolbar
+            onEscape={() => {
+              gameService.refreshList(curSession!, displayScene);
+              setDisplayScene(undefined);
+              setDisplayFocus(undefined);
+            }}
+          >
+            <ResultViewer
+              SceneQueue={QueueControl}
+              ref={resultViewerRef}
+              scene={displayScene}
+              focusFilename={displayFocus}
+              sceneNav={{
+                hasPrev: navIdx > 0,
+                hasNext: navIdx >= 0 && navIdx < navScenes.length - 1,
+                go: goScene,
+              }}
+              isMainImage={isMainImage}
+              onFilenameChange={onFilenameChange}
+              onEdit={onEdit}
+              buttons={buttons}
+              onSampleExtract={
+                type === 'scene'
+                  ? (seeds: number[]) => {
+                      const sourceScene = displayScene;
+                      gameService.refreshList(curSession!, sourceScene);
+                      setDisplayScene(undefined);
+                      const allScenes = curSession!.getScenes('scene');
+                      const targetScenes = allScenes.filter(
+                        (s) => s.name !== sourceScene.name,
+                      );
+                      if (targetScenes.length === 0) {
+                        appState.pushMessage('대상 씬이 없습니다.');
+                        return;
+                      }
+                      setSceneSelector({
+                        type: 'scene',
+                        text: `🎲 샘플 뽑기 (${seeds.length}개 시드)`,
+                        scenes: targetScenes,
+                        callback: (selected) => {
+                          setSceneSelector(undefined);
+                          if (selected.length === 0) return;
+                          appState.pushDialog({
+                            type: 'confirm',
+                            text: `${selected.length}개 씬에 ${seeds.length}개 시드로 각각 이미지를 생성하시겠습니까?\n(총 ${selected.length * seeds.length}장)`,
+                            callback: async () => {
+                              const workflow = curSession!.selectedWorkflow;
+                              if (!workflow) {
+                                appState.pushMessage(
+                                  '워크플로우가 선택되지 않았습니다.',
+                                );
+                                return;
+                              }
+                              const [, , shared] =
+                                curSession!.getCommonSetup(workflow);
+                              const originalSeed = shared?.seed;
+                              try {
+                                for (const targetScene of selected) {
+                                  for (const seed of seeds) {
+                                    if (shared) shared.seed = seed;
+                                    await queueWorkflow(
+                                      curSession!,
+                                      workflow,
+                                      targetScene,
+                                      1,
+                                    );
+                                  }
+                                }
+                                appState.pushMessage(
+                                  `${selected.length * seeds.length}개 이미지 생성이 예약되었습니다.`,
+                                );
+                              } catch (e: any) {
+                                appState.pushMessage(
+                                  `샘플 뽑기 오류: ${e.message}`,
+                                );
+                              } finally {
+                                if (shared) shared.seed = originalSeed;
+                              }
+                            },
+                          });
+                        },
+                      });
+                    }
+                  : undefined
+              }
+            />
+          </FloatView>
+        );
+      }
+      return null;
+    })();
+
+    // 컨텍스트 메뉴 「선택 작업」의 변형 씬 일괄 작업이 이 탭의 씬 선택 창을 빌려 쓴다(2026-10-04 P2~P4, sceneSelectorHost).
+    useEffect(() => {
+      if (!isActive) return undefined;
+      return registerSceneSelectorHost(type, setSceneSelector);
+    }, [type, isActive]);
+
+    // 씬 휴지통·아티스트 태깅은 전역 승격(appState.sceneTrashOpen/artistTagOpen,
+    // 퀵 메뉴 P2) — 모달 호스트는 App.tsx 전역 오버레이, 버튼은 portable 공유 JSX.
+    // 툴바 ⋯(더보기) 오버플로 메뉴
+    const [showToolbarMenu, setShowToolbarMenu] = useState(false);
+    // 툴바 버튼 드래그 재배치 (클래식 툴바에선 비활성)
+    const toolbarDrag = useToolbarDragState('scene');
+    const toolbarDragActive = toolbarDrag.active;
+    const { drop: toolbarRowDrop, isOver: toolbarRowOver } = useToolbarRowDrop(
+      'scene',
+      'scene',
+    );
+    const {
+      ref: toolbarScrollRef,
+      hint: toolbarScrollHint,
+      onScroll: updateToolbarScrollHint,
+    } = useHScrollHint<HTMLDivElement>();
+    // 드롭 타깃 커넥터와 스크롤 힌트 ref 를 한 요소에 함께 건다.
+    const toolbarRowRef = useCallback(
+      (el: HTMLDivElement | null) => {
+        (toolbarRowDrop as any)(el);
+        toolbarScrollRef.current = el;
+      },
+      [toolbarRowDrop, toolbarScrollRef],
+    );
+
+    const [, setBmRev] = useState(0);
+    useEffect(() => {
+      const onBookmarkUpdated = () => setBmRev((r) => r + 1);
+      sessionService.addEventListener('bookmark-updated', onBookmarkUpdated);
+      return () =>
+        sessionService.removeEventListener(
+          'bookmark-updated',
+          onBookmarkUpdated,
+        );
+    }, []);
+    const sceneBookmark = sessionService.getSceneBookmark(curSession.name);
+
+    const toggleSceneSearch = useCallback(() => {
+      if (showSceneSearch) setSceneSearchQuery('');
+      setShowSceneSearch(!showSceneSearch);
+    }, [showSceneSearch]);
+
+    const moveScene = (draggingScene: GenericScene, targetIndex: number) => {
+      curSession!.moveScene(draggingScene, targetIndex);
+    };
+
+    const moveScenes = (
+      selectedScenes: GenericScene[],
+      targetIndex: number,
+    ) => {
+      if (!curSession || selectedScenes.length === 0) return;
+      const stype = selectedScenes[0].type;
+      const allScenes = curSession.getScenes(stype);
+      const selectedSet = new Set(selectedScenes.map((s) => s.name));
+
+      // 선택된 씬들을 제외한 나머지 목록
+      const remaining = allScenes.filter((s) => !selectedSet.has(s.name));
+
+      // targetIndex에서 선택된 씬들 중 앞에 있던 것들을 보정
+      let offset = 0;
+      for (let i = 0; i < targetIndex && i < allScenes.length; i += 1) {
+        if (selectedSet.has(allScenes[i].name)) offset += 1;
+      }
+      const insertAt = targetIndex - offset;
+
+      // 선택된 씬들을 현재 순서대로 유지하면서 삽입
+      const sorted = selectedScenes.sort(
+        (a, b) => allScenes.indexOf(a) - allScenes.indexOf(b),
+      );
+      for (let i = 0; i < sorted.length; i += 1) {
+        remaining.splice(insertAt + i, 0, sorted[i]);
+      }
+
+      // 맵 재구성
+      const final = remaining.reduce((acc: Map<string, GenericScene>, s) => {
+        acc.set(s.name, s);
+        return acc;
+      }, new Map()) as any;
+      if (stype === 'scene') {
+        curSession.scenes = final;
+      } else {
+        curSession.inpaints = final;
+      }
+    };
+
+    // ── 씬 툴바 버튼 바인딩: 레지스트리 id → 실제 버튼 노드 ──
+    // 구성·순서는 TOOLBAR_VIEW_MAIN 의 'scene' 영역(models/uiLayout.ts)이 결정한다.
+    // 모바일은 텍스트 대신 아이콘으로 폭을 줄인다(줄 밀림 방지). 단 클래식 툴바
+    // 토글이 켜지면 예전처럼 텍스트로 표시(mobileIcon=false).
+    // mobileIcon = 모바일 행 레이아웃(가로 스크롤·sticky ⋯)까지 좌우하므로 별도 유지.
+    const pickImportImage = () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = IMPORT_IMAGE_ACCEPT;
+      input.onchange = (e: any) => {
+        const file = e.target.files?.[0];
+        if (file) {
+          appState.handleFile(file);
+        }
+      };
+      input.click();
+    };
+    const mobileIcon = isMobile && !appState.uiToolbar.classic;
+    // 버튼 내용의 아이콘화 여부 — PC 도 기본 아이콘. 텍스트 복원은 개인 설정
+    // "씬 툴바 텍스트 버튼(레거시)" 또는 클래식 툴바 토글이 담당.
+    const iconMode =
+      mobileIcon ||
+      (!isMobile &&
+        !appState.uiToolbar.classic &&
+        !appState.sceneToolbarLegacyText);
+    // PC 아이콘 모드만(모바일 제외) — 모바일 글자 버튼을 그대로 두면서 PC 만 아이콘으로 바꿀 때 쓴다.
+    const pcIconMode = !isMobile && iconMode;
+    // PC 씬 툴바 그룹(2026-10-04 T5, 2-D 그룹 캡션) — 모바일·클래식 툴바는 그룹 없이 종전 그대로.
+    // 레거시 글자 설정(sceneToolbarLegacyText)은 버튼만 글자로 바꾸고 그룹·캡션은 유지한다.
+    const groupedToolbar = !isMobile && !appState.uiToolbar.classic;
+    const toolbarButtons: Record<string, ReactNode> = {
+      'add-scene': (
+        <Tooltip content="씬 추가">
+          <button
+            type="button"
+            className={`round-button${iconMode ? ' icon-only' : ''} back-sky`}
+            onClick={addScene}
+          >
+            {iconMode ? <ActionIcon id="add-scene" size={18} /> : '씬 추가'}
+          </button>
+        </Tooltip>
+      ),
+      'queue-add': (
+        <SceneQueueMenu
+          session={curSession}
+          type={type}
+          selectedOnly={selectedCount > 0}
+        >
+          <button
+            type="button"
+            className={`round-button${iconMode && selectedCount === 0 ? ' icon-only' : ''} back-sky`}
+            aria-label={
+              selectedCount > 0
+                ? `선택한 씬 예약 추가 (${selectedCount})`
+                : '모든 씬 예약 추가'
+            }
+            onClick={selectedCount > 0 ? addSelectedToQueue : addAllToQueue}
+          >
+            {iconMode ? (
+              // 예약제거(달력✕, 씬 카드)와 짝을 이루는 달력+ 아이콘(사전 queue-add). 선택 중엔 수 병기
+              <>
+                <ActionIcon id="queue-add" size={18} />
+                {selectedCount > 0 && (
+                  <span className="ml-1 text-xs">{selectedCount}</span>
+                )}
+              </>
+            ) : selectedCount > 0 ? (
+              `선택 씬 예약추가 (${selectedCount})`
+            ) : (
+              '모두 예약추가'
+            )}
+          </button>
+        </SceneQueueMenu>
+      ),
+      'export-images': (
+        <Tooltip content="이미지 내보내기">
+          <button
+            type="button"
+            className={`round-button${iconMode ? ' icon-only' : ''} back-gray`}
+            onClick={() => appState.exportPackage(type)}
+          >
+            {iconMode ? (
+              <ActionIcon id="export-images" size={18} />
+            ) : (
+              <>
+                {isMobile ? '' : '이미지 '}
+                내보내기
+              </>
+            )}
+          </button>
+        </Tooltip>
+      ),
+      'quick-export': (
+        <Tooltip content="기본 프리셋으로 한 번에 내보내기">
+          <button
+            type="button"
+            className="round-button back-sky"
+            onClick={() => appState.quickExportPackage(type)}
+          >
+            {/* 아이콘 모드 = 번개+내보내기 아이콘 조합(2026-07-18 사용자). ⚡ 글자 → 사전 아이콘(2026-10-04 I1) */}
+            {iconMode ? (
+              <>
+                <ActionIcon id="quick-export" size={18} />
+                <ActionIcon id="export-images" size={18} className="ml-0.5" />
+              </>
+            ) : (
+              <>
+                <ActionIcon id="quick-export" size={18} />
+                {isMobile ? '' : ' 빠른 내보내기'}
+              </>
+            )}
+          </button>
+        </Tooltip>
+      ),
+      'batch-process': (
+        <Tooltip content="대량 작업">
+          <button
+            type="button"
+            className={`round-button${iconMode ? ' icon-only' : ''} back-gray`}
+            onClick={() => {
+              appState.openBatchProcessMenu(type, setSceneSelector);
+            }}
+          >
+            {/* PC 도 아이콘 모드면 아이콘(2026-10-04 T5 그룹 툴바 — 이전엔 PC 글자 유지). 글자는 레거시 글자 설정·클래식 툴바 */}
+            {iconMode ? (
+              <ActionIcon id="batch-process" size={18} />
+            ) : (
+              '대량 작업'
+            )}
+          </button>
+        </Tooltip>
+      ),
+      'multi-select': (
+        <Tooltip content="드래그 선택 모드">
+          <button
+            type="button"
+            className={`round-button${iconMode && selectedCount === 0 ? ' icon-only' : ''} ${
+              appState.sceneSelectionMode ? 'back-sky' : 'back-gray'
+            }`}
+            onClick={() => {
+              if (appState.sceneSelectionMode) {
+                appState.sceneSelectionMode = false;
+                appState.clearSceneSelection();
+              } else {
+                appState.sceneSelectionMode = true;
+              }
+            }}
+          >
+            {iconMode ? (
+              <>
+                <ActionIcon id="multi-select" size={18} />
+                {selectedCount > 0 && (
+                  <span className="ml-1 text-xs">{selectedCount}</span>
+                )}
+              </>
+            ) : appState.sceneSelectionMode ? (
+              `선택중 ${selectedCount}`
+            ) : (
+              '선택 모드'
+            )}
+          </button>
+        </Tooltip>
+      ),
+      // 해상도 변경: PC 아이콘 모드는 아이콘+툴팁(2026-10-04 T5 그룹 툴바). 모바일은 글자·툴팁 없음 그대로(2026-07-18 사용자)
+      'change-resolution': isMobile ? (
+        <button
+          type="button"
+          className="round-button back-gray"
+          onClick={() => {
+            appState.openChangeResolutionMenu(type, setSceneSelector);
+          }}
+        >
+          해상도
+        </button>
+      ) : (
+        <Tooltip content="해상도 변경">
+          <button
+            type="button"
+            className={`round-button${pcIconMode ? ' icon-only' : ''} back-gray`}
+            onClick={() => {
+              appState.openChangeResolutionMenu(type, setSceneSelector);
+            }}
+          >
+            {pcIconMode ? (
+              <ActionIcon id="change-resolution" size={18} />
+            ) : (
+              '해상도 변경'
+            )}
+          </button>
+        </Tooltip>
+      ),
+      'webp-convert': (
+        <Tooltip content="선택 씬의 PNG를 WebP로 변환(용량 절감, 메타데이터 보존)">
+          <button
+            type="button"
+            className="round-button back-gray"
+            onClick={() => {
+              appState.openConvertToWebpMenu(type, setSceneSelector);
+            }}
+          >
+            {/* 아이콘 모드 = 'WebP' 단축 표기(2026-07-18 사용자), 모바일도 단축 */}
+            {isMobile || iconMode ? 'WebP' : 'WebP 변환'}
+          </button>
+        </Tooltip>
+      ),
+      'import-image': (
+        <Tooltip content="이미지 프롬프트 추출">
+          <button
+            type="button"
+            className="round-button icon-only back-gray"
+            onClick={pickImportImage}
+          >
+            <ActionIcon id="import-image" size={18} />
+          </button>
+        </Tooltip>
+      ),
+      // 'artist-tag'·'scene-trash' 는 portable 공유 JSX(PortableToolbarButtons)로
+      // 이관(B군 승격) — buttonNode 의 shared 폴백이 렌더한다.
+      'scene-search': (
+        <Tooltip content="씬 검색">
+          <button
+            type="button"
+            className={`round-button icon-only ${showSceneSearch ? 'back-sky' : 'back-gray'}`}
+            onClick={toggleSceneSearch}
+          >
+            <ActionIcon id="scene-search" size={18} />
+          </button>
+        </Tooltip>
+      ),
+      'image-review': (
+        <Tooltip content="이미지를 크게 넘겨보며 검수">
+          <button
+            type="button"
+            className={`round-button${iconMode ? ' icon-only' : ''} back-gray`}
+            onClick={() => setImageReview({})}
+          >
+            <ActionIcon id="image-review" size={18} />
+            {!iconMode && <span className="ml-1">이미지 검수</span>}
+          </button>
+        </Tooltip>
+      ),
+      'scene-find': (
+        <Tooltip content="필터하지 않고 씬 위치로 이동">
+          <button
+            type="button"
+            className={`round-button${iconMode ? ' icon-only' : ''} back-gray`}
+            onClick={findScene}
+          >
+            <ActionIcon id="scene-find" size={18} />
+            {!iconMode && <span className="ml-1">씬 찾기</span>}
+          </button>
+        </Tooltip>
+      ),
+      'artist-breakdown': (
+        <Tooltip content="좌측 프롬프트의 작가 태그를 하나씩 분리해 default 씬에 예약">
+          <button
+            type="button"
+            className={`round-button${iconMode ? ' icon-only' : ''} back-gray`}
+            onClick={() => queueArtistBreakdown(curSession)}
+          >
+            <ActionIcon id="artist-breakdown" size={18} />
+            {!iconMode && <span className="ml-1">작가 분해</span>}
+          </button>
+        </Tooltip>
+      ),
+      // 작가 태그 artist: 접두 전환(2026-09-26): 긍정 프롬프트 칸 전체, 구획마다 있으면 떼고 없는 작가(태그 DB)엔 붙임. 확인창 뒤 적용.
+      'artist-prefix-toggle': (
+        <Tooltip content="긍정 프롬프트의 작가 태그 artist: 접두 전환 — 있으면 제거, 없으면 추가(태그 DB 기준)">
+          <button
+            type="button"
+            className={`round-button${iconMode ? ' icon-only' : ''} back-gray`}
+            onClick={() => applyArtistPrefixBatch(curSession)}
+          >
+            <ActionIcon id="artist-prefix-toggle" size={18} />
+            {!iconMode && <span className="ml-1">작가 접두 전환</span>}
+          </button>
+        </Tooltip>
+      ),
+      'bookmark-jump': (
+        <Tooltip content="북마크된 씬으로 이동">
+          <button
+            type="button"
+            className={`round-button icon-only ${sceneBookmark ? 'back-orange' : 'back-gray'}`}
+            onClick={() => {
+              if (!sceneBookmark) {
+                appState.pushMessage('북마크된 씬이 없습니다.');
+                return;
+              }
+              if (sceneBookmark.type !== type) {
+                appState.pushMessage(
+                  `북마크된 씬은 ${
+                    sceneBookmark.type === 'scene' ? '일반' : '인페인트'
+                  } 탭에 있습니다.`,
+                );
+                return;
+              }
+              const el = document.getElementById(
+                `scene-cell-${type}-${sceneBookmark.name}`,
+              );
+              if (el) {
+                el.scrollIntoView({
+                  behavior: 'smooth',
+                  block: 'center',
+                });
+              } else {
+                appState.pushMessage('북마크된 씬을 찾을 수 없습니다.');
+              }
+            }}
+          >
+            <ActionIcon id="bookmark-jump" size={18} />
+          </button>
+        </Tooltip>
+      ),
+      // 'scene-template' 은 프로젝트 바 레지스트리로 이동(씬 템플릿 개편 2026-07-18)
+      // — 공유 JSX(PortableToolbarButtons)가 렌더한다.
+      'shortcut-help': !isMobile && (
+        <Tooltip content="단축키 도움말">
+          <button
+            type="button"
+            className="round-button back-gray"
+            onClick={() => {
+              appState.showSceneCheatsheet = !appState.showSceneCheatsheet;
+            }}
+          >
+            <ActionIcon id="shortcut-help" size={14} />
+            <span className="ml-1 text-xs hidden lg:inline">H</span>
+          </button>
+        </Tooltip>
+      ),
+    };
+    // portable 공유 버튼(find-replace·empty-image-trash 등) — 크로스 영역 렌더용.
+    // variant='scene': 타 영역발 버튼도 씬 툴바 표준 스타일(배경형)로 적응 렌더.
+    // iconOnly=iconMode: 텍스트 포함 버튼(piece-editor)도 아이콘 모드에선 아이콘+툴팁.
+    const shared = portableToolbarButtons({
+      mobileIcon: iconMode,
+      variant: 'scene',
+      iconOnly: iconMode,
+    });
+    const buttonNode = (id: string): ReactNode =>
+      toolbarButtons[id] ?? shared[id];
+
+    // 사용자 설정(appState.uiToolbar, observable)에 따라 인라인/⋯메뉴 배치 결정.
+    // 편집 모드 v2: resolveToolbarView 가 전 영역을 해석 → 이 컴포넌트의 'scene' 영역만 사용.
+    // 동반 슬롯에 배정된 버튼은 파생 숨김(이동 의미론) — 툴바 표면에서 사라진다
+    // (uiToolbar 데이터는 불변, 제외 집합 필터).
+    const sceneView = resolveToolbarView(
+      TOOLBAR_VIEW_MAIN,
+      appState.uiToolbar,
+      isMobile,
+      companionAssignedIds(appState.uiCompanionSlots),
+    );
+    const sceneArea = sceneView.find((a) => a.area === 'scene');
+    const toolbarLayout = {
+      inline: sceneArea?.inline ?? [],
+      menu: sceneArea?.menu ?? [],
+    };
+    // 커스터마이징 이름(레지스트리 라벨) 조회용 — 크로스 영역 id(portable)의
+    // 이름도 표시해야 하므로 View 전체 레지스트리에서 찾는다.
+    const sceneName = (id: string) => {
+      for (const { registry } of TOOLBAR_VIEW_MAIN) {
+        const found = registry.find((b) => b.id === id);
+        if (found) return found.name;
+      }
+      return id;
+    };
+    // 모바일 V2 더보기 둘째 줄의 칸 라벨 — 레지스트리 v2Label(짧은 이름) 우선, 없으면 name.
+    const sceneV2Label = (id: string) => {
+      for (const { registry } of TOOLBAR_VIEW_MAIN) {
+        const found = registry.find((b) => b.id === id);
+        if (found) return found.v2Label ?? found.name;
+      }
+      return id;
+    };
+    // 인라인 버튼(드래그 재배치 래퍼 포함) — 그룹 칸이든 종전 한 줄이든 같은 노드를 쓴다.
+    // index 는 해석된 inline 배열상의 위치(그룹 렌더 순서와 다를 수 있음 — 삽입은 앵커 id 기준).
+    const inlineToolbarButton = (id: string) => (
+      <DraggableToolbarButton
+        key={id}
+        group="scene"
+        id={id}
+        name={sceneName(id)}
+        area="scene"
+        index={toolbarLayout.inline.indexOf(id)}
+        disabled={!!appState.uiToolbar.classic}
+      >
+        {buttonNode(id)}
+      </DraggableToolbarButton>
+    );
+    const toolbarSegments = groupedToolbar
+      ? groupToolbarIds(toolbarLayout.inline)
+      : [];
+    // ⋯ 더보기(PC 그룹 툴바)에서 그룹 없는 버튼 행에 「꺼내면 툴바 끝 기타 칸」 안내 툴팁.
+    const otherMenuIds = new Set(
+      groupedToolbar
+        ? (groupToolbarIds(toolbarLayout.menu).find(
+            (s) => s.group === TOOLBAR_GROUP_OTHER,
+          )?.ids ?? [])
+        : [],
+    );
+
+    return (
+      <div
+        className={`flex flex-col h-full ${className ?? ''}`}
+        onMouseDownCapture={mainDragSurface ? undefined : handleGridMouseDown}
+        onClickCapture={mainDragSurface ? undefined : handleGridClick}
+      >
+        {mainDragSurface &&
+          dragBox &&
+          isDraggingRef.current &&
+          gridContainerRef.current &&
+          createPortal(
+            <div
+              className="fixed bg-sky-500/30 border-2 border-sky-500 rounded pointer-events-none z-[var(--z-dnd-hint)]"
+              style={{
+                left:
+                  Math.min(dragBox.x1, dragBox.x2) +
+                  gridContainerRef.current.getBoundingClientRect().left -
+                  gridContainerRef.current.scrollLeft,
+                top:
+                  Math.min(dragBox.y1, dragBox.y2) +
+                  gridContainerRef.current.getBoundingClientRect().top -
+                  gridContainerRef.current.scrollTop,
+                width: Math.abs(dragBox.x2 - dragBox.x1),
+                height: Math.abs(dragBox.y2 - dragBox.y1),
+              }}
+            />,
+            document.body,
+          )}
+        {sceneSelector && (
+          <FloatView priority={0} onEscape={() => setSceneSelector(undefined)}>
+            <SceneSelector
+              text={sceneSelector.text}
+              scenes={sceneSelector.scenes ?? curSession!.getScenes(type)}
+              onConfirm={sceneSelector.callback}
+              getImage={getImage}
+            />
+          </FloatView>
+        )}
+        {resultViewer}
+        {imageReview && (
+          <ImageReview
+            session={curSession}
+            type={type}
+            startScene={imageReview.startScene}
+            onClose={() => setImageReview(undefined)}
+            onInpaint={async (scene, path) => {
+              if (scene.type === 'scene') {
+                await createInpaintScene(scene, 'SDInpaint', path, () =>
+                  setImageReview(undefined),
+                );
+                return;
+              }
+              await replaceInpaintSceneImage(scene, path);
+              setImageReview(undefined);
+              setInpaintEditScene(scene);
+            }}
+          />
+        )}
+        {quickPromptScene && (
+          <SceneQuickPromptModal
+            scene={quickPromptScene.scene}
+            anchor={quickPromptScene.anchor}
+            onClose={() => setQuickPromptScene(undefined)}
+          />
+        )}
+        {/* 씬 휴지통·아티스트 태깅 모달은 App.tsx 전역 오버레이로 이관(B군 승격) */}
+        {panel}
+        {!!showPannel && !v2Layout && (
+          <div
+            className={`flex flex-none pb-1.5 flex-wrap${groupedToolbar ? ' items-end' : ''}`}
+          >
+            {/* 모바일(비클래식): 줄바꿈 대신 가로 스크롤 — 어떤 기기 폭에서도 1줄 보장.
+                행 전체가 드롭 타깃(놓으면 인라인 고정) */}
+            {/* 모바일: 스크롤바를 숨긴 행이라 가려진 버튼이 있을 때 양 끝에 옅은 화살표 힌트를 띄운다
+                (환경설정 탭 바와 같은 HScrollHint). PC 는 줄바꿈이라 래퍼를 contents 로 무력화 */}
+            <div
+              className={
+                mobileIcon ? 'relative min-w-0 max-w-full' : 'contents'
+              }
+            >
+              <div
+                ref={toolbarRowRef}
+                onScroll={mobileIcon ? updateToolbarScrollHint : undefined}
+                className={`scene-toolbar-row flex ${
+                  groupedToolbar
+                    ? 'scene-toolbar-grouped flex-wrap'
+                    : `gap-1 md:gap-2 items-center ${
+                        mobileIcon
+                          ? 'flex-nowrap overflow-x-auto no-scrollbars min-w-0 max-w-full [&>*]:flex-none'
+                          : 'flex-wrap'
+                      }`
+                }${toolbarRowHighlightClass(toolbarDrag, toolbarRowOver)}`}
+              >
+                {appState.sceneSelectionMode && (
+                  <Tooltip content="현재 표시된 씬 모두 선택">
+                    <button
+                      type="button"
+                      // 그룹 툴바는 행 gap 이 없어(칸 간격은 구분선 칸이 맡음) 첫 칸과 12px 띄운다
+                      className={`round-button back-sky${groupedToolbar ? ' mr-3' : ''}`}
+                      onClick={() =>
+                        appState.addScenesToSelection(
+                          getFilteredScenes().map((scene) => scene.name),
+                          type,
+                        )
+                      }
+                    >
+                      {iconMode ? (
+                        <>
+                          <ActionIcon id="select-all" size={18} />
+                          <span className="ml-1 text-xs">전체</span>
+                        </>
+                      ) : (
+                        '모두 선택'
+                      )}
+                    </button>
+                  </Tooltip>
+                )}
+                {groupedToolbar
+                  ? // PC 그룹 칸: 그룹 순서 고정·그룹 안은 사용자 순서·그룹 없는 버튼은 맨 끝 「기타」 칸(비면 없음).
+                    // 칸 사이 구분선은 다음 칸의 ::before(.toolbar-group-sep) — 줄 끝에 선만 남지 않는다.
+                    toolbarSegments.map((seg, si) => (
+                      <div
+                        key={seg.group}
+                        role="group"
+                        aria-label={seg.caption}
+                        data-toolbar-group={seg.group}
+                        className={`toolbar-group${si > 0 ? ' toolbar-group-sep' : ''}`}
+                      >
+                        <div
+                          className="toolbar-group-caption text-faint"
+                          aria-hidden="true"
+                        >
+                          {seg.caption}
+                        </div>
+                        <div className="toolbar-group-buttons">
+                          {seg.ids.map(inlineToolbarButton)}
+                        </div>
+                      </div>
+                    ))
+                  : toolbarLayout.inline.map(inlineToolbarButton)}
+                {(toolbarLayout.menu.length > 0 || toolbarDragActive) && (
+                  // 모바일 가로 스크롤에서도 ⋯ 는 우측에 항상 노출(sticky) —
+                  // 끝까지 스크롤하면 제자리에 자연 합류. PC 는 팝오버 앵커용 relative.
+                  // 메뉴가 비어도 드래그 중엔 반투명 유령 ⋯(드롭 타깃)로 나타난다.
+                  <div
+                    className={
+                      mobileIcon
+                        ? 'sticky right-0 bg-[var(--c-surface)] pl-1'
+                        : groupedToolbar && toolbarSegments.length > 0
+                          ? 'relative toolbar-group-sep'
+                          : 'relative'
+                    }
+                  >
+                    {mobileIcon && toolbarScrollHint.right && (
+                      <HScrollHintArrow
+                        side="right"
+                        surface="var(--c-surface)"
+                        positionClass="right-full"
+                      />
+                    )}
+                    <ToolbarMenuDropTarget group="scene" area="scene">
+                      <Tooltip content="더보기">
+                        <button
+                          type="button"
+                          className={`round-button icon-only ${showToolbarMenu ? 'back-sky' : 'back-gray'}${toolbarLayout.menu.length === 0 ? ' opacity-40' : ''}`}
+                          onClick={() => {
+                            if (toolbarLayout.menu.length > 0)
+                              setShowToolbarMenu(!showToolbarMenu);
+                          }}
+                        >
+                          <ActionIcon id="more" size={18} />
+                        </button>
+                      </Tooltip>
+                    </ToolbarMenuDropTarget>
+                    {/* PC 팝오버는 relative 앵커 안에서 렌더. 모바일 메뉴(ModalOverlay)는
+                      sticky 가 만드는 스태킹 컨텍스트에 갇히면 씬 그리드에 덮이므로 바깥에서 렌더 */}
+                    {!isMobile && (
+                      <ToolbarOverflowMenu
+                        isOpen={showToolbarMenu}
+                        onClose={() => setShowToolbarMenu(false)}
+                        title="더보기"
+                        group="scene"
+                        dndType={
+                          appState.uiToolbar.classic
+                            ? undefined
+                            : toolbarDndType('scene')
+                        }
+                        items={toolbarLayout.menu.map((id) => ({
+                          id,
+                          name: sceneName(id),
+                          // 노드를 캐시하지 않고 매 렌더 참조 — 상태 의존 라벨
+                          // ("선택 씬 예약추가 (N)" 등)이 메뉴가 열린 채로도 갱신되도록
+                          node: buttonNode(id),
+                          hint: otherMenuIds.has(id)
+                            ? TOOLBAR_GROUP_OTHER_HINT
+                            : undefined,
+                        }))}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+              {mobileIcon && toolbarScrollHint.left && (
+                <HScrollHintArrow side="left" surface="var(--c-surface)" />
+              )}
+              {mobileIcon &&
+                toolbarScrollHint.right &&
+                !(toolbarLayout.menu.length > 0 || toolbarDragActive) && (
+                  <HScrollHintArrow side="right" surface="var(--c-surface)" />
+                )}
+            </div>
+            {isMobile && toolbarLayout.menu.length > 0 && (
+              <ToolbarOverflowMenu
+                isOpen={showToolbarMenu}
+                onClose={() => setShowToolbarMenu(false)}
+                title="더보기"
+                group="scene"
+                dndType={
+                  appState.uiToolbar.classic
+                    ? undefined
+                    : toolbarDndType('scene')
+                }
+                items={toolbarLayout.menu.map((id) => ({
+                  id,
+                  name: sceneName(id),
+                  node: buttonNode(id),
+                }))}
+              />
+            )}
+            <ToolbarHideZone group="scene" />
+            <div className="ml-auto mr-2 hidden md:flex items-center gap-2">
+              {!appState.classicSceneCard && (
+                <select
+                  className="gray-input text-sm py-1 px-2"
+                  value={curSession.sceneCardStyle?.[type] ?? 'portrait'}
+                  onChange={(e) => {
+                    curSession.sceneCardStyle = {
+                      ...curSession.sceneCardStyle,
+                      [type]: e.target.value,
+                    };
+                    sessionService.markDirty(curSession.name);
+                  }}
+                >
+                  <option value="portrait">세로 3:4</option>
+                  <option value="square">정사각형</option>
+                  <option value="landscape">가로 4:3</option>
+                  <option value="fixedHeight">높이 고정</option>
+                </select>
+              )}
+              <button
+                type="button"
+                onClick={() => setCellSize((cellSize + 1) % 3)}
+                className="round-button back-gray"
+              >
+                {cellSizes[cellSize]}
+              </button>
+            </div>
+          </div>
+        )}
+        {showSceneSearch && !v2Layout && (
+          <div className="flex flex-none items-center gap-2 pb-2 px-1">
+            <FaSearch className="text-faint flex-none" />
+            <input
+              ref={sceneSearchRef}
+              data-esc-cancel
+              type="text"
+              className="flex-1 px-2 py-1 border line-color rounded bg-[var(--c-input-bg)] text-default outline-none focus:border-sky-500"
+              placeholder="씬 이름 검색..."
+              value={sceneSearchQuery}
+              onChange={(e) => setSceneSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  setSceneSearchQuery('');
+                  setShowSceneSearch(false);
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="round-button icon-only back-gray"
+              aria-label="씬 검색 닫기"
+              onClick={() => {
+                setSceneSearchQuery('');
+                setShowSceneSearch(false);
+              }}
+            >
+              <FaTimes />
+            </button>
+          </div>
+        )}
+        <div className="flex flex-1 overflow-hidden">
+          {(() => {
+            const effectiveCellSize = showPannel || isMobile ? cellSize : 2;
+            const minWidths = ['180px', '240px', '320px'];
+            // 모바일도 CSS grid(2026-09-20): 최소 트랙이 min(9rem, 50%) 라 아무리 좁아도 2열이
+            // 확보되고, 넓으면 열이 늘며, 1fr 로 폭을 채워 좌우 대칭이 된다.
+            const useGrid = true;
+            const gridMinTrack = isMobile
+              ? 'min(9rem, 50%)'
+              : minWidths[effectiveCellSize];
+            const renderedScenes = getFilteredScenes();
+            const sceneIndices = new Map(
+              curSession.getScenes(type).map((scene, index) => [scene, index]),
+            );
+            return (
+              <div
+                ref={gridContainerRef}
+                className={
+                  useGrid
+                    ? 'overflow-auto w-full content-start relative'
+                    : 'flex flex-wrap overflow-auto justify-start items-start content-start relative'
+                }
+                style={
+                  useGrid
+                    ? {
+                        display: 'grid',
+                        gridTemplateColumns: `repeat(auto-fill, minmax(${gridMinTrack}, 1fr))`,
+                        alignItems: 'start',
+                        alignContent: 'start',
+                        // 모바일은 스크롤바(8px)가 레이아웃 폭을 차지해 오른쪽 여백만 커진다 →
+                        // 양쪽에 같은 자리를 잡아 카드 열을 화면 중앙에 맞춘다.
+                        ...(isMobile
+                          ? { scrollbarGutter: 'stable both-edges' }
+                          : {}),
+                      }
+                    : undefined
+                }
+              >
+                {dragBox && isDraggingRef.current && !mainDragSurface && (
+                  <div
+                    className="absolute bg-sky-500/30 border-2 border-sky-500 rounded pointer-events-none z-50"
+                    style={{
+                      left: Math.min(dragBox.x1, dragBox.x2),
+                      top: Math.min(dragBox.y1, dragBox.y2),
+                      width: Math.abs(dragBox.x2 - dragBox.x1),
+                      height: Math.abs(dragBox.y2 - dragBox.y1),
+                    }}
+                  />
+                )}
+                {renderedScenes.length === 0 && (
+                  <div className="w-full col-span-full py-16 flex flex-col items-center justify-center gap-1 text-faint text-sm select-none">
+                    {sceneSearchQuery.trim() ? (
+                      <span>검색 결과가 없습니다</span>
+                    ) : (
+                      <>
+                        <span>아직 씬이 없습니다</span>
+                        <span>
+                          {filterFunc
+                            ? '상단 툴바의 [씬 추가] 버튼으로 첫 씬을 만들어 보세요'
+                            : '아래 [새 씬] 카드나 툴바의 [씬 추가] 버튼으로 첫 씬을 만들어 보세요'}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                )}
+                {renderedScenes.map((scene, sceneIdx) => (
+                  <SceneCell
+                    cellSize={effectiveCellSize}
+                    key={scene.name}
+                    scene={scene}
+                    sceneIndex={sceneIndices.get(scene)}
+                    isActive={isActive}
+                    getImage={getImage}
+                    setDisplayScene={setDisplayScene}
+                    setEditingScene={setEditingScene}
+                    onQuickPrompt={(s, anchor) => {
+                      if (s.type === 'scene')
+                        setQuickPromptScene({ scene: s as Scene, anchor });
+                    }}
+                    onReview={(reviewScene) =>
+                      setImageReview({ startScene: reviewScene })
+                    }
+                    moveScene={moveScene}
+                    moveScenes={moveScenes}
+                    curSession={curSession}
+                    isBookmarked={sessionService.isSceneBookmarked(
+                      curSession.name,
+                      scene.name,
+                    )}
+                    onToggleBookmark={() =>
+                      sessionService.toggleSceneBookmark(
+                        curSession.name,
+                        scene.name,
+                        scene.type,
+                      )
+                    }
+                    disableHover={!!(editingScene || displayScene)}
+                    isFocused={focusedSceneIndex === sceneIdx}
+                  />
+                ))}
+                {/* 그리드 끝의 점선 「새 씬」 카드(2026-09-21, PC·모바일 공통) — 툴바 [씬 추가]와 같은 addScene.
+                    검색 중·선택 모드·파생 목록(filterFunc)에서는 숨긴다. 씬 카드가 아니므로 scene-cell- id 를 쓰지 않는다. */}
+                {!sceneSearchQuery.trim() &&
+                  !appState.sceneSelectionMode &&
+                  !filterFunc && (
+                    <button
+                      type="button"
+                      data-add-scene-card=""
+                      className={`${isMobile ? 'm-[5px]' : appState.classicSceneCard ? 'm-[10.5px]' : 'm-[8.5px]'} ${
+                        appState.classicSceneCard ? '' : 'rounded-lg '
+                      }border-2 border-dashed line-color bg-transparent flex flex-col items-center justify-center gap-1.5 text-sub clickable select-none`}
+                      // 폭·높이 모두 칸에 맞춘다(같은 줄 씬 카드와 같은 높이). 혼자 줄에 놓이면 aspectRatio 가 높이를 정한다.
+                      style={{
+                        alignSelf: 'stretch',
+                        justifySelf: 'stretch',
+                        aspectRatio: '1 / 1.15',
+                      }}
+                      onClick={addScene}
+                    >
+                      <ActionIcon id="add-scene" size={22} />
+                      <span className="text-sm">새 씬</span>
+                    </button>
+                  )}
+              </div>
+            );
+          })()}
+        </div>
+        {v2Layout &&
+          (() => {
+            const selecting = appState.sceneSelectionMode;
+            // 메인 줄·상단 슬롯·하단 바에 이미 집이 있는 버튼은 더보기에서 뺀다(찾기 및 변환·작가 분해는 더보기가 집). 나머지 툴바 버튼은 전부 더보기로
+            // (V2 에서 기능이 사라지지 않게). 해상도·WebP 는 대량 작업 메뉴에 있다.
+            const homed = new Set([
+              'multi-select',
+              'export-images',
+              'quick-export',
+              'batch-process',
+              'import-image',
+              'scene-search',
+              'scene-find',
+              'bookmark-jump',
+              'add-scene',
+              'piece-editor',
+              'change-resolution',
+              'webp-convert',
+            ]);
+            // 일괄 예약은 하단 바의 예약 버튼이 맡는다(보고 있는 탭의 종류를 따르고, 선택이 있으면 선택분만) → 더보기에서 뺀다.
+            homed.add('queue-add');
+            const moreIds = [
+              ...toolbarLayout.inline,
+              ...toolbarLayout.menu,
+            ].filter((id) => !homed.has(id) && !!buttonNode(id));
+            const selectedNames = getSelectedSceneNames(curSession, type);
+            const selectedScenesNow = () => {
+              const names = new Set(getSelectedSceneNames(curSession, type));
+              return curSession
+                .getScenes(type)
+                .filter((x) => names.has(x.name));
+            };
+            const mainSlots: V2SlotDef[] = [
+              {
+                key: 'multi-select',
+                name: '다중 선택',
+                icon: <ActionIcon id="multi-select" size={17} />,
+                onTap: () => {
+                  appState.sceneSelectionMode = true;
+                },
+              },
+              {
+                key: 'export',
+                name: '내보내기',
+                icon: <ActionIcon id="export-images" size={17} />,
+                onTap: () => appState.exportPackage(type),
+                swipeUp: {
+                  name: '빠른 내보내기',
+                  run: () => appState.quickExportPackage(type),
+                },
+              },
+              {
+                key: 'batch-process',
+                name: '대량 작업',
+                icon: <ActionIcon id="batch-process" size={17} />,
+                onTap: () =>
+                  appState.openBatchProcessMenu(type, setSceneSelector),
+              },
+              {
+                key: 'import-image',
+                name: '프롬프트 추출',
+                icon: <ActionIcon id="import-image" size={17} />,
+                onTap: pickImportImage,
+              },
+              {
+                // 둘째 줄(2계층)로 펼친다. 열린 동안은 백드롭이 재탭을 흡수해 접히므로 여기서는 열기만.
+                key: 'more',
+                name: '더보기',
+                icon: <ActionIcon id="more" size={17} />,
+                onTap: () => setV2Tier(true),
+                disabled: moreIds.length === 0,
+                expanded: v2Tier,
+              },
+            ];
+            // 순서는 메인 줄과 같은 자리에 같은 성격을 둔다(2026-09-21 사용자 결정): 다중 선택↔전체, 내보내기↔내보내기(위로 밀기도 같은 자리),
+            // 대량 작업↔선택 작업, 그 뒤에 예약 추가, 맨 끝은 완료.
+            const selectSlots: V2SlotDef[] = [
+              {
+                key: 'select-all',
+                name: '전체',
+                icon: <ActionIcon id="select-all" size={17} />,
+                onTap: () =>
+                  appState.addScenesToSelection(
+                    getFilteredScenes().map((scene) => scene.name),
+                    type,
+                  ),
+              },
+              {
+                // 고른 씬만 내보낸다(내보내기 함수가 대상 목록을 받는다 — 대량 작업과 같은 경로). 위로 밀면 빠른 내보내기.
+                key: 'export-selected',
+                name: '내보내기',
+                icon: <ActionIcon id="export-images" size={17} />,
+                disabled: selectedNames.length === 0,
+                onTap: () => appState.exportPackage(type, selectedScenesNow()),
+                swipeUp: {
+                  name: '빠른 내보내기',
+                  run: () => {
+                    const picked = selectedScenesNow();
+                    if (picked.length > 0)
+                      appState.quickExportPackage(type, picked);
+                  },
+                },
+              },
+              {
+                key: 'selection-actions',
+                name: '선택 작업',
+                icon: <ActionIcon id="batch-process" size={17} />,
+                disabled: selectedNames.length === 0,
+                // 선택을 대상으로 동작하는 기능(해상도 변경·이미지 삭제·씬 삭제·복사·시드 그룹 등)은 기존 컨텍스트 메뉴에 있다 → 그대로 연다
+                onTap: (e) => {
+                  const first = curSession
+                    .getScenes(type)
+                    .find((x) => x.name === selectedNames[0]);
+                  if (first) {
+                    // 메뉴 라벨의 선택 수·변형 탭 전용 항목은 이 값(씬 종류)을 본다 — 우클릭(onContext)과 같게 맞춘다
+                    appState.contextSceneType = first.type;
+                    showSceneContextMenu({
+                      event: e,
+                      props: { ctx: { type: 'scene', scene: first } },
+                    });
+                  }
+                },
+              },
+              {
+                key: 'queue-selected',
+                name: '예약 추가',
+                icon: <ActionIcon id="queue-add" size={17} />,
+                disabled: selectedNames.length === 0,
+                onTap: () => addScenesToQueue(curSession, type, true),
+              },
+              {
+                key: 'select-end',
+                name: '완료',
+                icon: <FaCheck size={17} />,
+                tone: 'accent',
+                badge:
+                  selectedNames.length > 0 ? (
+                    <span className="ml-0.5">{selectedNames.length}</span>
+                  ) : undefined,
+                onTap: () => {
+                  appState.sceneSelectionMode = false;
+                  appState.clearSceneSelection();
+                },
+              },
+            ];
+            return (
+              <>
+                {/* 메인 줄 래퍼(relative): 더보기 둘째 줄이 bottom-full 로 이 위에 덮어 올라온다 */}
+                <div className="relative flex-none" data-v2-bottom="">
+                  <V2TierRows
+                    open={v2Tier && !selecting}
+                    onClose={closeV2Tier}
+                    perRow={mainSlots.length}
+                    items={moreIds.map((id) => ({
+                      id,
+                      label: sceneV2Label(id),
+                      node: buttonNode(id),
+                    }))}
+                  />
+                  <V2MainRow
+                    slots={selecting ? selectSlots : mainSlots}
+                    selecting={selecting}
+                  />
+                </div>
+                <ToolbarOverflowMenu
+                  isOpen={v2Menu === 'find'}
+                  onClose={() => setV2Menu(null)}
+                  title="찾기·이동"
+                  group="scene"
+                  items={['scene-find', 'bookmark-jump']
+                    .filter((id) => !!buttonNode(id))
+                    .map((id) => ({
+                      id,
+                      name: sceneName(id),
+                      node: buttonNode(id),
+                    }))}
+                />
+                {v2PieceSlot &&
+                  createPortal(buttonNode('piece-editor'), v2PieceSlot)}
+                {v2TopSlot &&
+                  createPortal(
+                    <label className="flex-1 min-w-0 h-10 flex items-center gap-1 pl-2 pr-1 rounded-[10px] border line-color bg-[var(--c-input-bg)]">
+                      <input
+                        ref={sceneSearchRef}
+                        type="text"
+                        aria-label="씬 검색"
+                        className="flex-1 min-w-0 w-0 bg-transparent border-0 outline-none text-[13px] text-default"
+                        placeholder="씬 검색"
+                        value={sceneSearchQuery}
+                        onChange={(e) => setSceneSearchQuery(e.target.value)}
+                      />
+                      {sceneSearchQuery ? (
+                        <button
+                          type="button"
+                          aria-label="검색어 지우기"
+                          className="flex-none w-6 h-[30px] flex items-center justify-center rounded-md clickable text-faint"
+                          onClick={() => setSceneSearchQuery('')}
+                        >
+                          <FaTimes size={11} />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          aria-label="씬 찾기·북마크 이동"
+                          className="flex-none w-6 h-[30px] flex items-center justify-center rounded-md clickable text-faint"
+                          onClick={() => setV2Menu('find')}
+                        >
+                          <FaChevronDown size={10} />
+                        </button>
+                      )}
+                    </label>,
+                    v2TopSlot,
+                  )}
+              </>
+            );
+          })()}
+        {!isMobile && showCheatsheet && appState.floatViewCount === 0 && (
+          <ShortcutCheatsheet
+            scope="scene"
+            onClose={() => {
+              appState.showSceneCheatsheet = false;
+            }}
+          />
+        )}
+      </div>
+    );
+  },
+);
+
+export default QueueControl;

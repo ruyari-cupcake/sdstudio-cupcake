@@ -1,0 +1,195 @@
+import { type WFFieldType, WFWorkFlow, type WorkFlowDef } from './WorkFlow';
+import type {
+  Session,
+  GenericScene,
+  PromptNode,
+  SDAbstractJob,
+} from '../types';
+
+export enum WorkFlowCategoryFlag {
+  General = 1,
+  I2I = 2,
+  OneTime = 4,
+}
+
+export type WorkFlowCategory = number;
+
+export class WorkFlowService {
+  workflows: Map<string, WFWorkFlow>;
+
+  generalFlows: WFWorkFlow[] = [];
+
+  i2iFlows: WFWorkFlow[] = [];
+
+  oneTimeFlows: WFWorkFlow[] = [];
+
+  constructor() {
+    this.workflows = new Map();
+  }
+
+  addWorkFlow(category: WorkFlowCategory, def: WorkFlowDef) {
+    const workflow = new WFWorkFlow(def);
+    // eslint-disable-next-line no-bitwise -- Categories are an intentional bitmask and may contain several flags.
+    if (category & WorkFlowCategoryFlag.General) {
+      this.generalFlows.push(workflow);
+    }
+    // eslint-disable-next-line no-bitwise -- Categories are an intentional bitmask and may contain several flags.
+    if (category & WorkFlowCategoryFlag.I2I) {
+      this.i2iFlows.push(workflow);
+    }
+    // eslint-disable-next-line no-bitwise -- Categories are an intentional bitmask and may contain several flags.
+    if (category & WorkFlowCategoryFlag.OneTime) {
+      this.oneTimeFlows.push(workflow);
+    }
+    this.workflows.set(workflow.getType(), workflow);
+  }
+
+  presetFromJSON(json: any) {
+    const wf = this.workflows.get(json.type);
+    if (!wf) {
+      console.warn(`Unknown workflow type: ${json.type}`);
+      return null;
+    }
+    return wf.presetFromJSON(json);
+  }
+
+  sharedFromJSON(json: any) {
+    const wf = this.workflows.get(json.type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${json.type}`);
+    }
+    return wf.sharedFromJSON(json);
+  }
+
+  metaFromJSON(json: any) {
+    const wf = this.workflows.get(json.type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${json.type}`);
+    }
+    return wf.metaFromJSON(json);
+  }
+
+  buildShared(type: string) {
+    const wf = this.workflows.get(type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${type}`);
+    }
+    return wf.buildShared();
+  }
+
+  buildPreset(type: string) {
+    const wf = this.workflows.get(type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${type}`);
+    }
+    return wf.buildPreset();
+  }
+
+  buildMeta(type: string) {
+    const wf = this.workflows.get(type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${type}`);
+    }
+    return wf.buildMeta();
+  }
+
+  getGeneralEditor(type: string) {
+    return this.generalFlows.find((wf) => wf.getType() === type)!.def.editor;
+  }
+
+  getInnerEditor(type: string) {
+    return this.generalFlows.find((wf) => wf.getType() === type)!.def
+      .innerEditor!;
+  }
+
+  getI2IEditor(type: string) {
+    return this.i2iFlows.find((wf) => wf.getType() === type)!.def.editor;
+  }
+
+  getDef(type: string) {
+    return this.workflows.get(type)?.def;
+  }
+
+  getVarDef(type: string, fieldType: WFFieldType, field: string) {
+    const def = this.getDef(type)!;
+    if (fieldType === 'preset') {
+      return def.presetVars.find((v) => v.name === field);
+    }
+    if (fieldType === 'shared') {
+      return def.sharedVars.find((v) => v.name === field);
+    }
+    return def.metaVars.find((v) => v.name === field);
+  }
+
+  async createPrompts(
+    type: string,
+    session: Session,
+    scene: GenericScene,
+    preset: any,
+    shared: any,
+  ) {
+    const wf = this.workflows.get(type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${type}`);
+    }
+    return await wf.def.createPrompt!(session, scene, preset, shared);
+  }
+
+  async createCharacterPrompts(
+    type: string,
+    session: Session,
+    scene: GenericScene,
+    preset: any,
+    shared: any,
+  ) {
+    const wf = this.workflows.get(type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${type}`);
+    }
+    return await wf.def.createCharacterPrompts!(session, scene, preset, shared);
+  }
+
+  createPreset(
+    type: string,
+    job: SDAbstractJob<string>,
+    image?: string,
+    mask?: string,
+  ) {
+    const wf = this.workflows.get(type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${type}`);
+    }
+    return wf.def.createPreset!(job, image, mask);
+  }
+
+  async pushJob(
+    type: string,
+    session: Session,
+    scene: GenericScene,
+    prompt: PromptNode,
+    characterPrompts: PromptNode[],
+    preset: any,
+    shared: any,
+    samples: number,
+    meta?: any,
+    onComplete?: (img: string) => void,
+    nodelay?: boolean,
+  ) {
+    const wf = this.workflows.get(type);
+    if (!wf) {
+      throw new Error(`Unknown workflow type: ${type}`);
+    }
+    return await wf.def.handler!(
+      session,
+      scene,
+      prompt,
+      characterPrompts,
+      preset,
+      shared,
+      samples,
+      meta,
+      onComplete,
+      nodelay,
+    );
+  }
+}

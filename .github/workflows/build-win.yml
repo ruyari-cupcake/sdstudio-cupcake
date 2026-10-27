@@ -1,0 +1,137 @@
+name: Build Windows Portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-win:
+    # windows-latest(2025)의 VS2026(v18)을 node-gyp가 아직 인식 못함 → VS2022가 있는 이미지로 고정
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Verify root and packaged app release versions
+        run: node tools/check-release-metadata.cjs --ci-env
+
+      - name: Install native module dependencies
+        run: |
+          cd src/native
+          npm ci
+
+      - name: Build capacitor-background-mode
+        run: |
+          cd externals/capacitor-background-mode
+          npm ci
+          npm run build
+
+      - name: Install project dependencies (skip postinstall)
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Install pinned Electron runtime
+        run: node node_modules/electron/install.js
+
+      - name: Install electron-builder app deps
+        run: npx electron-builder install-app-deps
+
+      - name: Build application
+        run: npm run build
+
+      - name: Package (win-unpacked)
+        run: npx electron-builder build --win --dir --publish never
+
+      - name: Record files owned by this application build
+        run: node tools/write-app-manifest.cjs release/build/win-unpacked
+
+      - name: Verify Windows update replacement and recovery
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows-update-helper-smoke.ps1
+
+      # The real packaged window must accept OS mouse/keyboard input. DOM/CDP
+      # clicks alone bypass Electron's draggable non-client regions.
+      - name: Exercise packaged preferences with native Windows input
+        run: npm run smoke:settings
+        env:
+          SDSTUDIO_PACKAGED: '1'
+          ELECTRON_EXECUTABLE: '${{ github.workspace }}/release/build/win-unpacked/${{ env.app_executable }}'
+          SDSTUDIO_SETTINGS_REPORT_DIR: '${{ runner.temp }}/sdstudio-settings-acceptance'
+
+      - name: Upload preferences acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cupcake-SDStudio-Windows-settings-acceptance
+          path: '${{ runner.temp }}/sdstudio-settings-acceptance/'
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Exercise packaged storage and image preview resources
+        run: node tools/electron-storage-smoke.cjs
+        env:
+          SDSTUDIO_PACKAGED: '1'
+          ELECTRON_EXECUTABLE: '${{ github.workspace }}/release/build/win-unpacked/${{ env.app_executable }}'
+          SDSTUDIO_STORAGE_REPORT_DIR: '${{ runner.temp }}/sdstudio-storage-acceptance'
+
+      - name: Upload storage acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cupcake-SDStudio-Windows-storage-acceptance
+          path: '${{ runner.temp }}/sdstudio-storage-acceptance/'
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Exercise packaged update settings with native Windows input
+        run: node tools/electron-update-smoke.cjs
+        env:
+          SDSTUDIO_PACKAGED: '1'
+          ELECTRON_EXECUTABLE: '${{ github.workspace }}/release/build/win-unpacked/${{ env.app_executable }}'
+          SDSTUDIO_UPDATE_REPORT_DIR: '${{ runner.temp }}/sdstudio-update-acceptance'
+
+      - name: Upload update acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact_prefix }}-Windows-update-acceptance
+          path: '${{ runner.temp }}/sdstudio-update-acceptance/'
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Zip unpacked portable folder
+        run: |
+          cd release/build/win-unpacked
+          7z a "../${{ env.artifact_prefix }}-${{ env.version }}-Windows-folder.zip" .
+
+      - name: Build one-file portable Windows executable
+        run: npx electron-builder build --win portable --x64 --prepackaged release/build/win-unpacked --publish never
+
+      - name: Give the executable an unambiguous download name
+        run: |
+          shopt -s nullglob
+          files=(release/build/*.exe)
+          test "${#files[@]}" -eq 1
+          mv "${files[0]}" "release/build/${{ env.artifact_prefix }}-${{ env.version }}-Windows-Portable.exe"
+          test -s "release/build/${{ env.artifact_prefix }}-${{ env.version }}-Windows-Portable.exe"
+
+      - name: Upload portable Windows files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact_prefix }}-${{ env.version }}-Windows
+          path: |
+            release/build/${{ env.artifact_prefix }}-*-Windows-Portable.exe
+            release/build/${{ env.artifact_prefix }}-*-Windows-folder.zip
+          if-no-files-found: error
+          retention-days: 30

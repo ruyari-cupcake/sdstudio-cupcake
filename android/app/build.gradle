@@ -1,0 +1,96 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+// The checked-in package metadata also drives desktop release identity. Public
+// exports change that metadata before either platform is built.
+def packageMetadata = new groovy.json.JsonSlurper().parse(file('../../package.json'))
+def updateRepository = packageMetadata.build.publish
+def updateString = { value -> groovy.json.JsonOutput.toJson(value.toString()) }
+
+android {
+
+  namespace "io.sunho.SDStudio"
+    compileSdk rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "io.ruyari.cupcake.sdstudio.public"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 6010001
+        versionName "6.1.0-cupcake.1"
+        buildConfigField "String", "UPDATE_OWNER", updateString(updateRepository.owner)
+        buildConfigField "String", "UPDATE_REPO", updateString(updateRepository.repo)
+        buildConfigField "String", "UPDATE_CHANNEL", updateString(updateRepository.private ? 'private' : 'public')
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+    buildFeatures {
+      buildConfig true
+    }
+    // Preserve uncompressed native libraries through AGP's supported packaging owner.
+    packaging {
+      jniLibs {
+        useLegacyPackaging = false
+      }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    externalNativeBuild {
+      cmake {
+        path "src/main/jni/CMakeLists.txt"
+      }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+    implementation 'com.squareup.okhttp3:okhttp:4.9.2'
+    implementation 'com.lambdapioneer.argon2kt:argon2kt:1.5.0'
+  implementation 'com.github.bumptech.glide:glide:4.12.0'
+  annotationProcessor 'com.github.bumptech.glide:compiler:4.12.0'
+  implementation 'org.apache.commons:commons-compress:1.21'
+  // Google 드라이브 연동 ④(GoogleDrivePlugin.kt) — AuthorizationClient·revokeAccess·clearToken.
+  // 21.4.0 = minSdk 21 인 마지막 판(21.5.0 부터 minSdk 23, 22.0.0 은 24). 앱 minSdk 22 유지 위해 고정.
+  implementation 'com.google.android.gms:play-services-auth:21.4.0'
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}

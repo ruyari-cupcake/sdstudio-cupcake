@@ -1,0 +1,493 @@
+import type { UpdateBackend } from '../shared/appUpdate';
+import type { SaveLocationInsideInstall } from '../shared/installDir';
+import type { Config } from '../main/config';
+import type { DriveAuthStatus } from '../shared/googleDriveAuth';
+import type {
+  DriveBackupItem,
+  DriveDownloadProgress,
+  DriveFileMeta,
+  DriveListResult,
+  DriveUploadProgress,
+} from '../shared/googleDrive';
+import type {
+  EncodeVibeImageInput,
+  ImageAugmentInput,
+  ImageUpscaleInput,
+  ImageGenInput,
+  LoginValidity,
+} from './backends/imageGen';
+
+export interface FileEntry {
+  name: string;
+  path: string;
+}
+
+// selectFile 선택 인자(하위 호환). 미지정 = 기존 동작.
+export interface SelectFileOptions {
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}
+
+export enum ImageOptimizeMethod {
+  LOSSY = 1,
+  LOSSLESS = 2,
+  AVIF = 3,
+}
+
+export interface ResizeImageInput {
+  inputPath: string;
+  outputPath: string;
+  maxWidth: number;
+  maxHeight: number;
+  optimize?: ImageOptimizeMethod;
+  // 최적화 품질(1~100). 미지정 시 종전 기본값(webp 80·avif 50). lossless 는 무시.
+  // 데스크톱 전용 — Android 리사이저는 리사이즈만 하고 이 값을 사용하지 않는다.
+  quality?: number;
+  // NAI 알파 stealth 워터마크 보존(webp 전용, 데스크톱 전용). 리사이즈로 파괴되는
+  // 워터마크를 추출→재삽입해 NAI 인스펙터 인식을 유지한다. raw 재인코딩으로 느려짐.
+  preserveStealth?: boolean;
+}
+
+export interface FileStatEntry {
+  name: string;
+  size: number;
+  mtime: number;
+}
+
+export abstract class Backend {
+  readonly updates?: UpdateBackend;
+
+  abstract getConfig(): Promise<Config>;
+
+  abstract setConfig(newConfig: Config): Promise<void>;
+
+  abstract getVersion(): Promise<string>;
+
+  abstract openWebPage(url: string): Promise<void>;
+
+  abstract generateImage(arg: ImageGenInput): Promise<void>;
+
+  abstract augmentImage(arg: ImageAugmentInput): Promise<void>;
+
+  abstract upscaleImage(arg: ImageUpscaleInput): Promise<void>;
+
+  abstract login(email: string, password: string): Promise<void>;
+
+  abstract loginWithToken(token: string): Promise<void>;
+
+  // 저장된 로그인 토큰을 바꾸지 않고 후보 토큰만 검증한다. 수동 토큰
+  // 프리셋 전환에서 잘못된 토큰으로 현재 로그인을 덮어쓰지 않기 위한 관문.
+  abstract validateToken(token: string): Promise<LoginValidity>;
+
+  // 저장된 토큰이 실제로 유효한지 NovelAI API로 검증 (단순 파일 존재 확인이 아님)
+  abstract validateLogin(): Promise<LoginValidity>;
+
+  // 현재 TOKEN.txt 로그인 토큰을 변경 없이 읽는다. 다중 토큰 저장소가 비어 있을 때
+  // 기존 로그인을 최초 항목으로 안전하게 복사하기 위한 읽기 전용 관문이다.
+  abstract readLoginToken(): Promise<string | undefined>;
+
+  // 로그인 토큰 프리셋은 프로젝트 저장 경로와 분리된 인증 저장 영역에 둔다.
+  // 반환값 undefined 는 아직 프리셋 파일이 없는 정상적인 최초 상태다.
+  abstract readTokenProfileData(): Promise<string | undefined>;
+
+  abstract writeTokenProfileData(data: string): Promise<void>;
+
+  abstract encodeVibeImage(arg: EncodeVibeImageInput): Promise<string>;
+
+  abstract showFile(arg: string): Promise<void>;
+
+  // 앱 내부 exports/에 완성된 사용자 내보내기 산출물을 OS 다운로드 폴더로
+  // 옮긴 뒤 표시한다. 생성 원본을 다루는 showFile/copyToDownloads와 분리해
+  // 성공 후 내부 스테이징 사본을 안전하게 정리할 수 있게 한다.
+  abstract publishExport(arg: string): Promise<void>;
+
+  // publishExport 와 같은 규칙으로 exports/ 산출물을 다운로드 폴더에 저장하되
+  // 대화상자·폴더 열기·공유 없이 저장만 하고, 저장된 위치(표시용 경로)를 돌려준다.
+  // 저장 실패는 throw — 호출부(프로젝트 덮어쓰기 임시 백업, 드라이브 동기화 ⑤)는
+  // 이 결과를 받은 뒤에만 기존 프로젝트를 건드린다.
+  abstract saveExportToDownloads(arg: string): Promise<string>;
+
+  // ─── Google 드라이브 연동 인증 (드라이브 API ①) ───
+  // PC = main IPC(루프백 PKCE·safeStorage 저장). Android(④) = 네이티브 플러그인 GoogleDrive
+  // (AuthorizationClient — 영속 토큰 없음). Google Play 서비스가 없는 Android 는
+  // driveAuthSupported() false(설정 화면 구역 자체를 숨김·기존 공유 시트 흐름), 나머지 호출은 명확한 오류.
+  abstract driveAuthSupported(): boolean;
+
+  // 현재 연결 상태(연결돼 있으면 이메일·용량을 새로 조회). 토큰 값은 포함하지 않는다.
+  abstract driveAuthStatus(): Promise<DriveAuthStatus>;
+
+  // 시스템 브라우저로 승인 → 완료 시 상태. 실패·취소는 DriveAuthError(code) throw.
+  abstract driveAuthConnect(): Promise<DriveAuthStatus>;
+
+  // 진행 중인 브라우저 승인 대기를 취소한다(없으면 무시).
+  abstract driveAuthCancel(): Promise<void>;
+
+  // 저장된 인증 정보 삭제 + Google 권한 철회(철회 실패해도 로컬 해제는 완료).
+  abstract driveAuthDisconnect(): Promise<void>;
+
+  // 다른 창 포함 상태 변경 수신. 반환 = 구독 해제.
+  abstract onDriveAuthChanged(
+    callback: (status: DriveAuthStatus) => void,
+  ): () => void;
+
+  // 연결 여부만(네트워크 조회 없음) — 내보내기 목적지 결정용(드라이브 API ②).
+  // driveAuthStatus 는 이메일·용량을 새로 조회하므로(오프라인이면 제한 시간까지 대기) 쓰지 않는다.
+  abstract driveAuthConnected(): Promise<boolean>;
+
+  // 연결 여부의 마지막으로 알려진 값(동기·네트워크 없음, 드라이브 API ④). Android 의 <input type=file>
+  // 버튼은 사용자 제스처 안에서 await 없이 「출처를 물을지」를 정해야 해서 쓴다(PC 는 쓰지 않음 — false).
+  abstract driveAuthConnectedHint(): boolean;
+
+  // ─── Google 드라이브 올리기 (드라이브 API ②) ───
+  // exports/ 산출물을 드라이브 SDStudio 폴더에 올린다(exports/ 사본은 지우지 않음 — 호출부 몫).
+  // 실패·취소는 DriveUploadError(code) throw(취소 = 'cancelled'). NovelAI 토큰 파일은 거부.
+  // Android 는 네이티브 플러그인(8 MiB 청크 resumable, 진행 이벤트 driveUploadProgress).
+  abstract driveUpload(
+    exportsPath: string,
+    meta: { kind: string; name?: string },
+    onProgress?: (p: DriveUploadProgress) => void,
+  ): Promise<DriveFileMeta>;
+
+  // 이 창에서 진행 중인 올리기를 중단한다(없으면 무시).
+  abstract driveUploadCancel(): Promise<void>;
+
+  // 올린 파일의 드라이브 웹 주소를 시스템 브라우저로 연다(https://drive.google.com/ 만).
+  abstract driveOpenFile(webViewLink: string): Promise<void>;
+
+  // ─── Google 드라이브 목록·받기·휴지통 (드라이브 API ③) ───
+  // 실패는 DriveUploadError(code) throw. Android 는 네이티브 플러그인(받은 경로 = file:// URI).
+  // SDStudio 폴더의 파일 목록(최신 먼저)과 폴더 웹 주소. 폴더가 아직 없으면 빈 목록.
+  abstract driveList(): Promise<DriveListResult>;
+
+  // 파일을 받아 저장된 절대 경로를 돌려준다. 기본 = 앱 tmp/drive-download/<id>/(불러오기용 —
+  // 끝나면 driveCleanupDownload), toDownloads = OS 다운로드 폴더. 취소 = 'cancelled'.
+  // NovelAI 토큰 파일은 toDownloads 로만 받을 수 있다.
+  abstract driveDownload(
+    item: Pick<DriveBackupItem, 'id' | 'name' | 'size'>,
+    opts: { toDownloads?: boolean },
+    onProgress?: (p: DriveDownloadProgress) => void,
+  ): Promise<string>;
+
+  // 이 창에서 진행 중인 받기를 중단한다(없으면 무시).
+  abstract driveDownloadCancel(): Promise<void>;
+
+  // 드라이브 휴지통으로 이동(영구 삭제 아님 — files.delete 는 쓰지 않는다).
+  abstract driveTrash(fileId: string): Promise<void>;
+
+  // 받은 임시 폴더(tmp/drive-download/<id>) 삭제. 실패는 무시.
+  abstract driveCleanupDownload(fileId: string): Promise<void>;
+
+  // 폴더를 OS 파일 탐색기로 연다(내용물 표시). 데스크톱 전용 — 모바일은 no-op.
+  abstract openPath(arg: string): Promise<void>;
+
+  abstract copyToDownloads(path: string): Promise<void>;
+
+  abstract zipFiles(files: FileEntry[], outPath: string): Promise<void>;
+
+  abstract unzipFiles(tarPath: string, outPath: string): Promise<void>;
+
+  // 데이터 루트가 위치한 볼륨의 여유 공간(bytes). 조회 불가/미지원이면 null
+  // (= "알 수 없음"). 트랙1 (b) 마이그레이션 백업 게이트의 공간 판정용.
+  abstract getFreeSpace(): Promise<number | null>;
+
+  // 런타임 진단(감지 코어 수·실효 libuv 스레드풀 크기). 데스크톱 전용 — 모바일은
+  // libuv 스레드풀 개념이 없어 null(="해당 없음"). 이미지 병렬 상한 확인용.
+  abstract getRuntimeDiag(): Promise<{
+    cpus: number;
+    uvThreadpool: number;
+  } | null>;
+
+  // 부팅 경고 조회 — 사용자 지정 저장 경로 접근 실패로 기본 경로로 폴백했는지 등을
+  // 렌더러가 부팅 후 1회 조회해 사용자에게 안내한다. 데스크톱 전용(모바일은 null).
+  abstract getBootWarnings(): Promise<{
+    saveLocationFallback: { attempted: string; code: string } | null;
+    configLoadFailure: { path: string; code: string } | null;
+    saveLocationInsideInstall: SaveLocationInsideInstall | null;
+  } | null>;
+
+  // 현재 실행에서 실제로 사용 중인 데이터 루트. 기본 위치도 절대/표시 경로로 노출한다.
+  abstract getDataRoot(): Promise<string>;
+
+  // Desktop-only transition: caller flushes first, then restarts immediately.
+  async changeSaveLocation(_absolutePath: string): Promise<void> {
+    throw new Error('이 기기에서는 저장 위치 변경을 지원하지 않습니다.');
+  }
+
+  // 읽기 실패한 config.json 을 삭제하지 않고 백업명으로 격리한다. 데스크톱 전용.
+  abstract backupFailedConfig(): Promise<string>;
+
+  // 폴더가 실제 쓰기 가능한지 사전 검증(저장 경로 지정 전). 권한 없는 드라이브를
+  // 저장 경로로 지정해 다음 부팅이 벽돌화되는 것을 예방. 데스크톱 전용(모바일은 항상 ok).
+  abstract checkWritable(
+    absolutePath: string,
+  ): Promise<{ ok: boolean; code?: string }>;
+
+  abstract searchTags(word: string, category?: number): Promise<any>;
+
+  abstract lookupTag(word: string): Promise<any>;
+
+  abstract loadPiecesDB(pieces: string[]): Promise<void>;
+
+  abstract searchPieces(word: string): Promise<any>;
+
+  abstract listFiles(arg: string): Promise<string[]>;
+
+  abstract listFilesWithStats(arg: string): Promise<FileStatEntry[]>;
+
+  abstract readFile(filename: string): Promise<string>;
+
+  abstract writeFile(filename: string, data: string): Promise<void>;
+
+  abstract copyFile(src: string, dest: string): Promise<void>;
+
+  // src(APP_DIR 상대경로)를 절대경로 dest 로 복사. 데스크톱 export 목표 폴더용.
+  abstract copyFileToAbsolute(
+    src: string,
+    absoluteDest: string,
+  ): Promise<'copied' | 'same-file'>;
+
+  // 생성 이미지 PNG(src) → WebP(dest) 변환. NAI 프롬프트 메타데이터를 EXIF 로 이월. 데스크톱 전용.
+  abstract convertToWebp(
+    src: string,
+    dest: string,
+    quality: number,
+  ): Promise<void>;
+
+  abstract readDataFile(arg: string): Promise<string>;
+
+  abstract writeDataFile(filename: string, data: string): Promise<void>;
+
+  abstract writeDataFileAbsolute(
+    absolutePath: string,
+    data: string,
+  ): Promise<void>;
+
+  abstract existFileAbsolute(absolutePath: string): Promise<boolean>;
+
+  abstract renameFile(oldfile: string, newfile: string): Promise<void>;
+
+  abstract renameDir(oldfile: string, newfile: string): Promise<void>;
+
+  abstract deleteFile(filename: string): Promise<void>;
+
+  abstract deleteDir(filename: string): Promise<void>;
+
+  abstract trashFile(filename: string): Promise<void>;
+
+  abstract selectDir(): Promise<string | undefined>;
+
+  // options 는 하위 호환 선택 인자(드라이브 동기화 ②): PC 는 defaultPath 폴더에서
+  // 선택기를 열고 filters 를 적용한다. Android 문서 선택기는 둘 다 의도적으로 무시한다.
+  abstract selectFile(options?: SelectFileOptions): Promise<string | undefined>;
+
+  abstract selectFiles(options?: {
+    filters?: { name: string; extensions: string[] }[];
+  }): Promise<string[]>;
+
+  abstract readBinaryFile(filePath: string): Promise<string>;
+
+  abstract close(): Promise<void>;
+
+  // 앱 재시작 — 저장소 마이그레이션 재개 버튼용. 데스크톱=정상 종료 경로(close
+  // 인터셉트의 종료 시 저장 보장) 후 자동 재실행, 모바일=WebView reload(부트스트랩 재실행).
+  abstract restartApp(): Promise<void>;
+
+  abstract existFile(filename: string): Promise<boolean>;
+
+  abstract download(url: string, dest: string, filename: string): Promise<void>;
+
+  abstract resizeImage(input: ResizeImageInput): Promise<void>;
+
+  abstract openImageEditor(inputPath: string): Promise<void>;
+
+  abstract watchImage(inputPath: string): Promise<void>;
+
+  abstract unwatchImage(inputPath: string): Promise<void>;
+
+  abstract loadModel(modelPath: string): Promise<void>;
+
+  abstract extractZip(zipPath: string, outPath: string): Promise<void>;
+
+  abstract copyImageToClipboard(imagePath: string): Promise<void>;
+
+  abstract spawnLocalAI(): Promise<void>;
+
+  abstract isLocalAIRunning(): Promise<boolean>;
+
+  // `/user/data` 조회 — 같은 토큰이면 10초 안의 직전 결과를 재사용하고 동시 호출은 합친다
+  // (requestTiming USER_DATA_CACHE_MS). options.force = 캐시를 건너뛰고 새로 읽는다.
+  abstract getRemainCredits(
+    options?: import('./models/requestTiming').RecentRequestOptions,
+  ): Promise<number>;
+
+  abstract getOpusUsageStatus(
+    options?: import('./models/requestTiming').RecentRequestOptions,
+  ): Promise<import('./backends/imageGen').OpusUsageStatus>;
+
+  abstract getOpusUsageStatusForToken(
+    token: string,
+    options?: import('./models/requestTiming').RecentRequestOptions,
+  ): Promise<import('./backends/imageGen').OpusUsageStatus>;
+
+  abstract removeBackground(
+    inputImageBase64: string,
+    outputPath: string,
+  ): Promise<void>;
+
+  // 아티스트 태깅 (로컬 ONNX 추론, 데스크톱 전용)
+  abstract analyzeArtistTags(arg: {
+    imageBase64: string;
+    model: 'kaloscope' | 'wd-swinv2' | 'wd-eva02';
+  }): Promise<any>;
+
+  abstract onDownloadProgress(callback: (progress: any) => void): () => void;
+
+  abstract onZipProgress(callback: (progress: any) => void): () => void;
+
+  abstract onImageChanged(callback: (path: string) => void): () => void;
+
+  abstract onClose(callback: () => void): () => void;
+
+  // 텍스트 드래그 후 우클릭 → "Danbooru로 검색" (데스크톱 전용, 모바일은 no-op)
+  abstract onDanbooruSearch(callback: (text: string) => void): () => void;
+
+  // 모바일 백그라운드(포그라운드 서비스) 알림 내용 갱신.
+  // 기본은 no-op이며 안드로이드 백엔드에서만 실제 구현한다.
+  async updateBackgroundNotification(
+    _title: string,
+    _text: string,
+  ): Promise<void> {
+    // Desktop backends have no Android foreground notification to update.
+  }
+
+  // 새 창 열기 — 데스크톱(Electron)에서 보조 창(멀티 윈도우, W6)을 연다.
+  // projectName 을 주면 새 창이 부팅 후 그 프로젝트를 연다("새 창에서 열기").
+  // 기본은 no-op(모바일은 단일 WebView라 창 개념 없음) — 데스크톱 백엔드에서만 구현.
+  async openNewWindow(_projectName?: string): Promise<void> {
+    // The single-view backend has no additional native window.
+  }
+
+  // ─── 프로젝트 배타 락 (W6 P1) ───
+  // 데스크톱 멀티 윈도우에서 같은 프로젝트의 이중 열기를 차단한다.
+  // 모바일/단일 창은 락 개념이 없으므로 기본 구현은 "항상 성공" no-op.
+  async acquireProjectLock(_name: string): Promise<boolean> {
+    return true;
+  }
+
+  async releaseProjectLock(_name: string): Promise<void> {
+    // The single-view backend owns no cross-window project lock.
+  }
+
+  async queryProjectLock(
+    _name: string,
+  ): Promise<{ locked: boolean; mine: boolean }> {
+    return { locked: false, mine: false };
+  }
+
+  // notice 를 주면 안내 토스트가 요청 창이 아닌 **소유 창**에 표시된다
+  // (포커스가 소유 창으로 넘어가므로 안내도 도착한 창에서 보이는 게 자연스럽다).
+  async focusProjectLockOwner(_name: string, _notice?: string): Promise<void> {
+    // The single-view backend has no other lock-owner window.
+  }
+
+  // 락 소유 창으로 전달된 안내 수신 — 기본 no-op(모바일/단일 창).
+  onLockOwnerNotice(_callback: (message: string) => void): () => void {
+    return () => {};
+  }
+
+  // "새 창에서 열기"로 이 창에 예치된 초기 프로젝트 이름(1회성) — 없으면 null.
+  async takeInitialProject(): Promise<string | null> {
+    return null;
+  }
+
+  // ─── 전역 저장소 동기화 (W6 P2) ───
+  // 창 공유 저장소(글로벌 캐릭터 프리셋·휴지통·세션 메타 등)를 저장한 뒤 다른
+  // 창들에 알린다(낙관적 쓰기 + 브로드캐스트). 기본 no-op(모바일/단일 창).
+  async notifyGlobalStoreChanged(_key: string): Promise<void> {
+    // The single-view backend has no peer renderer to notify.
+  }
+
+  // 다른 창의 전역 저장소 변경 수신 — 수신 창은 해당 저장소를 디스크에서 재로드.
+  onGlobalStoreChanged(_callback: (key: string) => void): () => void {
+    return () => {};
+  }
+
+  // ─── 생성 위임: 단일 생성 호스트 (W6 P3) ───
+  // 데스크톱 멀티 윈도우에서 모든 창의 생성을 "호스트 창" 큐 하나로 일원화한다.
+  // 기본 구현은 "항상 자기 창이 호스트" — 단일 창·모바일은 위임 경로를 아예 타지
+  // 않으므로 종전 동작과 100% 동일하다(최우선 회귀 기준). payload/snapshot 은 IPC
+  // 구조적 복제로 넘어가는 순수 JSON 이라 여기선 느슨한 타입(any)으로 둔다.
+  async isGenerationHost(): Promise<boolean> {
+    return true;
+  }
+
+  onGenerationHostChanged(_callback: (isHost: boolean) => void): () => void {
+    return () => {};
+  }
+
+  onGenerationPeerCount(_callback: (count: number) => void): () => void {
+    return () => {};
+  }
+
+  // 보조 창 → 호스트
+  async delegateTask(_payload: any): Promise<void> {
+    // Single-view generation stays in the local queue; there is no remote host.
+  }
+
+  async delegateCancel(_payload: any): Promise<void> {
+    // The single-view backend has no delegated remote task to cancel.
+  }
+
+  async delegateRun(): Promise<void> {
+    // The single-view backend runs its local queue directly.
+  }
+
+  async delegateStop(): Promise<void> {
+    // The single-view backend stops its local queue directly.
+  }
+
+  onDelegateTask(_callback: (payload: any) => void): () => void {
+    return () => {};
+  }
+
+  onDelegateCancel(_callback: (payload: any) => void): () => void {
+    return () => {};
+  }
+
+  onDelegateRun(_callback: () => void): () => void {
+    return () => {};
+  }
+
+  onDelegateStop(_callback: () => void): () => void {
+    return () => {};
+  }
+
+  // 호스트 → 원 창(완료·실패) / 호스트 → 보조 창들(상태 미러)
+  async delegateComplete(_payload: any): Promise<void> {
+    // The single-view backend has no originating peer window.
+  }
+
+  async delegateQueueSnapshot(_snapshot: any): Promise<void> {
+    // The single-view backend has no peer queue mirror.
+  }
+
+  onDelegateComplete(_callback: (payload: any) => void): () => void {
+    return () => {};
+  }
+
+  onDelegateQueueSnapshot(_callback: (snapshot: any) => void): () => void {
+    return () => {};
+  }
+
+  // ─── 창 간 세션 op(메모리 반영) 동기화 — 같은 프로젝트 중복 열기(읽기 전용 미러) ───
+  // P2 전역 저장소 동기화가 "저장소 재로드"라면, 이쪽은 메모리의 세션 op(이미지
+  // 즐겨찾기 등)를 다른 창에 전파해 소유 창이 자기 큐에서 저장하도록 위임한다.
+  // 기본 no-op(모바일/단일 창) — payload 는 IPC 구조적 복제로 넘어가는 순수 JSON.
+  async notifySessionOp(_payload: any): Promise<void> {
+    // The single-view backend has no peer session owner.
+  }
+
+  onSessionOp(_callback: (payload: any) => void): () => void {
+    return () => {};
+  }
+}

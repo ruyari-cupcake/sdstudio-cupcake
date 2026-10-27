@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">SDStudio Cupcake</string>
+    <string name="title_activity_main">SDStudio Cupcake</string>
+    <string name="package_name">io.ruyari.cupcake.sdstudio.public</string>
+    <string name="custom_url_scheme">io.ruyari.cupcake.sdstudio.public</string>
+</resources>

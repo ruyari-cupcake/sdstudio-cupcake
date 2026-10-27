@@ -1,0 +1,419 @@
+package io.sunho.SDStudio;
+
+import static androidx.core.content.ContextCompat.startActivity;
+
+import android.app.DownloadManager;
+import android.content.Context;
+import android.database.Cursor;
+import android.media.MediaScannerConnection;
+import android.net.Uri;
+import android.provider.DocumentsContract;
+import android.provider.MediaStore;
+import android.util.Log;
+
+import com.getcapacitor.Plugin;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.*;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.PluginCall;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.StatFs;
+import android.provider.Settings;
+
+import androidx.core.content.FileProvider;
+
+import java.io.*;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+@CapacitorPlugin(name = "ZipService")
+public class ZipService extends Plugin {
+  private static final String TAG = "ZipService";
+
+  @PluginMethod
+  public void zipFiles(PluginCall call) {
+    // 원자적 아카이브 쓰기: '.part' 임시 경로에 기록 후 완료 시 rename.
+    // 도중 종료 시 불완전 tar 가 최종 경로에 남지 않는다(트랙1 (b) 백업 원자성 §4-0).
+    String outPath = call.getString("outPath");
+    String tmpPath = outPath + ".part";
+    File tmpFile = new File(tmpPath);
+    try {
+      List<JSONObject> files = call.getArray("files").toList();
+      if (outPath.toLowerCase(java.util.Locale.ROOT).endsWith(".zip")) {
+        try (ZipOutputStream zipOut = new ZipOutputStream(
+            new BufferedOutputStream(new FileOutputStream(tmpFile)))) {
+          zipOut.setLevel(1);
+          byte[] buffer = new byte[64 * 1024];
+          for (JSONObject file : files) {
+            zipOut.putNextEntry(new ZipEntry(file.getString("name")));
+            try (InputStream input = new BufferedInputStream(
+                new FileInputStream(file.getString("path")))) {
+              int count;
+              while ((count = input.read(buffer)) != -1) zipOut.write(buffer, 0, count);
+            }
+            zipOut.closeEntry();
+          }
+        }
+        // Publish only after the ZIP central directory has been written and closed.
+        android.system.Os.rename(tmpPath, outPath);
+        call.resolve();
+        return;
+      }
+
+      FileOutputStream fos = new FileOutputStream(tmpFile);
+      BufferedOutputStream bos = new BufferedOutputStream(fos);
+      //GzipCompressorOutputStream gzipOut = new GzipCompressorOutputStream(bos);
+      TarArchiveOutputStream tarOut = new TarArchiveOutputStream(bos);
+      // 엔트리 이름 100바이트 초과(한글 프로젝트/씬 이름이면 흔함) 시 기본 모드
+      // (LONGFILE_ERROR)는 RuntimeException 을 던져 미처리로 프로세스가 즉사한다
+      // (모바일 백업 완료 직전 튕김의 원인). PAX 확장 헤더로 긴 이름을 기록한다 —
+      // PC(tar-stream)·복원(TarArchiveInputStream) 모두 PAX 를 지원해 호환 유지.
+      tarOut.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX);
+      tarOut.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX);
+
+      for (JSONObject file : files) {
+        String fileName = file.getString("name");
+        String filePath = file.getString("path");
+        addFileToTar(tarOut, filePath, fileName);
+      }
+
+      tarOut.finish();
+      tarOut.close();
+
+      // Match ZIP publication: a failed replacement must retain the old archive.
+      android.system.Os.rename(tmpPath, outPath);
+      call.resolve();
+    } catch (Exception e) {
+      // IOException/JSONException 외의 런타임 예외(라이브러리가 던지는
+      // RuntimeException 등)도 흡수한다 — 플러그인 스레드의 미처리 예외는
+      // 앱 프로세스 전체를 죽이므로(실기 크래시 사례) 반드시 reject 로 변환.
+      // 불완전 임시 파일 정리 시도
+      if (tmpFile.exists()) {
+        tmpFile.delete();
+      }
+      call.reject("Failed to zip files", e);
+    }
+  }
+
+  // POSIX rename replaces an existing destination atomically; never pre-delete it.
+  @PluginMethod
+  public void atomicRename(PluginCall call) {
+    String from = call.getString("from");
+    String to = call.getString("to");
+    String directory = call.getString("directory");
+    if (from == null || from.isEmpty() || to == null || to.isEmpty()) {
+      call.reject("from and to must be provided", "EINVAL");
+      return;
+    }
+    try {
+      File root;
+      if ("DOCUMENTS".equals(directory)) {
+        root = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+      } else if ("EXTERNAL_STORAGE".equals(directory)) {
+        root = Environment.getExternalStorageDirectory();
+      } else {
+        call.reject("Unsupported storage directory", "EINVAL");
+        return;
+      }
+      android.system.Os.rename(new File(root, from).getPath(), new File(root, to).getPath());
+      call.resolve();
+    } catch (android.system.ErrnoException error) {
+      call.reject("Unable to replace storage file", android.system.OsConstants.errnoName(error.errno), error);
+    } catch (SecurityException error) {
+      call.reject("Storage access denied", "EACCES", error);
+    } catch (Exception error) {
+      call.reject("Unable to replace storage file", error);
+    }
+  }
+
+  // File.exists() collapses access failures to false. Preserve errno so callers
+  // never initialize an empty store over data that was merely unreadable.
+  @PluginMethod
+  public void pathExists(PluginCall call) {
+    String path = call.getString("path");
+    String directory = call.getString("directory");
+    if (path == null || path.isEmpty()) {
+      call.reject("path must be provided", "EINVAL");
+      return;
+    }
+    try {
+      File root;
+      if ("DOCUMENTS".equals(directory)) {
+        root = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+      } else if ("EXTERNAL_STORAGE".equals(directory)) {
+        root = Environment.getExternalStorageDirectory();
+      } else {
+        call.reject("Unsupported storage directory", "EINVAL");
+        return;
+      }
+      // Android's scoped-storage view can report hidden existing files as ENOENT.
+      // The existing all-files gate is the authority for these public directories.
+      if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+        call.reject("All-files access is required to inspect this storage", "EACCES");
+        return;
+      }
+      android.system.Os.stat(new File(root, path).getPath());
+      JSObject result = new JSObject();
+      result.put("exists", true);
+      call.resolve(result);
+    } catch (android.system.ErrnoException error) {
+      if (error.errno == android.system.OsConstants.ENOENT ||
+          error.errno == android.system.OsConstants.ENOTDIR) {
+        JSObject result = new JSObject();
+        result.put("exists", false);
+        call.resolve(result);
+      } else {
+        call.reject("Unable to inspect storage path", android.system.OsConstants.errnoName(error.errno), error);
+      }
+    } catch (SecurityException error) {
+      call.reject("Storage access denied", "EACCES", error);
+    } catch (Exception error) {
+      call.reject("Unable to inspect storage path", error);
+    }
+  }
+
+
+  // 데이터 루트 볼륨의 실제 여유 공간(bytes) — 마이그레이션 백업 게이트 공간 판정용.
+  // 데이터는 Documents/.SDStudio 하위에 있어 외부 저장 볼륨과 동일하므로 그 볼륨의
+  // StatFs 를 조회한다. navigator.storage.estimate() 는 WebView 가 캡된 쿼터(≈10GB)를
+  // 돌려줘 실제 디스크 여유와 무관하므로 네이티브 StatFs 로 대체한다(트랙1 (b) §4-1).
+  @PluginMethod
+  public void getFreeSpace(PluginCall call) {
+    try {
+      File dir = Environment.getExternalStorageDirectory();
+      StatFs stat = new StatFs(dir.getAbsolutePath());
+      long available = stat.getAvailableBytes();
+      JSObject ret = new JSObject();
+      ret.put("bytes", available);
+      call.resolve(ret);
+    } catch (Exception e) {
+      call.reject("Failed to get free space", e);
+    }
+  }
+
+  // Android 11+ '모든 파일 접근' 특수 권한 상태 — 저장소 부팅 게이트용.
+  // 이 권한이 없으면 FUSE 가 타 설치본 소유 파일(재설치·기기 이전 전의 데이터)을
+  // File API 에서 오류 없이 숨겨 "전부 증발"처럼 보이므로, 쓰기 프로브로는 감지가
+  // 불가능하다 — 반드시 이 정확한 상태 조회로 판정해야 한다(2026-07-31 근본 조사).
+  @PluginMethod
+  public void storagePermissionStatus(PluginCall call) {
+    JSObject ret = new JSObject();
+    boolean required = Build.VERSION.SDK_INT >= 30;
+    boolean granted = true;
+    if (required) {
+      try {
+        granted = Environment.isExternalStorageManager();
+      } catch (Exception e) {
+        granted = false;
+      }
+    }
+    ret.put("required", required);
+    ret.put("granted", granted);
+    call.resolve(ret);
+  }
+
+  // '모든 파일 접근' 설정 화면 열기 — 부팅 게이트 화면의 [설정 열기] 버튼.
+  // 이 앱 항목으로 딥링크하고, 실패 시 전체 목록 화면으로 폴백(MainActivity 와 동일 패턴).
+  @PluginMethod
+  public void openAllFilesSettings(PluginCall call) {
+    try {
+      Uri uri = Uri.parse("package:" + getContext().getPackageName());
+      Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+      intent.setData(uri);
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+      getContext().startActivity(intent);
+      call.resolve();
+    } catch (Exception e) {
+      try {
+        Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        getContext().startActivity(intent);
+        call.resolve();
+      } catch (Exception e2) {
+        call.reject("Failed to open all files access settings", e2);
+      }
+    }
+  }
+
+  private void addFileToTar(TarArchiveOutputStream tarOut, String filePath, String entryName) throws IOException {
+    File file = new File(filePath);
+    TarArchiveEntry tarEntry = new TarArchiveEntry(file, entryName);
+    tarEntry.setSize(file.length());
+    tarOut.putArchiveEntry(tarEntry);
+
+    BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file));
+    byte[] buffer = new byte[1024];
+    int read;
+    while ((read = bis.read(buffer)) != -1) {
+      tarOut.write(buffer, 0, read);
+    }
+    bis.close();
+    tarOut.closeArchiveEntry();
+  }
+
+  private InputStream openInputStreamFromUri(Context context, Uri uri) throws IOException {
+    if ("file".equalsIgnoreCase(uri.getScheme())) {
+      return new FileInputStream(uri.getPath());
+    } else if ("content".equalsIgnoreCase(uri.getScheme())) {
+      return context.getContentResolver().openInputStream(uri);
+    }
+    throw new IllegalArgumentException("Unsupported URI scheme: " + uri.getScheme());
+  }
+
+
+  // tar 압축 해제(앱의 모든 불러오기가 쓰는 유일한 네이티브 해제 경로 — zip 은 만들기만
+  // 하고 풀지 않는다). 드라이브 동기화 ② B8: 엔트리 이름이 대상 폴더 밖(../, 절대 경로,
+  // 드라이브 문자)을 가리키거나 링크 엔트리면 풀지 않고 건너뛴 뒤 로그를 남긴다.
+  // 결과 { skipped: 건너뛴 엔트리 수 } — JS 쪽은 사용하지 않아도 무해.
+  @PluginMethod
+  public void unzipFiles(PluginCall call) {
+    String outPath = call.getString("outPath");
+    String zipPath = call.getString("zipPath");
+    if (outPath == null || zipPath == null) {
+      call.reject("outPath and zipPath must be provided");
+      return;
+    }
+    int skipped = 0;
+    try {
+      File root = new File(outPath).getCanonicalFile();
+      InputStream fis = openInputStreamFromUri(getContext(), Uri.parse(zipPath));
+      try (TarArchiveInputStream tarIn =
+          new TarArchiveInputStream(new BufferedInputStream(fis))) {
+        TarArchiveEntry entry;
+        while ((entry = (TarArchiveEntry) tarIn.getNextEntry()) != null) {
+          String name = entry.getName();
+          if (entry.isSymbolicLink() || entry.isLink()) {
+            skipped++;
+            Log.w(TAG, "unzipFiles: skipped link entry: " + name);
+            continue;
+          }
+          File destPath = TarEntryPaths.resolveInside(root, name);
+          if (destPath == null) {
+            skipped++;
+            Log.w(TAG, "unzipFiles: skipped entry outside target: " + name);
+            continue;
+          }
+          if (entry.isDirectory()) {
+            destPath.mkdirs();
+          } else {
+            if (destPath.equals(root)) {
+              skipped++;
+              Log.w(TAG, "unzipFiles: skipped file entry at target root: " + name);
+              continue;
+            }
+            File parent = destPath.getParentFile();
+            if (parent != null) parent.mkdirs();
+            try (OutputStream out = new FileOutputStream(destPath)) {
+              byte[] buffer = new byte[64 * 1024];
+              int length;
+              while ((length = tarIn.read(buffer)) != -1) {
+                out.write(buffer, 0, length);
+              }
+            }
+          }
+        }
+      }
+      JSObject ret = new JSObject();
+      ret.put("skipped", skipped);
+      call.resolve(ret);
+    } catch (Exception e) {
+      // 런타임 예외도 reject 로 변환 — 플러그인 스레드의 미처리 예외는 앱 프로세스를
+      // 죽인다(zipFiles 와 같은 이유).
+      call.reject("Failed to unzip files", e);
+    }
+  }
+
+  // 다운로드한 파일을 MediaStore에 등록한다. targetSdk 34 + 모든 파일 접근 환경에서
+  // Filesystem.copy는 디스크에 직접 쓰기만 하고 MediaStore에 등록하지 않아 갤러리/파일앱에
+  // 노출되지 않는다. 명시적 미디어스캔으로 이미지로 등록해 노출시킨다.
+  @PluginMethod
+  public void scanMedia(PluginCall call) {
+    String path = call.getString("path");
+    String mime = call.getString("mime", "image/png");
+    if (path == null) {
+      call.reject("path must be provided");
+      return;
+    }
+    try {
+      MediaScannerConnection.scanFile(
+        getContext(),
+        new String[]{ path },
+        new String[]{ mime },
+        (scannedPath, uri) -> {
+          JSObject ret = new JSObject();
+          ret.put("path", scannedPath);
+          ret.put("uri", uri != null ? uri.toString() : null);
+          call.resolve(ret);
+        }
+      );
+    } catch (Exception e) {
+      call.reject("Failed to scan media", e);
+    }
+  }
+
+  @PluginMethod
+  public void showDownloads(PluginCall call) {
+    Intent intent=new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS);
+    try {
+      getContext().startActivity(intent);
+      call.resolve();
+    } catch (Exception e) {
+      call.reject("Failed to donwloads folder", e);
+    }
+  }
+
+  @PluginMethod
+  public void showFileInFolder(PluginCall call) {
+    String filePath = call.getString("filePath");
+    if (filePath == null) {
+      call.reject("File path must be provided");
+      return;
+    }
+
+    File file = new File(filePath);
+    if (!file.exists()) {
+      call.reject("File does not exist");
+      return;
+    }
+
+    Uri fileUri;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+      String authority = getContext().getPackageName() + ".fileprovider";
+      fileUri = FileProvider.getUriForFile(getContext(), authority, file);
+    } else {
+      fileUri = Uri.fromFile(file);
+    }
+
+    Intent intent = new Intent(Intent.ACTION_VIEW);
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+      intent.setDataAndType(fileUri, DocumentsContract.Document.MIME_TYPE_DIR);
+    } else {
+      intent.setDataAndType(fileUri, "resource/folder");
+    }
+    intent.putExtra("org.openintents.extra.ABSOLUTE_PATH", filePath);
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+
+    try {
+      getContext().startActivity(intent);
+      call.resolve();
+    } catch (Exception e) {
+      call.reject("Failed to show file in folder", e);
+    }
+  }
+}

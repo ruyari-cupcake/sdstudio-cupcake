@@ -1,0 +1,207 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { FaObjectGroup } from 'react-icons/fa';
+import activateButtonFromKeyboard from './keyboardButton';
+import { useSceneSelectorGestures } from './useSceneSelectorGestures';
+import type { GenericScene } from '../models/types';
+import { imageService, gameService } from '../models';
+import { appState } from '../models/AppService';
+
+interface SceneSelectorProps {
+  text: string;
+  scenes: GenericScene[];
+  getImage: (scene: GenericScene) => Promise<string | null>;
+  onConfirm: (selectedScenes: GenericScene[]) => void;
+}
+
+const SceneImage: React.FC<{
+  scene: GenericScene;
+  getImage: (scene: GenericScene) => Promise<string | null>;
+}> = ({ scene, getImage }) => {
+  const [image, setImage] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+
+  useEffect(() => {
+    let active = true;
+    let revision = 0;
+    setImage(null);
+    const loadImage = async () => {
+      const request = ++revision;
+      setLoading(true);
+      try {
+        const uri = await getImage(scene);
+        if (active && request === revision) setImage(uri);
+      } catch {
+        if (active && request === revision) setImage(null);
+      } finally {
+        if (active && request === revision) setLoading(false);
+      }
+    };
+    loadImage();
+    gameService.addEventListener('updated', loadImage);
+    imageService.addEventListener('updated', loadImage);
+    return () => {
+      active = false;
+      gameService.removeEventListener('updated', loadImage);
+      imageService.removeEventListener('updated', loadImage);
+    };
+  }, [scene, getImage]);
+
+  return (
+    <div className="w-20 h-20 flex items-center justify-center">
+      {image ? (
+        <img
+          className="bg-checkboard w-auto h-auto max-w-20 max-h-20"
+          draggable={false}
+          src={image}
+          alt={scene.name}
+        />
+      ) : loading ? (
+        <div className="w-16 h-16 bg-gray-200 dark:bg-slate-600 animate-pulse rounded" />
+      ) : null}
+    </div>
+  );
+};
+
+const SceneSelector: React.FC<SceneSelectorProps> = ({
+  scenes,
+  text,
+  getImage,
+  onConfirm,
+}) => {
+  const { curSession } = appState;
+  const [selectedScenes, setSelectedScenes] = useState<GenericScene[]>([]);
+
+  // 컴포넌트 마운트 시 이미지 목록 새로고침
+  useEffect(() => {
+    if (curSession) {
+      imageService.refreshBatch(curSession).catch((error) => {
+        appState.pushMessage(
+          `씬 이미지를 새로 고치지 못했습니다: ${String(error)}`,
+        );
+      });
+    }
+  }, [curSession]);
+
+  // 다중 선택 제스처(PC 드래그 상자 / 터치 길게 눌러 연속 선택)
+  const scenesRef = useRef(scenes);
+  scenesRef.current = scenes;
+  const selectedRef = useRef(selectedScenes);
+  selectedRef.current = selectedScenes;
+  const { listRef, box, sweeping, suppressClickRef } = useSceneSelectorGestures(
+    {
+      getNames: () => scenesRef.current.map((x) => x.name),
+      getSelected: () => new Set(selectedRef.current.map((x) => x.name)),
+      setSelected: (names) =>
+        setSelectedScenes(scenesRef.current.filter((x) => names.has(x.name))),
+    },
+  );
+
+  const toggleSceneSelection = (scene: GenericScene) => {
+    if (suppressClickRef.current) return;
+    const isSelected = selectedScenes.some(
+      (selected) => selected.name === scene.name,
+    );
+    const newSelectedScenes = isSelected
+      ? selectedScenes.filter((selected) => selected.name !== scene.name)
+      : [...selectedScenes, scene];
+
+    setSelectedScenes(newSelectedScenes);
+  };
+
+  const selectAllScenes = () => {
+    setSelectedScenes(scenes);
+  };
+
+  const clearAllSelections = () => {
+    setSelectedScenes([]);
+  };
+
+  return (
+    <div className="p-2 md:p-4 flex flex-col h-full">
+      <div className="flex items-center gap-2 text-body flex-none">
+        <FaObjectGroup className="text-lg md:text-xl" />
+        <div className="text-lg md:text-xl flex flex-col md:flex-row md:gap-2">
+          {' '}
+          <span>씬을 선택하고 해당 작업을 적용합니다:</span>{' '}
+          <span className="font-bold text-default">{text}</span>
+        </div>
+      </div>
+      <div className="px-1 pt-2 md:pt-3 flex flex-col flex-1 overflow-hidden">
+        <div className="gap-2 flex flex-none overflow-hidden">
+          <button
+            type="button"
+            className="round-button back-sky"
+            onClick={selectAllScenes}
+          >
+            모두 선택
+          </button>
+          <button
+            type="button"
+            className="round-button back-gray"
+            onClick={clearAllSelections}
+          >
+            모두 선택 해제
+          </button>
+        </div>
+        <div className="flex-1 overflow-hidden pt-4 pb-2">
+          <div
+            ref={listRef}
+            className={`relative flex flex-wrap h-full overflow-auto gap-2 content-start text-sub select-none${
+              sweeping ? ' touch-none' : ''
+            }`}
+          >
+            {box && (
+              <div
+                className="absolute bg-sky-500/30 border-2 border-sky-500 rounded pointer-events-none z-50"
+                style={{
+                  left: Math.min(box.x1, box.x2),
+                  top: Math.min(box.y1, box.y2),
+                  width: Math.abs(box.x2 - box.x1),
+                  height: Math.abs(box.y2 - box.y1),
+                }}
+              />
+            )}
+            {scenes.map((scene, sceneIndex) => (
+              <div
+                className={`hover:brightness-95 active:brightness-90 cursor-pointer p-2 border flex-none flex flex-col items-center ${
+                  selectedScenes.some(
+                    (selected) => selected.name === scene.name,
+                  )
+                    ? 'border-sky-500 dark:border-sky-500 bg-sky-200 dark:bg-slate-700'
+                    : 'bg-[var(--c-surface-2)]  border-gray-400 dark:border-slate-400'
+                }`}
+                role="button"
+                tabIndex={0}
+                aria-pressed={selectedScenes.some(
+                  (selected) => selected.name === scene.name,
+                )}
+                onKeyDown={activateButtonFromKeyboard}
+                onClick={() => toggleSceneSelection(scene)}
+                key={scene.name}
+                data-selector-index={sceneIndex}
+              >
+                <div>
+                  <SceneImage getImage={getImage} scene={scene} />
+                </div>
+                <div className="h-12 w-16 md:w-28 overflow-auto break-all select-none">
+                  {scene.name}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="flex-none flex">
+          <button
+            type="button"
+            className="round-button back-green ml-auto"
+            onClick={() => onConfirm(selectedScenes)}
+          >
+            작업 적용 ({selectedScenes.length}개)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default SceneSelector;
